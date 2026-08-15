@@ -15,38 +15,61 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
-type CompletedPart struct {
-	Number int32  `json:"part_number"`
-	ETag   string `json:"etag"`
-}
+var ErrObjectTooLarge = errors.New("object exceeds read limit")
+
 type ObjectInfo struct {
 	Size int64
 	ETag string
 }
 
-var ErrObjectTooLarge = errors.New("object exceeds read limit")
+// ObjectRef describes one listed object, used by the garbage collector.
+type ObjectRef struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+}
 
+// Storage is the object storage control plane. File content is stored as
+// content-addressed blocks plus a small JSON manifest (the Seafile
+// "fs object" analogue); small fixed blobs (avatars) use raw objects.
 type Storage interface {
 	Ping(context.Context) error
-	PresignPut(context.Context, string, string, time.Duration) (string, error)
-	PresignGet(context.Context, string, string, string, bool, time.Duration) (string, error)
-	Head(context.Context, string) (ObjectInfo, error)
-	Read(context.Context, string, int64) ([]byte, error)
-	Write(context.Context, string, string, []byte) (ObjectInfo, error)
-	Delete(context.Context, string) error
-	CreateMultipart(context.Context, string, string) (string, error)
-	PresignPart(context.Context, string, string, int32, time.Duration) (string, error)
-	CompleteMultipart(context.Context, string, string, []CompletedPart) error
-	AbortMultipart(context.Context, string, string) error
+
+	// Blocks: fixed-size content-addressed chunks under blocks/xx/<sha256>.
+	PresignBlockPut(context.Context, string, time.Duration) (string, error)
+	HeadBlock(context.Context, string) (Block, error)
+	GetBlock(context.Context, string) ([]byte, error)
+	ListBlocks(context.Context) ([]ObjectRef, error)
+
+	// Manifests: JSON block lists under manifests/xx/<sha256-of-json>.
+	PutManifest(context.Context, Manifest) (string, error)
+	GetManifest(context.Context, string) (Manifest, error)
+	ListManifests(context.Context) ([]ObjectRef, error)
+
+	// Server-side whole-content write (documents, legacy migration).
+	Store(context.Context, io.Reader) (string, Manifest, error)
+
+	// Reading a logical file back as a stream.
+	Open(context.Context, string) (io.ReadSeekCloser, error)
+	ReadFile(context.Context, string, int64) ([]byte, error)
+
+	// Raw single objects (avatar, legacy objects, GC cleanup).
+	PutObject(context.Context, string, string, []byte) (ObjectInfo, error)
+	OpenRaw(context.Context, string) (io.ReadCloser, error)
+	GetObject(context.Context, string, int64) ([]byte, error)
+	DeleteObject(context.Context, string) error
+	PresignGetObject(context.Context, string, string, string, bool, time.Duration) (string, error)
+	ListPrefix(context.Context, string) ([]ObjectRef, error)
 }
 
 type S3 struct {
-	client  *s3.Client
-	presign *s3.PresignClient
-	bucket  string
+	client    *s3.Client
+	presign   *s3.PresignClient
+	bucket    string
+	blockSize int64
 }
 
 func NewS3(ctx context.Context, c config.Config) (*S3, error) {
@@ -72,17 +95,24 @@ func NewS3(ctx context.Context, c config.Config) (*S3, error) {
 			o.BaseEndpoint = aws.String(c.S3PublicEndpoint)
 		}
 	})
-	return &S3{client: client, presign: s3.NewPresignClient(presignClient), bucket: c.S3Bucket}, nil
+	return &S3{client: client, presign: s3.NewPresignClient(presignClient), bucket: c.S3Bucket, blockSize: c.BlockSize}, nil
 }
 
 func (s *S3) Ping(ctx context.Context) error {
 	_, err := s.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(s.bucket)})
 	return err
 }
-func (s *S3) PresignPut(ctx context.Context, key, mime string, expiry time.Duration) (string, error) {
-	in := &s3.PutObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)}
-	if mime != "" {
-		in.ContentType = aws.String(mime)
+
+// PresignBlockPut issues a conditional PUT URL for one block. The URL is
+// bound to If-None-Match: *, so an existing content-addressed block can
+// never be overwritten and concurrent identical uploads race harmlessly
+// (the loser receives 412 Precondition Failed).
+func (s *S3) PresignBlockPut(ctx context.Context, id string, expiry time.Duration) (string, error) {
+	in := &s3.PutObjectInput{
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(BlockKey(id)),
+		ContentType: aws.String("application/octet-stream"),
+		IfNoneMatch: aws.String("*"),
 	}
 	out, err := s.presign.PresignPutObject(ctx, in, s3.WithPresignExpires(expiry))
 	if err != nil {
@@ -90,7 +120,86 @@ func (s *S3) PresignPut(ctx context.Context, key, mime string, expiry time.Durat
 	}
 	return out.URL, nil
 }
-func (s *S3) PresignGet(ctx context.Context, key, filename, mime string, inline bool, expiry time.Duration) (string, error) {
+
+func (s *S3) HeadBlock(ctx context.Context, id string) (Block, error) {
+	out, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(BlockKey(id))})
+	if err != nil {
+		return Block{}, err
+	}
+	return Block{ID: id, Size: aws.ToInt64(out.ContentLength)}, nil
+}
+
+func (s *S3) GetBlock(ctx context.Context, id string) ([]byte, error) {
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(BlockKey(id))})
+	if err != nil {
+		return nil, err
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(out.Body, s.blockSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > s.blockSize {
+		return nil, fmt.Errorf("block %s exceeds configured block size", id)
+	}
+	return data, nil
+}
+
+// putConditional stores an immutable content-addressed object. A concurrent
+// upload of identical content loses the race with 412, which is treated as
+// success because the object that exists is identical by construction.
+func (s *S3) putConditional(ctx context.Context, key, mime string, data []byte) error {
+	in := &s3.PutObjectInput{
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(key),
+		Body:          bytes.NewReader(data),
+		ContentLength: aws.Int64(int64(len(data))),
+		IfNoneMatch:   aws.String("*"),
+	}
+	if mime != "" {
+		in.ContentType = aws.String(mime)
+	}
+	_, err := s.client.PutObject(ctx, in)
+	if err == nil {
+		return nil
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed" {
+		return nil
+	}
+	return err
+}
+
+func (s *S3) ListBlocks(ctx context.Context) ([]ObjectRef, error) {
+	return s.ListPrefix(ctx, blockPrefix)
+}
+func (s *S3) ListManifests(ctx context.Context) ([]ObjectRef, error) {
+	return s.ListPrefix(ctx, manifestPrefix)
+}
+
+func (s *S3) ListPrefix(ctx context.Context, prefix string) ([]ObjectRef, error) {
+	var out []ObjectRef
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(prefix),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, obj := range page.Contents {
+			out = append(out, ObjectRef{
+				Key:          aws.ToString(obj.Key),
+				Size:         aws.ToInt64(obj.Size),
+				LastModified: aws.ToTime(obj.LastModified),
+			})
+		}
+	}
+	return out, nil
+}
+
+func (s *S3) PresignGetObject(ctx context.Context, key, filename, mime string, inline bool, expiry time.Duration) (string, error) {
 	disposition := "attachment"
 	if inline {
 		disposition = "inline"
@@ -106,29 +215,8 @@ func (s *S3) PresignGet(ctx context.Context, key, filename, mime string, inline 
 	}
 	return out.URL, nil
 }
-func (s *S3) Head(ctx context.Context, key string) (ObjectInfo, error) {
-	out, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
-	if err != nil {
-		return ObjectInfo{}, err
-	}
-	return ObjectInfo{Size: aws.ToInt64(out.ContentLength), ETag: aws.ToString(out.ETag)}, nil
-}
-func (s *S3) Read(ctx context.Context, key string, limit int64) ([]byte, error) {
-	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
-	if err != nil {
-		return nil, err
-	}
-	defer out.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(out.Body, limit+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > limit {
-		return nil, ErrObjectTooLarge
-	}
-	return data, nil
-}
-func (s *S3) Write(ctx context.Context, key, mime string, data []byte) (ObjectInfo, error) {
+
+func (s *S3) PutObject(ctx context.Context, key, mime string, data []byte) (ObjectInfo, error) {
 	in := &s3.PutObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key), Body: bytes.NewReader(data), ContentLength: aws.Int64(int64(len(data)))}
 	if mime != "" {
 		in.ContentType = aws.String(mime)
@@ -139,37 +227,57 @@ func (s *S3) Write(ctx context.Context, key, mime string, data []byte) (ObjectIn
 	}
 	return ObjectInfo{Size: int64(len(data)), ETag: aws.ToString(out.ETag)}, nil
 }
-func (s *S3) Delete(ctx context.Context, key string) error {
+
+func (s *S3) OpenRaw(ctx context.Context, key string) (io.ReadCloser, error) {
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
+	if err != nil {
+		return nil, err
+	}
+	return out.Body, nil
+}
+
+func (s *S3) GetObject(ctx context.Context, key string, limit int64) ([]byte, error) {
+	body, err := s.OpenRaw(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+	data, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, ErrObjectTooLarge
+	}
+	return data, nil
+}
+
+// IsNotFound reports whether the error means the S3 object is absent.
+func IsNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchKey", "NotFound":
+			return true
+		}
+	}
+	return false
+}
+
+// DeleteObject is idempotent: deleting an already-absent key is not an error.
+func (s *S3) DeleteObject(ctx context.Context, key string) error {
+	if key == "" {
+		return nil
+	}
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
-	return err
-}
-func (s *S3) CreateMultipart(ctx context.Context, key, mime string) (string, error) {
-	in := &s3.CreateMultipartUploadInput{Bucket: aws.String(s.bucket), Key: aws.String(key)}
-	if mime != "" {
-		in.ContentType = aws.String(mime)
+	if err == nil {
+		return nil
 	}
-	out, err := s.client.CreateMultipartUpload(ctx, in)
-	if err != nil {
-		return "", err
+	if IsNotFound(err) {
+		return nil
 	}
-	return aws.ToString(out.UploadId), nil
-}
-func (s *S3) PresignPart(ctx context.Context, key, uploadID string, part int32, expiry time.Duration) (string, error) {
-	out, err := s.presign.PresignUploadPart(ctx, &s3.UploadPartInput{Bucket: aws.String(s.bucket), Key: aws.String(key), UploadId: aws.String(uploadID), PartNumber: aws.Int32(part)}, s3.WithPresignExpires(expiry))
-	if err != nil {
-		return "", err
-	}
-	return out.URL, nil
-}
-func (s *S3) CompleteMultipart(ctx context.Context, key, uploadID string, parts []CompletedPart) error {
-	completed := make([]types.CompletedPart, len(parts))
-	for i, part := range parts {
-		completed[i] = types.CompletedPart{PartNumber: aws.Int32(part.Number), ETag: aws.String(part.ETag)}
-	}
-	_, err := s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: aws.String(s.bucket), Key: aws.String(key), UploadId: aws.String(uploadID), MultipartUpload: &types.CompletedMultipartUpload{Parts: completed}})
-	return err
-}
-func (s *S3) AbortMultipart(ctx context.Context, key, uploadID string) error {
-	_, err := s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: aws.String(s.bucket), Key: aws.String(key), UploadId: aws.String(uploadID)})
 	return err
 }

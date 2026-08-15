@@ -12,23 +12,23 @@ import (
 )
 
 type Config struct {
-	Addr               string
-	DataDir            string
-	BaseURL            string
-	CookieSecure       bool
-	AdminUsername      string
-	AdminPassword      string
-	S3Endpoint         string
-	S3PublicEndpoint   string
-	S3Region           string
-	S3Bucket           string
-	S3AccessKey        string
-	S3SecretKey        string
-	S3PathStyle        bool
-	PresignExpires     time.Duration
-	MultipartThreshold int64
-	UploadExpires      time.Duration
-	PartSize           int64
+	Addr             string
+	DataDir          string
+	BaseURL          string
+	CookieSecure     bool
+	AdminUsername    string
+	AdminPassword    string
+	S3Endpoint       string
+	S3PublicEndpoint string
+	S3Region         string
+	S3Bucket         string
+	S3AccessKey      string
+	S3SecretKey      string
+	S3PathStyle      bool
+	PresignExpires   time.Duration
+	BlockSize        int64
+	UploadExpires    time.Duration
+	GCInterval       time.Duration
 }
 
 func Load() (Config, error) {
@@ -58,17 +58,20 @@ func Load() (Config, error) {
 	if c.UploadExpires, err = durationEnv("UPLOAD_EXPIRES", 24*time.Hour); err != nil {
 		return c, err
 	}
-	if c.MultipartThreshold, err = int64Env("MULTIPART_THRESHOLD", 100*1024*1024); err != nil {
+	if c.GCInterval, err = durationEnv("GC_INTERVAL", time.Hour); err != nil {
 		return c, err
 	}
-	if c.PartSize, err = int64Env("PART_SIZE", 16*1024*1024); err != nil {
+	if c.BlockSize, err = int64Env("BLOCK_SIZE", 4*1024*1024); err != nil {
 		return c, err
 	}
-	if c.MultipartThreshold <= 0 {
-		return c, errors.New("MULTIPART_THRESHOLD must be positive")
+	if c.BlockSize < 1*1024*1024 || c.BlockSize > 1*1024*1024*1024 {
+		return c, errors.New("BLOCK_SIZE must be between 1 MiB and 1 GiB")
 	}
-	if c.PartSize < 5*1024*1024 {
-		return c, errors.New("PART_SIZE must be at least 5 MiB")
+	if c.UploadExpires <= 0 {
+		return c, errors.New("UPLOAD_EXPIRES must be positive")
+	}
+	if c.GCInterval < 0 {
+		return c, errors.New("GC_INTERVAL must not be negative")
 	}
 	base, err := url.Parse(c.BaseURL)
 	if err != nil || base.Host == "" || (base.Scheme != "http" && base.Scheme != "https") {

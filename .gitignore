@@ -5,5 +5,6 @@
 *.db-shm
 *.db-wal
 web/node_modules/
+web/.npm-cache/
 coverage.out
 .DS_Store

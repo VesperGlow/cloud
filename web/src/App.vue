@@ -5,7 +5,9 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 
 const ROOT = '00000000-0000-0000-0000-000000000000'
 const FILE_CONCURRENCY = 3
-const PART_CONCURRENCY = 4
+const BLOCK_PUT_CONCURRENCY = 4
+const BLOCK_REGISTER_BATCH = 1000
+const COMPLETE_RETRIES = 3
 
 interface DriveFile { id:string; parent_id:string|null; name:string; kind:'file'|'directory'; size:number; mime_type?:string; etag?:string; status:'pending'|'ready'|'deleting'|'failed'; created_at:string; updated_at:string }
 interface UploadTask { id:string; file:File; progress:number; status:'queued'|'uploading'|'done'|'failed'|'cancelled'; error:string; cancelled:boolean; uploadId?:string; requests:XMLHttpRequest[] }
@@ -61,8 +63,9 @@ async function api<T>(path:string, init:RequestInit = {}):Promise<T> {
   const response = await fetch(path, { ...init, headers, credentials:'same-origin' })
   if (!response.ok) {
     let message = `请求失败 (${response.status})`
-    try { message = (await response.json()).error?.message || message } catch { /* ignore */ }
-    const error = new Error(message) as Error & { status?:number }; error.status=response.status; throw error
+    let payload: unknown = null
+    try { payload = await response.json(); message = (payload as {error?:{message?:string}}).error?.message || message } catch { /* ignore */ }
+    const error = new Error(message) as Error & { status?:number; data?:unknown }; error.status=response.status; error.data=payload; throw error
   }
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
@@ -175,9 +178,115 @@ function chooseFiles(){fileInput.value?.click()}
 function acceptFiles(list:FileList|File[]){for(const file of Array.from(list)){tasks.push({id:crypto.randomUUID(),file,progress:0,status:'queued',error:'',cancelled:false,requests:[]})}pumpQueue()}
 function onDrop(event:DragEvent){dragActive.value=false;if(event.dataTransfer?.files.length)acceptFiles(event.dataTransfer.files)}
 function pumpQueue(){while(activeUploads<FILE_CONCURRENCY){const task=tasks.find(t=>t.status==='queued');if(!task)return;activeUploads++;runUpload(task).finally(()=>{activeUploads--;pumpQueue()})}}
-async function runUpload(task:UploadTask){task.status='uploading';task.error='';task.cancelled=false;task.progress=0;try{const created=await api<{upload_id:string;mode:'single'|'multipart';url?:string;part_size?:number}>('/api/uploads',{method:'POST',body:JSON.stringify({parent_id:currentId.value,name:task.file.name,size:task.file.size,mime_type:task.file.type||'application/octet-stream'})});task.uploadId=created.upload_id;if(task.cancelled){await abortRemote(task);return}if(created.mode==='single'){await xhrPut(created.url!,task.file,task,(loaded)=>task.progress=percentage(loaded,task.file.size))}else{await multipartUpload(task,created.part_size!)}if(task.cancelled)return;await api(`/api/uploads/${task.uploadId}/complete`,{method:'POST',body:JSON.stringify(created.mode==='multipart'?{parts:(task as UploadTask & {parts?:{part_number:number;etag:string}[]}).parts}:{})});task.progress=100;task.status='done';await openFolder(currentId.value)}catch(e){if(task.cancelled){task.status='cancelled'}else{task.status='failed';task.error=(e as Error).message}}}
-async function multipartUpload(task:UploadTask,partSize:number){const count=Math.ceil(task.file.size/partSize);const urls=new Map<number,string>();for(let from=1;from<=count;from+=10){const page=await api<{parts:{part_number:number;url:string}[]}>(`/api/uploads/${task.uploadId}/parts?from=${from}&count=${Math.min(10,count-from+1)}`);page.parts.forEach(p=>urls.set(p.part_number,p.url))}const progress=new Array(count).fill(0) as number[];const completed:{part_number:number;etag:string}[]=[];let cursor=1;const worker=async()=>{while(true){const part=cursor++;if(part>count)return;if(task.cancelled)throw new Error('上传已取消');const start=(part-1)*partSize,end=Math.min(start+partSize,task.file.size),blob=task.file.slice(start,end);const etag=await xhrPut(urls.get(part)!,blob,task,(loaded)=>{progress[part-1]=loaded;task.progress=percentage(progress.reduce((a,b)=>a+b,0),task.file.size)});if(!etag)throw new Error('S3 未返回 ETag，请检查 Bucket CORS 的 ExposeHeaders');completed.push({part_number:part,etag})}};await Promise.all(Array.from({length:Math.min(PART_CONCURRENCY,count)},worker));completed.sort((a,b)=>a.part_number-b.part_number);(task as UploadTask & {parts:{part_number:number;etag:string}[]}).parts=completed}
-function xhrPut(url:string,body:Blob,task:UploadTask,onProgress:(n:number)=>void):Promise<string>{return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();task.requests.push(xhr);xhr.open('PUT',url);xhr.setRequestHeader('Content-Type',task.file.type||'application/octet-stream');xhr.upload.onprogress=e=>{if(e.lengthComputable)onProgress(e.loaded)};xhr.onload=()=>{task.requests=task.requests.filter(x=>x!==xhr);if(xhr.status>=200&&xhr.status<300)resolve(xhr.getResponseHeader('ETag')||'');else reject(new Error(`S3 上传失败 (${xhr.status})`))};xhr.onerror=()=>reject(new Error('无法连接对象存储，请检查 S3 CORS'));xhr.onabort=()=>reject(new Error('上传已取消'));xhr.send(body)})}
+interface BlockSpec { id:string; size:number; offset:number }
+interface RegisteredBlock { id:string; size:number; exists:boolean; url?:string; offset:number }
+
+async function runUpload(task:UploadTask){
+  task.status='uploading';task.error='';task.cancelled=false;task.progress=0
+  try{
+    const created=await api<{upload_id:string;mode:'blocks';block_size:number;block_count:number}>('/api/uploads',{method:'POST',body:JSON.stringify({parent_id:currentId.value,name:task.file.name,size:task.file.size,mime_type:task.file.type||'application/octet-stream'})})
+    task.uploadId=created.upload_id
+    if(task.cancelled){await abortRemote(task);return}
+    // 1) 按块切分文件并计算每个块的 SHA-256（内容寻址，重复块自动去重）。
+    const blocks=await hashBlocks(task,created.block_size,created.block_count)
+    if(task.cancelled){await abortRemote(task);return}
+    // 2) 登记全部块；服务端为缺失的块签发条件 PUT 的预签名 URL。
+    const registered=await registerBlocks(task,created.upload_id,blocks)
+    if(task.cancelled){await abortRemote(task);return}
+    // 3) 只把缺失的块直传到 S3。
+    await uploadBlocks(task,registered.filter(b=>!b.exists&&b.url))
+    if(task.cancelled){await abortRemote(task);return}
+    // 4) 完成上传；409 时按缺失列表修复并重试。
+    await completeWithRepair(task,created.upload_id,blocks)
+    task.progress=100;task.status='done';await openFolder(currentId.value)
+  }catch(e){if(task.cancelled){task.status='cancelled'}else{task.status='failed';task.error=(e as Error).message}}
+}
+
+async function sha256Hex(blob:Blob):Promise<string>{
+  const digest=await crypto.subtle.digest('SHA-256',await blob.arrayBuffer())
+  return Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,'0')).join('')
+}
+
+async function hashBlocks(task:UploadTask,blockSize:number,count:number):Promise<BlockSpec[]>{
+  const blocks:BlockSpec[]=[]
+  let hashed=0
+  for(let i=0;i<count;i++){
+    if(task.cancelled)throw new Error('上传已取消')
+    const start=i*blockSize,end=Math.min(start+blockSize,task.file.size)
+    const id=await sha256Hex(task.file.slice(start,end))
+    blocks.push({id,size:end-start,offset:start})
+    hashed+=end-start
+    task.progress=Math.floor(percentage(hashed,task.file.size)*0.35)
+  }
+  return blocks
+}
+
+async function registerBlocks(task:UploadTask,uploadId:string,blocks:BlockSpec[]):Promise<RegisteredBlock[]>{
+  const out:RegisteredBlock[]=[]
+  for(let from=0;from<blocks.length;from+=BLOCK_REGISTER_BATCH){
+    const page=blocks.slice(from,from+BLOCK_REGISTER_BATCH)
+    const data=await api<{blocks:{id:string;size:number;exists:boolean;url?:string}[]}>(`/api/uploads/${uploadId}/blocks`,{method:'POST',body:JSON.stringify({blocks:page.map(b=>({id:b.id,size:b.size}))})})
+    // 服务端按顺序回显；把文件偏移重新挂回每个块。
+    data.blocks.forEach((b,i)=>out.push({...b,offset:page[i].offset}))
+  }
+  return out
+}
+
+async function uploadBlocks(task:UploadTask,blocks:RegisteredBlock[]){
+  const total=blocks.reduce((sum,b)=>sum+b.size,0)
+  const sent=new Array(blocks.length).fill(0) as number[]
+  let cursor=0
+  const worker=async()=>{
+    while(true){
+      const idx=cursor++
+      if(idx>=blocks.length)return
+      if(task.cancelled)throw new Error('上传已取消')
+      const b=blocks[idx]
+      const blob=task.file.slice(b.offset,b.offset+b.size)
+      await xhrPutBlock(b.url!,blob,task,(loaded)=>{sent[idx]=loaded;task.progress=35+Math.floor(percentage(sent.reduce((a,x)=>a+x,0),total)*0.64)})
+    }
+  }
+  await Promise.all(Array.from({length:Math.min(BLOCK_PUT_CONCURRENCY,blocks.length)},worker))
+}
+
+async function completeWithRepair(task:UploadTask,uploadId:string,blocks:BlockSpec[]){
+  for(let attempt=0;attempt<COMPLETE_RETRIES;attempt++){
+    if(task.cancelled)throw new Error('上传已取消')
+    try{
+      await api(`/api/uploads/${uploadId}/complete`,{method:'POST',body:JSON.stringify({blocks})})
+      return
+    }catch(e){
+      const err=e as Error & {status?:number;data?:unknown}
+      const missing:string[]|undefined=(err.data as {error?:{missing_blocks?:string[]}}|null)?.error?.missing_blocks
+      if(err.status!==409||!missing?.length)throw e
+      // 有块在登记后被回收（极端竞态）：重新登记拿到新 URL，补传后重试。
+      const ids=new Set(missing)
+      const registered=await registerBlocks(task,uploadId,blocks.filter(b=>ids.has(b.id)))
+      await uploadBlocks(task,registered.filter(b=>!b.exists&&b.url))
+    }
+  }
+  throw new Error('无法完成块校验，请重试')
+}
+
+function xhrPutBlock(url:string,body:Blob,task:UploadTask,onProgress:(n:number)=>void):Promise<void>{
+  return new Promise((resolve,reject)=>{
+    const xhr=new XMLHttpRequest()
+    task.requests.push(xhr)
+    xhr.open('PUT',url)
+    xhr.setRequestHeader('Content-Type','application/octet-stream')
+    xhr.setRequestHeader('If-None-Match','*')
+    xhr.upload.onprogress=e=>{if(e.lengthComputable)onProgress(e.loaded)}
+    xhr.onload=()=>{
+      task.requests=task.requests.filter(x=>x!==xhr)
+      if(xhr.status>=200&&xhr.status<300)resolve()
+      else if(xhr.status===412)resolve() // 内容相同的块已存在（并发去重），视为成功
+      else reject(new Error(`S3 块上传失败 (${xhr.status})`))
+    }
+    xhr.onerror=()=>reject(new Error('无法连接对象存储，请检查 S3 CORS'))
+    xhr.onabort=()=>reject(new Error('上传已取消'))
+    xhr.send(body)
+  })
+}
 function percentage(done:number,total:number){return total===0?100:Math.min(99,Math.round(done/total*100))}
 async function cancelUpload(task:UploadTask){task.cancelled=true;task.requests.forEach(x=>x.abort());await abortRemote(task);task.status='cancelled'}
 async function abortRemote(task:UploadTask){if(task.uploadId){try{await api(`/api/uploads/${task.uploadId}`,{method:'DELETE'})}catch{/* stale cleanup retries later */}}}
@@ -193,13 +302,13 @@ onBeforeUnmount(()=>window.removeEventListener('keydown',handlePreviewKey))
 <template>
   <div v-if="checking" class="splash"><div class="brand-mark">C</div><div class="spinner"></div></div>
   <main v-else-if="!user" class="login-page">
-    <section class="login-visual"><div class="glow glow-a"></div><div class="glow glow-b"></div><div class="visual-copy"><span class="eyebrow">PRIVATE · DIRECT · YOURS</span><h1>你的文件，<br>安静地待在云上。</h1><p>轻量、自托管，大文件直接往返你的 S3。</p></div><div class="cloud-card"><span>☁</span><div><strong>Browser ↔ S3</strong><small>上传下载直连对象存储</small></div></div></section>
+    <section class="login-visual"><div class="glow glow-a"></div><div class="glow glow-b"></div><div class="visual-copy"><span class="eyebrow">PRIVATE · DIRECT · YOURS</span><h1>你的文件，<br>安静地待在云上。</h1><p>轻量、自托管，文件按内容块直传你的 S3。</p></div><div class="cloud-card"><span>☁</span><div><strong>Seafile 式块存储</strong><small>内容寻址 · 跨文件去重</small></div></div></section>
     <section class="login-panel"><form class="login-form" @submit.prevent="submitLogin"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div><p class="eyebrow dark">WELCOME BACK</p><h2>登录私人空间</h2><p class="muted">首次启动的随机凭据可在容器日志中查看</p></div><label>用户名<input v-model="login.username" autocomplete="username" maxlength="128" required></label><label>密码<input v-model="login.password" type="password" autocomplete="current-password" maxlength="1024" required></label><p v-if="login.notice" class="form-success">{{ login.notice }}</p><p v-if="login.error" class="form-error">{{ login.error }}</p><button class="primary wide" :disabled="login.busy">{{ login.busy ? '正在验证…' : '进入我的网盘' }}</button></form></section>
   </main>
 
   <div v-else class="app-shell" @dragover.prevent="dragActive=true" @dragleave.self="dragActive=false" @drop.prevent="onDrop">
-    <header class="topbar"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div class="top-actions"><span class="connection"><i></i>S3 直连</span><button class="account-button" title="打开账户设置" @click="showAccount"><span class="avatar-badge"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像" @error="hasAvatar=false"><template v-else>{{ user.slice(0,1).toUpperCase() }}</template></span><span class="account-copy"><b>{{ user }}</b><small>账户设置</small></span></button><button class="top-logout" @click="logout">退出</button></div></header>
-    <aside class="sidebar"><button class="nav active"><span>▰</span>我的文件</button><div class="sidebar-note"><span>总空间占用</span><strong>{{ formatSize(storageStats.total_bytes) }}</strong><small>{{ storageStats.file_count }} 个文件</small><p>统计所有已完成文件的逻辑大小，内容保存在 S3。</p></div></aside>
+    <header class="topbar"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div class="top-actions"><span class="connection"><i></i>S3 块直传</span><button class="account-button" title="打开账户设置" @click="showAccount"><span class="avatar-badge"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像" @error="hasAvatar=false"><template v-else>{{ user.slice(0,1).toUpperCase() }}</template></span><span class="account-copy"><b>{{ user }}</b><small>账户设置</small></span></button><button class="top-logout" @click="logout">退出</button></div></header>
+    <aside class="sidebar"><button class="nav active"><span>▰</span>我的文件</button><div class="sidebar-note"><span>总空间占用</span><strong>{{ formatSize(storageStats.total_bytes) }}</strong><small>{{ storageStats.file_count }} 个文件</small><p>统计所有已完成文件的逻辑大小；内容以 SHA-256 内容块存储在 S3，重复块全局去重。</p></div></aside>
     <section class="content" @click="clearSelectionFromBlank">
       <div class="content-head"><div><nav class="breadcrumbs" aria-label="路径"><button v-for="crumb in breadcrumbs" :key="crumb.id" @click="openFolder(crumb.id)">{{ crumb.name || '我的文件' }}<span>/</span></button></nav><h1>{{ current?.name || '我的文件' }}</h1><p>{{ items.length }} 个项目 · {{ pathTitle }}</p></div><div class="actions"><div class="view-switch" role="group" aria-label="文件显示方式"><button :class="{active:viewMode==='list'}" title="列表视图" aria-label="列表视图" @click="setViewMode('list')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg></button><button :class="{active:viewMode==='grid'}" title="大图标视图" aria-label="大图标视图" @click="setViewMode('grid')"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg></button></div><button class="secondary" @click="newDocument">＋ 新建文档</button><button class="secondary" @click="createFolder">＋ 新建文件夹</button><button class="primary" @click="chooseFiles">↑ 上传文件</button><input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}"></div></div>
       <div v-if="viewMode==='grid'&&selected&&!modal" class="selection-toolbar" role="toolbar" aria-label="所选项目操作">
@@ -240,7 +349,7 @@ onBeforeUnmount(()=>window.removeEventListener('keydown',handlePreviewKey))
       </div>
     </section>
 
-    <div v-if="dragActive" class="drop-zone"><div><span>↓</span><h2>释放以上传到 {{ current?.name || '我的文件' }}</h2><p>文件将直接发送到 S3</p></div></div>
+    <div v-if="dragActive" class="drop-zone"><div><span>↓</span><h2>释放以上传到 {{ current?.name || '我的文件' }}</h2><p>文件将按内容块直传 S3，重复内容自动去重</p></div></div>
     <section v-if="tasks.length" class="upload-panel"><header><div><strong>上传</strong><span v-if="unfinished.length">{{ unfinished.length }} 项进行中</span></div><button @click="clearFinished">清除已完成</button></header><div class="task-list"><article v-for="task in tasks" :key="task.id"><div class="task-top"><span class="task-icon">↑</span><div><strong>{{ task.file.name }}</strong><small>{{ formatSize(task.file.size) }} · {{ task.status==='queued'?'等待中':task.status==='uploading'?'正在上传':task.status==='done'?'已完成':task.status==='cancelled'?'已取消':task.error }}</small></div><b>{{ task.progress }}%</b><button v-if="task.status==='queued'||task.status==='uploading'" @click="cancelUpload(task)">×</button><button v-else-if="task.status==='failed'" @click="retry(task)">重试</button></div><div class="progress"><i :class="task.status" :style="{width:`${task.progress}%`}"></i></div></article></div></section>
 
     <div v-if="modal" class="modal-backdrop" :class="{previewing:modal==='preview',editing:modal==='editor'}" @click.self="closeBackdrop">

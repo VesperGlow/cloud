@@ -3,86 +3,232 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/VesperGlow/cloud/internal/auth"
 	"github.com/VesperGlow/cloud/internal/config"
 	"github.com/VesperGlow/cloud/internal/database"
+	"github.com/VesperGlow/cloud/internal/ids"
 	"github.com/VesperGlow/cloud/internal/storage"
+	"github.com/aws/smithy-go"
 )
 
+// notFoundError emulates the S3 NoSuchKey API error the real store returns.
+func notFoundError() error {
+	return &smithy.GenericAPIError{Code: "NoSuchKey", Message: "object not found", Fault: smithy.FaultClient}
+}
+
+// mockStorage emulates the block store in memory.
 type mockStorage struct {
-	objects   map[string]storage.ObjectInfo
-	contents  map[string][]byte
-	deleteErr error
+	blocks         map[string][]byte // by block id
+	manifests      map[string]storage.Manifest
+	raw            map[string][]byte // raw object key -> content
+	modified       map[string]time.Time
+	blockSize      int64
+	presignErr     error
+	putManifestErr error
+}
+
+func newMockStorage(blockSize int64) *mockStorage {
+	if blockSize <= 0 {
+		blockSize = 4 << 20
+	}
+	return &mockStorage{
+		blocks:    map[string][]byte{},
+		manifests: map[string]storage.Manifest{},
+		raw:       map[string][]byte{},
+		modified:  map[string]time.Time{},
+		blockSize: blockSize,
+	}
 }
 
 func (m *mockStorage) Ping(context.Context) error { return nil }
-func (m *mockStorage) PresignPut(_ context.Context, key, _ string, _ time.Duration) (string, error) {
-	m.objects[key] = storage.ObjectInfo{}
-	return "https://s3.example/put", nil
-}
-func (m *mockStorage) PresignGet(context.Context, string, string, string, bool, time.Duration) (string, error) {
-	return "https://s3.example/get", nil
-}
-func (m *mockStorage) Head(_ context.Context, key string) (storage.ObjectInfo, error) {
-	v, ok := m.objects[key]
-	if !ok {
-		return storage.ObjectInfo{}, errors.New("not found")
+func (m *mockStorage) PresignBlockPut(_ context.Context, id string, _ time.Duration) (string, error) {
+	if m.presignErr != nil {
+		return "", m.presignErr
 	}
-	return v, nil
+	return "https://s3.example/put/" + id, nil
 }
-func (m *mockStorage) Read(_ context.Context, key string, limit int64) ([]byte, error) {
-	data, ok := m.contents[key]
+func (m *mockStorage) HeadBlock(_ context.Context, id string) (storage.Block, error) {
+	data, ok := m.blocks[id]
 	if !ok {
-		return nil, errors.New("not found")
+		return storage.Block{}, notFoundError()
+	}
+	return storage.Block{ID: id, Size: int64(len(data))}, nil
+}
+func (m *mockStorage) GetBlock(_ context.Context, id string) ([]byte, error) {
+	data, ok := m.blocks[id]
+	if !ok {
+		return nil, notFoundError()
+	}
+	return append([]byte(nil), data...), nil
+}
+func (m *mockStorage) ListBlocks(context.Context) ([]storage.ObjectRef, error) {
+	var out []storage.ObjectRef
+	for id, data := range m.blocks {
+		key := storage.BlockKey(id)
+		out = append(out, storage.ObjectRef{Key: key, Size: int64(len(data)), LastModified: m.modified[key]})
+	}
+	return out, nil
+}
+func (m *mockStorage) PutManifest(_ context.Context, mm storage.Manifest) (string, error) {
+	if m.putManifestErr != nil {
+		return "", m.putManifestErr
+	}
+	key := mm.Key()
+	m.manifests[key] = mm
+	return key, nil
+}
+func (m *mockStorage) GetManifest(_ context.Context, key string) (storage.Manifest, error) {
+	mm, ok := m.manifests[key]
+	if !ok {
+		return storage.Manifest{}, notFoundError()
+	}
+	return mm, nil
+}
+func (m *mockStorage) ListManifests(context.Context) ([]storage.ObjectRef, error) {
+	var out []storage.ObjectRef
+	for key := range m.manifests {
+		out = append(out, storage.ObjectRef{Key: key, Size: 1, LastModified: m.modified[key]})
+	}
+	return out, nil
+}
+func (m *mockStorage) Store(_ context.Context, r io.Reader) (string, storage.Manifest, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return "", storage.Manifest{}, err
+	}
+	mm := storage.Manifest{Version: 1}
+	for len(data) > 0 {
+		n := len(data)
+		if int64(n) > m.blockSize {
+			n = int(m.blockSize)
+		}
+		chunk := data[:n]
+		data = data[n:]
+		id := sha256hex(chunk)
+		m.blocks[id] = append([]byte(nil), chunk...)
+		mm.Blocks = append(mm.Blocks, storage.Block{ID: id, Size: int64(len(chunk))})
+		mm.Size += int64(len(chunk))
+	}
+	key, err := m.PutManifest(context.Background(), mm)
+	return key, mm, err
+}
+func (m *mockStorage) Open(_ context.Context, key string) (io.ReadSeekCloser, error) {
+	mm, ok := m.manifests[key]
+	if !ok {
+		return nil, notFoundError()
+	}
+	var buf bytes.Buffer
+	for _, b := range mm.Blocks {
+		data, ok := m.blocks[b.ID]
+		if !ok {
+			return nil, notFoundError()
+		}
+		buf.Write(data)
+	}
+	return nopReadSeekCloser{Reader: bytes.NewReader(buf.Bytes())}, nil
+}
+
+type nopReadSeekCloser struct{ *bytes.Reader }
+
+func (nopReadSeekCloser) Close() error { return nil }
+
+func (m *mockStorage) ReadFile(ctx context.Context, key string, limit int64) ([]byte, error) {
+	rc, err := m.Open(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(io.LimitReader(rc, limit+1))
+	if err != nil {
+		return nil, err
 	}
 	if int64(len(data)) > limit {
 		return nil, storage.ErrObjectTooLarge
 	}
-	return append([]byte(nil), data...), nil
+	return data, nil
 }
-func (m *mockStorage) Write(_ context.Context, key, _ string, data []byte) (storage.ObjectInfo, error) {
-	m.contents[key] = append([]byte(nil), data...)
-	info := storage.ObjectInfo{Size: int64(len(data)), ETag: `"mock-etag"`}
-	m.objects[key] = info
-	return info, nil
+func (m *mockStorage) PutObject(_ context.Context, key, _ string, data []byte) (storage.ObjectInfo, error) {
+	m.raw[key] = append([]byte(nil), data...)
+	return storage.ObjectInfo{Size: int64(len(data)), ETag: `"etag"`}, nil
 }
-func (m *mockStorage) Delete(_ context.Context, key string) error {
-	if m.deleteErr != nil {
-		return m.deleteErr
+func (m *mockStorage) OpenRaw(_ context.Context, key string) (io.ReadCloser, error) {
+	data, ok := m.raw[key]
+	if !ok {
+		return nil, notFoundError()
 	}
-	delete(m.objects, key)
-	delete(m.contents, key)
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+func (m *mockStorage) GetObject(ctx context.Context, key string, limit int64) ([]byte, error) {
+	rc, err := m.OpenRaw(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(io.LimitReader(rc, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, storage.ErrObjectTooLarge
+	}
+	return data, nil
+}
+func (m *mockStorage) DeleteObject(_ context.Context, key string) error {
+	delete(m.raw, key)
+	delete(m.manifests, key)
+	delete(m.modified, key)
+	if id := strings.TrimPrefix(key, "blocks/"); id != key {
+		delete(m.blocks, strings.ReplaceAll(id, "/", ""))
+	}
 	return nil
 }
-func (m *mockStorage) CreateMultipart(context.Context, string, string) (string, error) {
-	return "s3-upload", nil
+func (m *mockStorage) PresignGetObject(context.Context, string, string, string, bool, time.Duration) (string, error) {
+	return "https://s3.example/get", nil
 }
-func (m *mockStorage) PresignPart(context.Context, string, string, int32, time.Duration) (string, error) {
-	return "https://s3.example/part", nil
+func (m *mockStorage) ListPrefix(_ context.Context, prefix string) ([]storage.ObjectRef, error) {
+	var out []storage.ObjectRef
+	for key, data := range m.raw {
+		if strings.HasPrefix(key, prefix) {
+			out = append(out, storage.ObjectRef{Key: key, Size: int64(len(data)), LastModified: m.modified[key]})
+		}
+	}
+	return out, nil
 }
-func (m *mockStorage) CompleteMultipart(context.Context, string, string, []storage.CompletedPart) error {
-	return nil
+
+// test helpers
+func (m *mockStorage) putBlock(id string, data []byte) { m.blocks[id] = append([]byte(nil), data...) }
+func (m *mockStorage) age(key string, t time.Time)     { m.modified[key] = t }
+
+func sha256hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
-func (m *mockStorage) AbortMultipart(context.Context, string, string) error { return nil }
 
 type testApp struct {
 	t       *testing.T
 	db      *sql.DB
 	store   *mockStorage
+	srv     *Server
 	handler http.Handler
 	cookie  *http.Cookie
 }
 
 func newTestApp(t *testing.T) *testApp {
+	return newTestAppWithBlockSize(t, 4<<20)
+}
+func newTestAppWithBlockSize(t *testing.T, blockSize int64) *testApp {
 	t.Helper()
 	db, err := database.Open(t.TempDir() + "/cloud.db")
 	if err != nil {
@@ -92,9 +238,11 @@ func newTestApp(t *testing.T) *testApp {
 	if _, err := a.Initialize(context.Background(), "admin", "a-secure-test-password"); err != nil {
 		t.Fatal(err)
 	}
-	store := &mockStorage{objects: map[string]storage.ObjectInfo{}, contents: map[string][]byte{}}
-	cfg := config.Config{BaseURL: "http://example.test", MultipartThreshold: 100, PartSize: 5 * 1024 * 1024, PresignExpires: time.Minute, UploadExpires: time.Hour}
-	app := &testApp{t: t, db: db, store: store, handler: New(db, store, a, cfg, nil).Handler()}
+	store := newMockStorage(blockSize)
+	cfg := config.Config{BaseURL: "http://example.test", BlockSize: blockSize, PresignExpires: time.Minute, UploadExpires: time.Hour}
+	app := &testApp{t: t, db: db, store: store}
+	app.srv = New(db, store, a, cfg, nil)
+	app.handler = app.srv.Handler()
 	resp := app.request("POST", "/api/auth/login", map[string]any{"username": "admin", "password": "a-secure-test-password"}, false)
 	if resp.Code != 200 {
 		t.Fatalf("login status %d: %s", resp.Code, resp.Body.String())
@@ -102,6 +250,39 @@ func newTestApp(t *testing.T) *testApp {
 	app.cookie = resp.Result().Cookies()[0]
 	t.Cleanup(func() { db.Close() })
 	return app
+}
+
+// readyFile stores content as blocks and inserts a ready file row.
+func (a *testApp) readyFile(t *testing.T, name string, content []byte) File {
+	t.Helper()
+	key, m, err := a.store.Store(context.Background(), bytes.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := ids.New()
+	parent := RootID
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := a.db.Exec(`INSERT INTO files(id,parent_id,name,kind,object_key,size,mime_type,etag,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, parent, name, "file", key, m.Size, "application/octet-stream", m.ID(), "ready", now, now); err != nil {
+		t.Fatal(err)
+	}
+	return File{ID: id, ParentID: &parent, Name: name, Kind: "file", Size: m.Size, MimeType: "application/octet-stream", ETag: m.ID(), Status: "ready", CreatedAt: now, UpdatedAt: now, objectKey: key}
+}
+
+type createdUpload struct {
+	UploadID   string `json:"upload_id"`
+	FileID     string `json:"file_id"`
+	Mode       string `json:"mode"`
+	BlockSize  int64  `json:"block_size"`
+	BlockCount int64  `json:"block_count"`
+}
+
+func (a *testApp) createUpload(t *testing.T, name string, size int64) createdUpload {
+	t.Helper()
+	rr := a.request("POST", "/api/uploads", map[string]any{"parent_id": RootID, "name": name, "size": size, "mime_type": "application/octet-stream"}, true)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create upload=%d: %s", rr.Code, rr.Body.String())
+	}
+	return decode[createdUpload](t, rr)
 }
 
 func TestChangeCredentialsRequiresCurrentPasswordAndRevokesSession(t *testing.T) {
@@ -156,6 +337,9 @@ func TestAvatarCanBeUploadedReadAndRemoved(t *testing.T) {
 }
 
 func (a *testApp) request(method, path string, body any, authenticated bool) *httptest.ResponseRecorder {
+	return a.requestH(method, path, body, authenticated, nil)
+}
+func (a *testApp) requestH(method, path string, body any, authenticated bool, headers map[string]string) *httptest.ResponseRecorder {
 	a.t.Helper()
 	var data []byte
 	if body != nil {
@@ -164,6 +348,9 @@ func (a *testApp) request(method, path string, body any, authenticated bool) *ht
 	req := httptest.NewRequest(method, path, bytes.NewReader(data))
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	if authenticated && a.cookie != nil {
 		req.AddCookie(a.cookie)
@@ -211,12 +398,8 @@ func TestDirectoryCannotMoveIntoDescendant(t *testing.T) {
 
 func TestShareLinkCanBeReadRotatedAndRevoked(t *testing.T) {
 	a := newTestApp(t)
-	id := "11111111-1111-4111-8111-111111111111"
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := a.db.Exec(`INSERT INTO files(id,parent_id,name,kind,object_key,size,mime_type,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, id, RootID, "profile.yaml", "file", "objects/profile", 42, "application/octet-stream", "ready", now, now); err != nil {
-		t.Fatal(err)
-	}
-	createdRR := a.request("POST", "/api/files/"+id+"/share", nil, true)
+	f := a.readyFile(t, "profile.yaml", []byte("name: value\n"))
+	createdRR := a.request("POST", "/api/files/"+f.ID+"/share", nil, true)
 	if createdRR.Code != http.StatusCreated {
 		t.Fatalf("create share=%d: %s", createdRR.Code, createdRR.Body.String())
 	}
@@ -235,7 +418,7 @@ func TestShareLinkCanBeReadRotatedAndRevoked(t *testing.T) {
 	if publicRR.Code != http.StatusFound || publicRR.Header().Get("Location") != "https://s3.example/get" {
 		t.Fatalf("public share=%d location=%q", publicRR.Code, publicRR.Header().Get("Location"))
 	}
-	statusRR := a.request("GET", "/api/files/"+id+"/share", nil, true)
+	statusRR := a.request("GET", "/api/files/"+f.ID+"/share", nil, true)
 	status := decode[struct {
 		Active bool   `json:"active"`
 		URL    string `json:"url"`
@@ -243,20 +426,40 @@ func TestShareLinkCanBeReadRotatedAndRevoked(t *testing.T) {
 	if !status.Active || status.URL != created.URL {
 		t.Fatalf("share status=%+v", status)
 	}
-	rotatedRR := a.request("POST", "/api/files/"+id+"/share", nil, true)
-	rotated := decode[struct{ URL string `json:"url"` }](t, rotatedRR)
+	rotatedRR := a.request("POST", "/api/files/"+f.ID+"/share", nil, true)
+	rotated := decode[struct {
+		URL string `json:"url"`
+	}](t, rotatedRR)
 	if rotated.URL == created.URL {
 		t.Fatal("rotating share reused token")
 	}
 	if oldRR := a.request("GET", shareURL.Path, nil, false); oldRR.Code != http.StatusNotFound {
 		t.Fatalf("old share remains active: %d", oldRR.Code)
 	}
-	if revokedRR := a.request("DELETE", "/api/files/"+id+"/share", nil, true); revokedRR.Code != http.StatusNoContent {
+	if revokedRR := a.request("DELETE", "/api/files/"+f.ID+"/share", nil, true); revokedRR.Code != http.StatusNoContent {
 		t.Fatalf("revoke share=%d", revokedRR.Code)
 	}
 	rotatedURL, _ := url.Parse(rotated.URL)
 	if publicRR := a.request("GET", rotatedURL.Path, nil, false); publicRR.Code != http.StatusNotFound {
 		t.Fatalf("revoked share remains active: %d", publicRR.Code)
+	}
+}
+
+func TestPublicShareStreamsMultiBlockFiles(t *testing.T) {
+	a := newTestAppWithBlockSize(t, 8)
+	content := []byte("0123456789ABCDEFGHIJ")
+	f := a.readyFile(t, "clip.mp4", content)
+	share := a.request("POST", "/api/files/"+f.ID+"/share", nil, true)
+	created := decode[struct {
+		URL string `json:"url"`
+	}](t, share)
+	u, _ := url.Parse(created.URL)
+	rr := a.requestH("GET", u.Path, nil, false, map[string]string{"Range": "bytes=5-13"})
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("shared range status=%d: %s", rr.Code, rr.Body.String())
+	}
+	if rr.Body.String() != string(content[5:14]) {
+		t.Fatalf("shared range body=%q", rr.Body.String())
 	}
 }
 
@@ -269,22 +472,28 @@ func TestResponseMimeRecognizesYAML(t *testing.T) {
 
 func TestMediaPreviewAndStorageStats(t *testing.T) {
 	a := newTestApp(t)
-	now := time.Now().UTC().Format(time.RFC3339Nano)
 	files := []struct {
-		id, name, mime string
-		size           int64
+		name, mime string
+		size       int64
 	}{
-		{"video-id", "clip.mp4", "application/octet-stream", 2048},
-		{"audio-id", "song.wav", "application/octet-stream", 4096},
-		{"image-id", "animated.gif", "image/gif", 1024},
+		{"clip.mp4", "application/octet-stream", 2048},
+		{"song.wav", "application/octet-stream", 4096},
+		{"animated.gif", "image/gif", 1024},
 	}
 	for _, f := range files {
-		if _, err := a.db.Exec(`INSERT INTO files(id,parent_id,name,kind,object_key,size,mime_type,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, f.id, RootID, f.name, "file", "objects/"+f.id, f.size, f.mime, "ready", now, now); err != nil {
-			t.Fatal(err)
-		}
-		preview := a.request("GET", "/api/files/"+f.id+"/preview", nil, true)
+		a.readyFile(t, f.name, bytes.Repeat([]byte("x"), int(f.size)))
+	}
+	rr := a.request("GET", "/api/files/"+RootID+"/children", nil, true)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("children=%d: %s", rr.Code, rr.Body.String())
+	}
+	items := decode[struct {
+		Items []File `json:"items"`
+	}](t, rr)
+	for _, item := range items.Items {
+		preview := a.request("GET", "/api/files/"+item.ID+"/preview", nil, true)
 		if preview.Code != http.StatusFound {
-			t.Fatalf("preview %s=%d: %s", f.name, preview.Code, preview.Body.String())
+			t.Fatalf("preview %s=%d: %s", item.Name, preview.Code, preview.Body.String())
 		}
 	}
 	if got := responseMime(File{Name: "song.mp3", MimeType: "application/octet-stream"}); got != "audio/mpeg" {
@@ -313,6 +522,13 @@ func TestCreateReadAndUpdateDocument(t *testing.T) {
 	if created.Status != "ready" || created.MimeType != "text/markdown; charset=utf-8" {
 		t.Fatalf("created document=%+v", created)
 	}
+	var firstKey string
+	if err := a.db.QueryRow(`SELECT object_key FROM files WHERE id=?`, created.ID).Scan(&firstKey); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(firstKey, "manifests/") {
+		t.Fatalf("document object key=%q", firstKey)
+	}
 	readRR := a.request("GET", "/api/files/"+created.ID+"/content", nil, true)
 	if readRR.Code != http.StatusOK {
 		t.Fatalf("read document=%d: %s", readRR.Code, readRR.Body.String())
@@ -332,65 +548,333 @@ func TestCreateReadAndUpdateDocument(t *testing.T) {
 	if updatedRR.Code != http.StatusOK {
 		t.Fatalf("update document=%d: %s", updatedRR.Code, updatedRR.Body.String())
 	}
+	var secondKey string
+	if err := a.db.QueryRow(`SELECT object_key FROM files WHERE id=?`, created.ID).Scan(&secondKey); err != nil {
+		t.Fatal(err)
+	}
+	if secondKey == firstKey {
+		t.Fatal("updated document kept the old manifest")
+	}
 	reread := a.request("GET", "/api/files/"+created.ID+"/content", nil, true)
-	got := decode[struct{ Content string `json:"content"` }](t, reread)
+	got := decode[struct {
+		Content string `json:"content"`
+	}](t, reread)
 	if got.Content != "# Saved\n" {
 		t.Fatalf("updated content=%q", got.Content)
 	}
 }
 
-func TestSingleUploadRequiresHeadVerification(t *testing.T) {
+func TestBlockUploadLifecycle(t *testing.T) {
 	a := newTestApp(t)
-	createdRR := a.request("POST", "/api/uploads", map[string]any{"parent_id": RootID, "name": "hello.txt", "size": 12, "mime_type": "text/plain"}, true)
-	if createdRR.Code != 201 {
-		t.Fatalf("create upload=%d: %s", createdRR.Code, createdRR.Body.String())
+	created := a.createUpload(t, "hello.txt", 12)
+	if created.Mode != "blocks" || created.BlockCount != 1 || created.BlockSize != 4<<20 {
+		t.Fatalf("created upload=%+v", created)
 	}
-	created := decode[map[string]any](t, createdRR)
-	uploadID := created["upload_id"].(string)
-	var objectKey string
-	if err := a.db.QueryRow(`SELECT f.object_key FROM files f JOIN uploads u ON u.file_id=f.id WHERE u.id=?`, uploadID).Scan(&objectKey); err != nil {
+	var key sql.NullString
+	if err := a.db.QueryRow(`SELECT object_key FROM files WHERE id=?`, created.FileID).Scan(&key); err != nil {
 		t.Fatal(err)
 	}
-	a.store.objects[objectKey] = storage.ObjectInfo{Size: 12, ETag: "etag"}
-	complete := a.request("POST", "/api/uploads/"+uploadID+"/complete", map[string]any{}, true)
-	if complete.Code != 200 {
-		t.Fatalf("complete=%d: %s", complete.Code, complete.Body.String())
+	if key.Valid {
+		t.Fatal("pending file must not have an object key")
+	}
+	content := []byte("hello, world")
+	id := sha256hex(content)
+	regRR := a.request("POST", "/api/uploads/"+created.UploadID+"/blocks", map[string]any{"blocks": []map[string]any{{"id": id, "size": int64(len(content))}}}, true)
+	if regRR.Code != http.StatusOK {
+		t.Fatalf("register blocks=%d: %s", regRR.Code, regRR.Body.String())
+	}
+	reg := decode[struct {
+		Blocks []struct {
+			ID     string `json:"id"`
+			Exists bool   `json:"exists"`
+			URL    string `json:"url"`
+		} `json:"blocks"`
+	}](t, regRR)
+	if len(reg.Blocks) != 1 || reg.Blocks[0].Exists || reg.Blocks[0].URL == "" {
+		t.Fatalf("registration=%+v", reg.Blocks)
+	}
+	// Completing before the block is uploaded fails with a repair list.
+	completeRR := a.request("POST", "/api/uploads/"+created.UploadID+"/complete", map[string]any{"blocks": []map[string]any{{"id": id, "size": int64(len(content))}}}, true)
+	if completeRR.Code != http.StatusConflict {
+		t.Fatalf("complete without blocks=%d: %s", completeRR.Code, completeRR.Body.String())
+	}
+	missing := decode[struct {
+		Error struct {
+			MissingBlocks []string `json:"missing_blocks"`
+		} `json:"error"`
+	}](t, completeRR)
+	if len(missing.Error.MissingBlocks) != 1 || missing.Error.MissingBlocks[0] != id {
+		t.Fatalf("missing blocks=%+v", missing.Error.MissingBlocks)
+	}
+	// Client uploads the block, then completes.
+	a.store.putBlock(id, content)
+	doneRR := a.request("POST", "/api/uploads/"+created.UploadID+"/complete", map[string]any{"blocks": []map[string]any{{"id": id, "size": int64(len(content))}}}, true)
+	if doneRR.Code != http.StatusOK {
+		t.Fatalf("complete=%d: %s", doneRR.Code, doneRR.Body.String())
+	}
+	done := decode[File](t, doneRR)
+	if done.Status != "ready" {
+		t.Fatalf("status=%s", done.Status)
+	}
+	var objKey string
+	if err := a.db.QueryRow(`SELECT object_key FROM files WHERE id=?`, created.FileID).Scan(&objKey); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(objKey, "manifests/") {
+		t.Fatalf("object key=%q", objKey)
+	}
+	// Single-block files still download straight from S3.
+	dl := a.request("GET", "/api/files/"+created.FileID+"/download", nil, true)
+	if dl.Code != http.StatusFound {
+		t.Fatalf("download=%d: %s", dl.Code, dl.Body.String())
+	}
+	// Deleting removes only metadata; the block stays for the GC.
+	if del := a.request("DELETE", "/api/files/"+created.FileID, nil, true); del.Code != http.StatusNoContent {
+		t.Fatalf("delete=%d: %s", del.Code, del.Body.String())
+	}
+	if _, ok := a.store.blocks[id]; !ok {
+		t.Fatal("deleting a file must not delete shared blocks")
+	}
+}
+
+func TestBlockUploadRejectsInvalidLists(t *testing.T) {
+	a := newTestAppWithBlockSize(t, 8)
+	created := a.createUpload(t, "big.bin", 20)
+	bad := map[string]any{
+		"blocks": []map[string]any{
+			{"id": sha256hex([]byte("01234567")), "size": 8},
+			{"id": sha256hex([]byte("89ABCDEF")), "size": 8},
+		},
+	}
+	if rr := a.request("POST", "/api/uploads/"+created.UploadID+"/complete", bad, true); rr.Code != http.StatusBadRequest {
+		t.Fatalf("wrong block count=%d: %s", rr.Code, rr.Body.String())
+	}
+	wrongSize := map[string]any{
+		"blocks": []map[string]any{
+			{"id": sha256hex([]byte("01234567")), "size": 7},
+			{"id": sha256hex([]byte("89ABCDEF")), "size": 8},
+			{"id": sha256hex([]byte("GHIJ")), "size": 4},
+		},
+	}
+	if rr := a.request("POST", "/api/uploads/"+created.UploadID+"/complete", wrongSize, true); rr.Code != http.StatusBadRequest {
+		t.Fatalf("wrong block size=%d: %s", rr.Code, rr.Body.String())
+	}
+	badID := map[string]any{
+		"blocks": []map[string]any{
+			{"id": "not-a-hash", "size": 8},
+			{"id": sha256hex([]byte("89ABCDEF")), "size": 8},
+			{"id": sha256hex([]byte("GHIJ")), "size": 4},
+		},
+	}
+	if rr := a.request("POST", "/api/uploads/"+created.UploadID+"/complete", badID, true); rr.Code != http.StatusBadRequest {
+		t.Fatalf("bad block id=%d: %s", rr.Code, rr.Body.String())
+	}
+	oversized := map[string]any{"blocks": []map[string]any{{"id": sha256hex([]byte("x")), "size": 64}}}
+	if rr := a.request("POST", "/api/uploads/"+created.UploadID+"/blocks", oversized, true); rr.Code != http.StatusBadRequest {
+		t.Fatalf("oversized registration=%d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestMultiBlockUploadStreamsWithRangeSupport(t *testing.T) {
+	a := newTestAppWithBlockSize(t, 8)
+	content := []byte("0123456789ABCDEFGHIJ")
+	created := a.createUpload(t, "big.bin", 20)
+	if created.BlockCount != 3 {
+		t.Fatalf("block count=%d", created.BlockCount)
+	}
+	blocks := []struct {
+		data []byte
+		size int64
+	}{
+		{content[0:8], 8},
+		{content[8:16], 8},
+		{content[16:20], 4},
+	}
+	regBody := make([]map[string]any, len(blocks))
+	for i, b := range blocks {
+		regBody[i] = map[string]any{"id": sha256hex(b.data), "size": b.size}
+	}
+	regRR := a.request("POST", "/api/uploads/"+created.UploadID+"/blocks", map[string]any{"blocks": regBody}, true)
+	if regRR.Code != http.StatusOK {
+		t.Fatalf("register=%d: %s", regRR.Code, regRR.Body.String())
+	}
+	for _, b := range blocks {
+		a.store.putBlock(sha256hex(b.data), b.data)
+	}
+	doneRR := a.request("POST", "/api/uploads/"+created.UploadID+"/complete", map[string]any{"blocks": regBody}, true)
+	if doneRR.Code != http.StatusOK {
+		t.Fatalf("complete=%d: %s", doneRR.Code, doneRR.Body.String())
+	}
+	full := a.request("GET", "/api/files/"+created.FileID+"/download", nil, true)
+	if full.Code != http.StatusOK {
+		t.Fatalf("full download=%d: %s", full.Code, full.Body.String())
+	}
+	if full.Body.String() != string(content) {
+		t.Fatalf("full body=%q", full.Body.String())
+	}
+	partial := a.requestH("GET", "/api/files/"+created.FileID+"/download", nil, true, map[string]string{"Range": "bytes=2-9"})
+	if partial.Code != http.StatusPartialContent {
+		t.Fatalf("range status=%d: %s", partial.Code, partial.Body.String())
+	}
+	if partial.Body.String() != string(content[2:10]) {
+		t.Fatalf("range body=%q", partial.Body.String())
+	}
+	// Preview is inline for media types; verify serving works there too.
+	media := a.readyFile(t, "clip.mp4", content)
+	seek := a.requestH("GET", "/api/files/"+media.ID+"/preview", nil, true, map[string]string{"Range": "bytes=18-"})
+	if seek.Code != http.StatusPartialContent || seek.Body.String() != string(content[18:]) {
+		t.Fatalf("preview range=%d body=%q", seek.Code, seek.Body.String())
+	}
+}
+
+func TestIdenticalFilesShareBlocksAndManifest(t *testing.T) {
+	a := newTestApp(t)
+	f1 := a.readyFile(t, "one.bin", []byte("same content"))
+	f2 := a.readyFile(t, "two.bin", []byte("same content"))
+	if f1.objectKey != f2.objectKey || f1.ETag != f2.ETag {
+		t.Fatal("identical files should share a manifest")
+	}
+	if del := a.request("DELETE", "/api/files/"+f1.ID, nil, true); del.Code != http.StatusNoContent {
+		t.Fatalf("delete=%d: %s", del.Code, del.Body.String())
+	}
+	dl := a.request("GET", "/api/files/"+f2.ID+"/download", nil, true)
+	if dl.Code != http.StatusFound {
+		t.Fatalf("second copy broken after delete: %d", dl.Code)
+	}
+}
+
+func TestEmptyFileUpload(t *testing.T) {
+	a := newTestApp(t)
+	created := a.createUpload(t, "empty.bin", 0)
+	if created.BlockCount != 0 {
+		t.Fatalf("block count=%d", created.BlockCount)
+	}
+	doneRR := a.request("POST", "/api/uploads/"+created.UploadID+"/complete", map[string]any{"blocks": []map[string]any{}}, true)
+	if doneRR.Code != http.StatusOK {
+		t.Fatalf("complete=%d: %s", doneRR.Code, doneRR.Body.String())
+	}
+	dl := a.request("GET", "/api/files/"+created.FileID+"/download", nil, true)
+	if dl.Code != http.StatusOK || dl.Body.Len() != 0 {
+		t.Fatalf("empty download=%d bytes=%d", dl.Code, dl.Body.Len())
+	}
+}
+
+func TestDeleteRejectsPendingFile(t *testing.T) {
+	a := newTestApp(t)
+	created := a.createUpload(t, "pending.bin", 100)
+	if rr := a.request("DELETE", "/api/files/"+created.FileID, nil, true); rr.Code != http.StatusConflict {
+		t.Fatalf("delete pending=%d", rr.Code)
+	}
+	if rr := a.request("DELETE", "/api/uploads/"+created.UploadID, nil, true); rr.Code != http.StatusNoContent {
+		t.Fatalf("abort=%d: %s", rr.Code, rr.Body.String())
+	}
+	var n int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM files WHERE id=?`, created.FileID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("aborted upload left its file row behind")
+	}
+}
+
+func TestGarbageCollector(t *testing.T) {
+	a := newTestAppWithBlockSize(t, 8)
+	fa := a.readyFile(t, "a.bin", []byte("AAAAAAAABBBBBBBB"))
+	fb := a.readyFile(t, "b.bin", []byte("CCCCCCCCDDDDDDDD"))
+	blockA, blockB := sha256hex([]byte("AAAAAAAA")), sha256hex([]byte("BBBBBBBB"))
+	blockC, blockD := sha256hex([]byte("CCCCCCCC")), sha256hex([]byte("DDDDDDDD"))
+	if del := a.request("DELETE", "/api/files/"+fb.ID, nil, true); del.Code != http.StatusNoContent {
+		t.Fatalf("delete=%d: %s", del.Code, del.Body.String())
+	}
+	// Mock objects default to a zero LastModified, i.e. older than any
+	// grace period — everything unreferenced should be collected.
+	a.srv.CollectGarbage(context.Background())
+	if _, ok := a.store.manifests[fb.objectKey]; ok {
+		t.Fatal("orphan manifest was not collected")
+	}
+	if _, ok := a.store.blocks[blockC]; ok {
+		t.Fatal("orphan block C was not collected")
+	}
+	if _, ok := a.store.blocks[blockD]; ok {
+		t.Fatal("orphan block D was not collected")
+	}
+	if _, ok := a.store.manifests[fa.objectKey]; !ok {
+		t.Fatal("referenced manifest was collected")
+	}
+	if _, ok := a.store.blocks[blockA]; !ok {
+		t.Fatal("shared block A was collected")
+	}
+	if _, ok := a.store.blocks[blockB]; !ok {
+		t.Fatal("shared block B was collected")
+	}
+	// Young orphan blocks (in-flight uploads) survive the grace period.
+	young := sha256hex([]byte("WWWWWWWW"))
+	a.store.putBlock(young, []byte("WWWWWWWW"))
+	a.store.age(storage.BlockKey(young), time.Now())
+	a.srv.CollectGarbage(context.Background())
+	if _, ok := a.store.blocks[young]; !ok {
+		t.Fatal("young orphan block was collected")
+	}
+}
+
+func TestLegacyObjectsAreMigratedToBlocks(t *testing.T) {
+	a := newTestApp(t)
+	content := []byte("legacy whole object content")
+	legacyKey := "objects/legacy-1"
+	a.store.raw[legacyKey] = append([]byte(nil), content...)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	id := ids.New()
+	if _, err := a.db.Exec(`INSERT INTO files(id,parent_id,name,kind,object_key,size,status,created_at,updated_at) VALUES(?,?,?,?,?,?,'ready',?,?)`, id, RootID, "legacy.bin", "file", legacyKey, len(content), now, now); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := a.srv.MigrateLegacyObjects(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated != 1 {
+		t.Fatalf("migrated=%d", migrated)
+	}
+	var key, etag string
+	if err := a.db.QueryRow(`SELECT object_key,etag FROM files WHERE id=?`, id).Scan(&key, &etag); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(key, "manifests/") || !storage.ValidBlockID(etag) {
+		t.Fatalf("migrated key=%q etag=%q", key, etag)
+	}
+	if _, ok := a.store.raw[legacyKey]; ok {
+		t.Fatal("legacy object was not deleted after migration")
+	}
+	dl := a.request("GET", "/api/files/"+id+"/download", nil, true)
+	if dl.Code != http.StatusFound {
+		t.Fatalf("migrated download=%d: %s", dl.Code, dl.Body.String())
+	}
+}
+
+func TestLegacyMigrationMarksMissingObjectsFailed(t *testing.T) {
+	a := newTestApp(t)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	id := ids.New()
+	if _, err := a.db.Exec(`INSERT INTO files(id,parent_id,name,kind,object_key,size,status,created_at,updated_at) VALUES(?,?,?,?,?,?,'ready',?,?)`, id, RootID, "gone.bin", "file", "objects/gone", 5, now, now); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := a.srv.MigrateLegacyObjects(context.Background())
+	if err != nil || migrated != 0 {
+		t.Fatalf("migrated=%d err=%v", migrated, err)
 	}
 	var status string
-	if err := a.db.QueryRow(`SELECT status FROM files WHERE object_key=?`, objectKey).Scan(&status); err != nil {
+	if err := a.db.QueryRow(`SELECT status FROM files WHERE id=?`, id).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
-	if status != "ready" {
+	if status != "failed" {
 		t.Fatalf("status=%s", status)
 	}
 }
 
-func TestDeleteFailureRetainsDeletingMetadata(t *testing.T) {
-	a := newTestApp(t)
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := a.db.Exec(`INSERT INTO files(id,parent_id,name,kind,object_key,size,status,created_at,updated_at) VALUES('file-id',?,'keep.txt','file','objects/key',1,'ready',?,?)`, RootID, now, now)
-	if err != nil {
-		t.Fatal(err)
+func TestBlockLayoutHelpers(t *testing.T) {
+	if blockCount(0, 8) != 0 || blockCount(1, 8) != 1 || blockCount(8, 8) != 1 || blockCount(9, 8) != 2 || blockCount(16, 8) != 2 || blockCount(17, 8) != 3 {
+		t.Fatal("blockCount is wrong")
 	}
-	a.store.objects["objects/key"] = storage.ObjectInfo{Size: 1}
-	a.store.deleteErr = errors.New("S3 unavailable")
-	rr := a.request("DELETE", "/api/files/file-id", nil, true)
-	if rr.Code != 502 {
-		t.Fatalf("delete=%d", rr.Code)
-	}
-	var status string
-	if err := a.db.QueryRow(`SELECT status FROM files WHERE id='file-id'`).Scan(&status); err != nil {
-		t.Fatal(err)
-	}
-	if status != "deleting" {
-		t.Fatalf("status=%s", status)
-	}
-	a.store.deleteErr = nil
-	retry := a.request("DELETE", "/api/files/file-id", nil, true)
-	if retry.Code != http.StatusNoContent {
-		t.Fatalf("delete retry=%d: %s", retry.Code, retry.Body.String())
-	}
-	if err := a.db.QueryRow(`SELECT status FROM files WHERE id='file-id'`).Scan(&status); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("metadata should be removed after retry, got %v", err)
+	if expectedBlockSize(20, 8, 0) != 8 || expectedBlockSize(20, 8, 1) != 8 || expectedBlockSize(20, 8, 2) != 4 {
+		t.Fatal("expectedBlockSize is wrong")
 	}
 }

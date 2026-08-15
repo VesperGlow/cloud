@@ -22,9 +22,9 @@ services:
       S3_SECRET_KEY: "${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}"
       S3_PATH_STYLE: "true"
       PRESIGN_EXPIRES: "${PRESIGN_EXPIRES:-15m}"
-      MULTIPART_THRESHOLD: "${MULTIPART_THRESHOLD:-104857600}"
+      BLOCK_SIZE: "${BLOCK_SIZE:-4194304}"
       UPLOAD_EXPIRES: "${UPLOAD_EXPIRES:-24h}"
-      PART_SIZE: "${PART_SIZE:-16777216}"
+      GC_INTERVAL: "${GC_INTERVAL:-1h}"
     volumes:
       - cloud-data:/data
     healthcheck:

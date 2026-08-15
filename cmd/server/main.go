@@ -63,6 +63,12 @@ func main() {
 	app := server.New(db, store, authService, cfg, log)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// One-time re-store of whole objects created before block storage.
+	if migrated, err := app.MigrateLegacyObjects(context.Background()); err != nil {
+		log.Error("legacy object migration failed; it will be retried on the next start", "error", err)
+	} else if migrated > 0 {
+		log.Info("legacy objects re-stored as content-addressed blocks", "files", migrated)
+	}
 	go func() {
 		ticker := time.NewTicker(15 * time.Minute)
 		defer ticker.Stop()
@@ -76,6 +82,21 @@ func main() {
 			}
 		}
 	}()
+	if cfg.GCInterval > 0 {
+		go func() {
+			app.CollectGarbage(context.Background())
+			ticker := time.NewTicker(cfg.GCInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					app.CollectGarbage(context.Background())
+				}
+			}
+		}()
+	}
 	app.CleanupExpiredUploads(context.Background())
 	authService.Cleanup(context.Background())
 	httpServer := &http.Server{Addr: cfg.Addr, Handler: app.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 1 << 20}
