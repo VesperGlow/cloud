@@ -66,19 +66,34 @@ function notify(text:string, kind:'error'|'success'='error') { toast.text=text;t
 function isBook(item:DriveFile){return item.kind==='file'&&item.status==='ready'&&/\.(epub|txt)$/i.test(item.name)}
 function openReader(item:DriveFile){readerFile.value=item;openModal('reader');history.replaceState({cloudNav:true},'','/read/'+item.id)}
 async function checkSession() {
-  try { const me=await api<ProfileResponse>('/api/auth/me');user.value=me.username;hasAvatar.value=me.has_avatar;await openFolder(ROOT);openDeepLink() }
+  try { const me=await api<ProfileResponse>('/api/auth/me');user.value=me.username;hasAvatar.value=me.has_avatar;await openRoute() }
   catch { user.value=null;hasAvatar.value=false }
   finally { checking.value=false }
+}
+// 启动路由：按 URL 恢复到对应文件夹（/f/{id}），再处理阅读器深链。
+async function openRoute(){
+  const fm=location.pathname.match(/^\/f\/([^/]+)\/?$/)
+  suppressHistory=true
+  try{
+    if(fm){
+      const id=decodeURIComponent(fm[1])
+      await openFolder(id)
+      if(currentId.value!==id)history.replaceState({cloudNav:true},'','/')
+    }else{
+      await openFolder(ROOT)
+    }
+  }finally{suppressHistory=false}
+  openDeepLink()
 }
 // 深链 /read/{fileId}：登录后直接打开阅读器。
 async function openDeepLink(){
   const m=location.pathname.match(/^\/read\/([^/]+)\/?$/)
   if(!m)return
-  history.replaceState({cloudNav:true},'','/')
+  history.replaceState({cloudNav:true},'',folderURL(currentId.value))
   try{
     const data=await api<{file:DriveFile}>(`/api/files/${decodeURIComponent(m[1])}`)
     if(data.file.kind==='file'&&isBook(data.file))openReader(data.file)
-  }catch{/* 文件不存在或不可读：留在首页 */}
+  }catch{/* 文件不存在或不可读：留在当前文件夹 */}
 }
 async function submitLogin() {
   login.busy=true;login.error='';login.notice=''
@@ -119,7 +134,8 @@ async function saveAccount(){
   finally{modalBusy.value=false}
 }
 
-async function openFolder(id:string){loading.value=true;try{const [meta,list,stats]=await Promise.all([api<{file:DriveFile;breadcrumbs:DriveFile[]}>(`/api/files/${id}`),api<{items:DriveFile[]}>(`/api/files/${id}/children`),api<StorageStats>('/api/storage/stats')]);if(!suppressHistory&&id!==currentId.value){navActions.value.push({kind:'folder',id:currentId.value});window.history.pushState({cloudNav:true},'')}currentId.value=id;current.value=meta.file;breadcrumbs.value=meta.breadcrumbs;items.value=list.items;storageStats.total_bytes=stats.total_bytes;storageStats.file_count=stats.file_count;selected.value=null}catch(e){notify((e as Error).message)}finally{loading.value=false}}
+function folderURL(id:string){return id===ROOT?'/':'/f/'+id}
+async function openFolder(id:string){loading.value=true;try{const [meta,list,stats]=await Promise.all([api<{file:DriveFile;breadcrumbs:DriveFile[]}>(`/api/files/${id}`),api<{items:DriveFile[]}>(`/api/files/${id}/children`),api<StorageStats>('/api/storage/stats')]);if(!suppressHistory&&id!==currentId.value){navActions.value.push({kind:'folder',id:currentId.value});window.history.pushState({cloudNav:true},'')}currentId.value=id;current.value=meta.file;breadcrumbs.value=meta.breadcrumbs;items.value=list.items;storageStats.total_bytes=stats.total_bytes;storageStats.file_count=stats.file_count;selected.value=null;history.replaceState({cloudNav:true},'',folderURL(id))}catch(e){notify((e as Error).message)}finally{loading.value=false}}
 
 // 应用内导航历史：每次进入文件夹/打开弹窗都 pushState，系统返回键先关
 // 弹窗、再逐级返回上一屏，而不是直接退出整个应用。
@@ -131,7 +147,7 @@ function handlePopState(){
   const action=navActions.value.pop()
   if(!action)return
   if(action.kind==='modal-close'){
-    if(modal.value==='reader')history.replaceState({cloudNav:true},'','/')
+    if(modal.value==='reader')history.replaceState({cloudNav:true},'',folderURL(currentId.value))
     modal.value=null;return
   }
   popChain=popChain.then(async()=>{
