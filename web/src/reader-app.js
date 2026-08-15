@@ -23,7 +23,8 @@ export const ReaderApp = (function () {
   let resizeTimer = null;
   let suppressZoneClick = 0; // 滑动翻页后短暂吞掉热区补发的 click，避免一次滑动翻两页/误切工具栏
 
-  // state: { bookId, info, kind, contentNode, toc, tocEntries,
+  // state: { bookId, info, kind, segments, pages, currentSeg, currentCol,
+  //          currentX, currentTop, toc, tocEntries,
   //          currentPage, pageCount, pageWidth, pageHeight, restoreRatio }
 
   function init(rootElement) {
@@ -144,7 +145,7 @@ export const ReaderApp = (function () {
         suppressZoneClick = Date.now() + 600;
       }
       const atEdge = (active.currentPage === 0 && dx > 0) || (active.currentPage >= active.pageCount - 1 && dx < 0);
-      setTransform(active, -active.currentPage * active.pageStep + (atEdge ? dx / 3 : dx), false);
+      setTransform(active, active.currentX + (atEdge ? dx / 3 : dx), false);
     }, { passive: true });
 
     els.viewport.addEventListener('touchend', event => {
@@ -262,7 +263,7 @@ export const ReaderApp = (function () {
   function applyActiveToDom() {
     if (!active) return;
     setHeader(active.info);
-    const mounted = els.page.firstElementChild === active.contentNode;
+    const mounted = els.page.firstElementChild === active.segments;
     if (!mounted || active.pageWidth !== els.viewport.clientWidth || active.pageHeight !== els.viewport.clientHeight) {
       activate(active);
     } else {
@@ -288,12 +289,13 @@ export const ReaderApp = (function () {
       .catch(() => ({ page: 0, total_pages: null }));
 
     setLoading('正在读取书籍…');
-    // 解析已在服务端完成：EPUB 返回清洗好的正文 HTML + 目录，TXT 返回原文 + 目录偏移。
+    // 解析已在服务端完成：EPUB 返回逐章清洗好的正文，TXT 返回原文 + 目录偏移。
     const model = await fetchContent(bookId);
-    const contentNode = assembleContent(model);
+    const segments = assembleSegments(model);
     const state = {
-      bookId, info, kind: info.kind, contentNode,
+      bookId, info, kind: info.kind, segments,
       toc: model.toc || [], tocEntries: [],
+      pages: [], currentSeg: null, currentCol: 0, currentX: 0, currentTop: 0,
       currentPage: 0, pageCount: 1, pageWidth: 0, pageHeight: 0, restoreRatio: 0,
     };
     const progress = await savedProgress;
@@ -303,30 +305,56 @@ export const ReaderApp = (function () {
     return state;
   }
 
-  function assembleContent(model) {
+  // 分段渲染：每章一个分栏段，翻页只滑动当前段的小层，不再把整本书
+  // 扛进一个巨型合成层（那是重型页面里翻页卡顿的根源）。
+  function assembleSegments(model) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'book-segments';
     if (model.kind === 'txt') {
-      const node = document.createElement('div');
-      node.className = 'book-content txt';
       const text = model.text || '';
-      const toc = (model.toc || []).map((entry, index) => ({ offset: Number(entry.offset) || 0, index }))
+      const marks = (model.toc || [])
+        .map((entry, index) => ({ offset: Number(entry.offset) || 0, index }))
         .sort((a, b) => a.offset - b.offset);
-      let pos = 0;
-      for (const { offset, index } of toc) {
-        const at = Math.max(pos, Math.min(text.length, offset));
-        if (at > pos) node.appendChild(document.createTextNode(text.slice(pos, at)));
-        const anchor = document.createElement('span');
-        anchor.className = 'toc-anchor';
-        anchor.dataset.toc = String(index);
-        node.appendChild(anchor);
-        pos = at;
+      // 以章节目录为界切段；没有目录时按固定长度切段，避免单段过大
+      const cuts = [0];
+      for (const m of marks) if (m.offset > 0 && m.offset < text.length) cuts.push(m.offset);
+      cuts.push(text.length);
+      if (!marks.length && text.length > 60000) {
+        const size = 20000;
+        cuts.length = 0;
+        for (let pos = 0; pos < text.length; pos += size) cuts.push(pos);
+        cuts.push(text.length);
       }
-      node.appendChild(document.createTextNode(text.slice(pos)));
-      return node;
+      for (let k = 0; k < cuts.length - 1; k++) {
+        const start = cuts[k], end = cuts[k + 1];
+        if (end <= start) continue;
+        const node = document.createElement('div');
+        node.className = 'book-content txt';
+        if (start > 0) {
+          for (const m of marks) {
+            if (m.offset === start) {
+              const anchor = document.createElement('span');
+              anchor.className = 'toc-anchor';
+              anchor.dataset.toc = String(m.index);
+              node.appendChild(anchor);
+            }
+          }
+        }
+        node.appendChild(document.createTextNode(text.slice(start, end)));
+        wrapper.appendChild(node);
+      }
+      if (!wrapper.childNodes.length) wrapper.appendChild(document.createElement('div'));
+      return wrapper;
     }
-    const node = document.createElement('div');
-    node.className = 'book-content epub';
-    node.innerHTML = model.html || '';
-    return node;
+    const chapters = (model.chapters && model.chapters.length) ? model.chapters : [{ html: model.html || '' }];
+    for (const chapter of chapters) {
+      const node = document.createElement('div');
+      node.className = 'book-content epub';
+      node.innerHTML = chapter.html || '';
+      wrapper.appendChild(node);
+    }
+    if (!wrapper.childNodes.length) wrapper.appendChild(document.createElement('div'));
+    return wrapper;
   }
 
   async function fetchBookInfo(bookId) {
@@ -345,9 +373,12 @@ export const ReaderApp = (function () {
     return await response.json();
   }
 
-  // ---- 分栏布局 / 翻页 ----
+  // ---- 分段分栏布局 / 翻页 ----
+  // 每章一个分栏段：段们纵向堆叠在 wrapper 里，翻页只滑动当前段的小层
+  // （章大小），跨章用 wrapper 的 top 定位瞬时切换；不再把整本书扛进
+  // 一个数千页宽的巨型合成层——那是重型页面里翻页卡顿的根源。
   function activate(state) {
-    if (els.page.firstElementChild !== state.contentNode) els.page.replaceChildren(state.contentNode);
+    if (els.page.firstElementChild !== state.segments) els.page.replaceChildren(state.segments);
     measure(state);
     if (state.restoreRatio != null) {
       state.currentPage = Math.round(state.restoreRatio * Math.max(0, state.pageCount - 1));
@@ -357,44 +388,75 @@ export const ReaderApp = (function () {
   }
 
   function measure(state) {
-    const node = state.contentNode;
     const width = els.viewport.clientWidth;
     const height = els.viewport.clientHeight;
     let sidePad = Math.round(Math.min(Math.max(width * 0.055, 16), 44));
     if (width - 2 * sidePad > MAX_COLUMN) sidePad = Math.round((width - MAX_COLUMN) / 2);
-    // 关键：把容器宽度钉成整数、box-sizing 内联强制，保证栏距严格 = 整数屏宽，
-    // 否则浏览器用小数宽拉伸单栏，会让 translateX 逐页漂移、文字接不上。
-    node.style.boxSizing = 'border-box';
-    node.style.width = `${width}px`;
-    node.style.height = `${height}px`;
-    node.style.padding = `60px ${sidePad}px 24px`;
-    node.style.columnWidth = `${Math.max(1, width - 2 * sidePad)}px`;
-    node.style.columnGap = `${2 * sidePad}px`;
-    node.style.columnFill = 'auto';
-    node.style.transition = 'none'; // 重排必须瞬时归位，不能沿用上次翻页残留的过渡
-    node.style.transform = 'translateX(0px)';
-    if (currentAnim) { currentAnim.cancel(); currentAnim = null; }
-    lastX = 0;
     state.pageWidth = width;
     state.pageHeight = height;
     state.pageStep = width;
-    state.pageCount = Math.max(1, Math.round(node.scrollWidth / width));
+    state.pages = [];
+    let top = 0;
+    for (const node of state.segments.children) {
+      // 关键：把容器宽度钉成整数、box-sizing 内联强制，保证栏距严格 = 整数屏宽，
+      // 否则浏览器用小数宽拉伸单栏，会让 translateX 逐页漂移、文字接不上。
+      node.style.boxSizing = 'border-box';
+      node.style.width = `${width}px`;
+      node.style.height = `${height}px`;
+      node.style.padding = `60px ${sidePad}px 24px`;
+      node.style.columnWidth = `${Math.max(1, width - 2 * sidePad)}px`;
+      node.style.columnGap = `${2 * sidePad}px`;
+      node.style.columnFill = 'auto';
+      node.style.transition = 'none';
+      node.style.transform = 'none'; // 空闲段不提升合成层
+      node._cols = Math.max(1, Math.round(node.scrollWidth / width));
+      node._top = top;
+      node._startPage = state.pages.length;
+      for (let col = 0; col < node._cols; col++) state.pages.push({ node, col });
+      top += height;
+    }
+    if (currentAnim) { currentAnim.cancel(); currentAnim = null; }
+    lastX = 0;
+    state.currentSeg = null;
+    state.currentTop = null;
+    state.pageCount = Math.max(1, state.pages.length);
     mapTocPages(state);
   }
 
   function goToPage(state, index, animate = false) {
-    state.currentPage = Math.min(Math.max(0, index), Math.max(0, state.pageCount - 1));
-    setTransform(state, -state.currentPage * state.pageStep, animate);
+    const page = Math.min(Math.max(0, index), Math.max(0, state.pageCount - 1));
+    state.currentPage = page;
+    const slot = state.pages[page];
+    const x = -slot.col * state.pageStep;
+    if (slot.node !== state.currentSeg) {
+      // 跨章：wrapper 纵向定位 + 目标段瞬时归位
+      if (currentAnim) { currentAnim.cancel(); currentAnim = null; }
+      state.currentSeg = slot.node;
+      state.currentCol = slot.col;
+      state.currentX = x;
+      slot.node.style.transition = 'none';
+      slot.node.style.transform = `translateX(${x}px)`;
+      lastX = x;
+      if (state.currentTop !== slot.node._top) {
+        state.currentTop = slot.node._top;
+        state.segments.style.top = `-${slot.node._top}px`;
+      }
+    } else {
+      state.currentCol = slot.col;
+      state.currentX = x;
+      setTransform(state, x, animate);
+    }
     updateTocActive();
   }
 
   // 所有 transform 写入的唯一出口。动画用 WAAPI 从 JS 记录的当前位置直接
   // 插值：不读布局、不强制回流，全程合成器驱动——拖拽松手后的吸附翻页
-  // 立即开始，不被整本书的排版阻塞（这是"松手卡一下"的根源）。
+  // 立即开始，不被排版阻塞。
   let lastX = 0;
   let currentAnim = null;
   function setTransform(state, x, animate) {
-    const node = state.contentNode;
+    const node = state.currentSeg;
+    if (!node) return;
     if (currentAnim) { currentAnim.cancel(); currentAnim = null; }
     node.style.transition = 'none';
     node.style.transform = `translateX(${x}px)`;
@@ -409,35 +471,37 @@ export const ReaderApp = (function () {
   }
 
   function mapTocPages(state) {
-    const node = state.contentNode;
-    const baseLeft = node.getBoundingClientRect().left;
     state.tocEntries = (state.toc || []).map((entry, index) => {
       const target = findTocTarget(state, entry, index);
       let page = 0;
-      if (target) page = Math.max(0, Math.round((target.getBoundingClientRect().left - baseLeft) / state.pageStep));
+      if (target) {
+        const owner = target.closest('.book-content');
+        if (owner && typeof owner._startPage === 'number') {
+          page = owner._startPage + Math.max(0, Math.round((target.getBoundingClientRect().left - owner.getBoundingClientRect().left) / state.pageStep));
+        }
+      }
       return { ...entry, page: Math.min(page, state.pageCount - 1) };
     });
   }
 
   function findTocTarget(state, entry, index) {
-    const node = state.contentNode;
-    if (state.kind === 'txt') return node.querySelector(`[data-toc="${index}"]`);
+    const root = state.segments;
+    if (state.kind === 'txt') return root.querySelector(`[data-toc="${index}"]`);
     if (entry.fragment) {
-      const byId = Array.from(node.querySelectorAll('[id], [data-frag-ids]')).find(element =>
+      const byId = Array.from(root.querySelectorAll('[id], [data-frag-ids]')).find(element =>
         element.id === entry.fragment || (element.dataset.fragIds || '').split(' ').includes(entry.fragment));
       if (byId) return byId;
     }
-    return Array.from(node.querySelectorAll('[data-source-path]')).find(element => element.dataset.sourcePath === entry.path) || null;
+    return Array.from(root.querySelectorAll('[data-source-path]')).find(element => element.dataset.sourcePath === entry.path) || null;
   }
 
-  // 点目录时按“当前已稳定的版面”实时算页码，而不是用 measure() 时预存的值。
-  // measure 可能发生在图片/字体尚未加载完之前（手机端尤甚），预存页码会偏前；
-  // 这里 target 与 baseLeft 同受 translateX 平移，相减后与当前翻页位置无关，结果精确。
+  // 点目录时按"当前已稳定的版面"实时算页码，而不是用 measure() 时预存的值。
   function tocTargetPage(state, entry, index) {
     const target = findTocTarget(state, entry, index);
     if (!target) return Math.max(0, entry.page || 0);
-    const baseLeft = state.contentNode.getBoundingClientRect().left;
-    const page = Math.round((target.getBoundingClientRect().left - baseLeft) / state.pageStep);
+    const owner = target.closest('.book-content');
+    if (!owner || typeof owner._startPage !== 'number') return Math.max(0, entry.page || 0);
+    const page = owner._startPage + Math.round((target.getBoundingClientRect().left - owner.getBoundingClientRect().left) / state.pageStep);
     return Math.min(Math.max(0, page), Math.max(0, state.pageCount - 1));
   }
 
@@ -462,68 +526,13 @@ export const ReaderApp = (function () {
 
   function relayoutActive() {
     if (!active || !isVisible()) return;
-    // 重排前抓住当前页左上角的文字位置；重排后把它对回页顶，正文不漂移、不跳行。
-    // 抓不到锚点（极少数情况）才退回旧的按比例映射。
-    const anchor = captureTopAnchor(active);
+    // 重排按比例回到对应位置（分段模型下不做文字锚点对位）
     const fallbackRatio = active.pageCount > 1 ? active.currentPage / (active.pageCount - 1) : 0;
     measure(active);
-    let page = anchor ? anchorPage(active, anchor) : null;
-    if (page == null) page = Math.round(fallbackRatio * Math.max(0, active.pageCount - 1));
-    goToPage(active, page);
+    goToPage(active, Math.round(fallbackRatio * Math.max(0, active.pageCount - 1)));
     renderToc();
     updatePageLabel();
     queueProgressSave(active.currentPage);
-  }
-
-  // 用 DOM 文本锚点记录"当前页顶端是哪段文字"。EPUB（块元素）与 TXT（裸文本节点）通用。
-  function captureTopAnchor(state) {
-    const node = state.contentNode;
-    const style = getComputedStyle(node);
-    const padLeft = parseFloat(style.paddingLeft) || 0;
-    const padTop = parseFloat(style.paddingTop) || 0;
-    const rect = els.viewport.getBoundingClientRect();
-    return caretAt(rect.left + padLeft + 8, rect.top + padTop + 8);
-  }
-
-  function caretAt(x, y) {
-    // 透明翻页热区盖在正文之上，会先被命中测试取到。临时让它们对命中透明，才能定位到文字。
-    const zones = [els.prevZone, els.centerZone, els.nextZone].filter(Boolean);
-    const saved = zones.map(zone => zone.style.pointerEvents);
-    zones.forEach(zone => { zone.style.pointerEvents = 'none'; });
-    try {
-      if (document.caretPositionFromPoint) {
-        const pos = document.caretPositionFromPoint(x, y);
-        return pos ? { node: pos.offsetNode, offset: pos.offset } : null;
-      }
-      if (document.caretRangeFromPoint) {
-        const range = document.caretRangeFromPoint(x, y);
-        return range ? { node: range.startContainer, offset: range.startOffset } : null;
-      }
-      return null;
-    } catch (_) {
-      return null;
-    } finally {
-      zones.forEach((zone, index) => { zone.style.pointerEvents = saved[index]; });
-    }
-  }
-
-  function anchorPage(state, anchor) {
-    if (!anchor || !anchor.node || !anchor.node.isConnected) return null;
-    if (!state.contentNode.contains(anchor.node)) return null;
-    try {
-      const range = document.createRange();
-      const max = anchor.node.nodeType === Node.TEXT_NODE ? anchor.node.length : anchor.node.childNodes.length;
-      range.setStart(anchor.node, Math.min(anchor.offset, max));
-      range.collapse(true);
-      const rects = range.getClientRects();
-      const rect = rects.length ? rects[0] : range.getBoundingClientRect();
-      if (!rect) return null;
-      const baseLeft = state.contentNode.getBoundingClientRect().left;
-      const page = Math.round((rect.left - baseLeft) / state.pageStep);
-      return Math.max(0, Math.min(state.pageCount - 1, page));
-    } catch (_) {
-      return null;
-    }
   }
 
   function toggleTools() {

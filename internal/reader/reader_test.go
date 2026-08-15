@@ -65,6 +65,9 @@ func TestParseEPUBPipeline(t *testing.T) {
 		t.Fatalf("toc entry=%+v", entry)
 	}
 	htmlOut := book.HTML
+	if len(book.Chapters) != 1 || !strings.Contains(book.Chapters[0].HTML, "你好世界") {
+		t.Fatalf("chapters=%+v", book.Chapters)
+	}
 	for _, want := range []string{"你好世界", "第一章 开始", `data-source-path="OEBPS/ch1.xhtml"`, `alt="插图"`} {
 		if !strings.Contains(htmlOut, want) {
 			t.Fatalf("html missing %q:\n%s", want, htmlOut)

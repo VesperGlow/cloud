@@ -93,7 +93,7 @@ func (s *Server) bookContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if book.Format == "epub" {
-		writeJSON(w, http.StatusOK, map[string]any{"kind": "epub", "html": book.HTML, "toc": book.TOC})
+		writeJSON(w, http.StatusOK, map[string]any{"kind": "epub", "html": book.HTML, "chapters": book.Chapters, "toc": book.TOC})
 	} else {
 		writeJSON(w, http.StatusOK, map[string]any{"kind": "txt", "text": book.Text, "toc": book.TOC})
 	}

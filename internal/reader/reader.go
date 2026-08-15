@@ -47,11 +47,17 @@ type Asset struct {
 	Height      int
 }
 
+// Chapter 是一章清洗后的正文 HTML，客户端按章分段渲染（小合成层翻页）。
+type Chapter struct {
+	HTML string `json:"html"`
+}
+
 // Book is the parsed, immutable content model of one file.
 type Book struct {
 	Format   string     // "epub" | "txt"
 	Title    string     // epub 书名；txt 为文件名
-	HTML     string     // epub 清洗后的正文
+	HTML     string     // epub 清洗后的全部正文（Chapters 拼接）
+	Chapters []Chapter  // epub 逐章正文
 	Text     string     // txt 全文（UTF-8）
 	TOC      []TocEntry // epub 目录或 txt 章节（UTF-16 偏移）
 	Cover    []byte
@@ -208,11 +214,17 @@ func parseEPUB(rs io.ReadSeeker, size int64, assetBase string) (*Book, error) {
 		b.chapter = item.path
 		b.pending = b.pending[:0]
 		b.renderChapter([]byte(chapter))
+		book.Chapters = append(book.Chapters, Chapter{HTML: b.out.String()})
+		b.out.Reset()
 	}
-	if strings.TrimSpace(b.out.String()) == "" {
+	if strings.TrimSpace(b.out.String()) == "" && len(book.Chapters) == 0 {
 		return nil, fmt.Errorf("EPUB 中没有可阅读内容")
 	}
-	book.HTML = b.out.String()
+	parts := make([]string, len(book.Chapters))
+	for i, ch := range book.Chapters {
+		parts[i] = ch.HTML
+	}
+	book.HTML = strings.Join(parts, "")
 	book.Assets = b.assets
 	return book, nil
 }

@@ -302,3 +302,7 @@ body.reader-open .connection i,
 body.reader-open .connection i:before,
 body.reader-open .connection i:after,
 body.reader-open .storage-bar i{animation:none}
+
+/* 分段渲染：空闲段不提升合成层，翻页只栅格化当前章的小层 */
+.book-content{will-change:auto}
+.book-segments{position:absolute;left:0;top:0;width:100%}
