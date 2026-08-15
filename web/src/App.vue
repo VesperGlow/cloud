@@ -11,7 +11,7 @@ interface FolderOption { id:string; name:string; depth:number }
 
 const user = ref<string|null>(null)
 const checking = ref(true)
-const login = reactive({ username:'admin', password:'', busy:false, error:'' })
+const login = reactive({ username:'admin', password:'', busy:false, error:'', notice:'' })
 const currentId = ref(ROOT)
 const current = ref<DriveFile|null>(null)
 const items = ref<DriveFile[]>([])
@@ -21,10 +21,11 @@ const dragActive = ref(false)
 const toast = reactive({ text:'', kind:'error' as 'error'|'success' })
 const tasks = reactive<UploadTask[]>([])
 const selected = ref<DriveFile|null>(null)
-const modal = ref<'rename'|'move'|'preview'|null>(null)
+const modal = ref<'rename'|'move'|'preview'|'account'|null>(null)
 const renameValue = ref('')
 const folders = ref<FolderOption[]>([])
 const modalBusy = ref(false)
+const account = reactive({ username:'', currentPassword:'', password:'', confirmPassword:'', error:'' })
 const fileInput = ref<HTMLInputElement|null>(null)
 let activeUploads = 0
 let toastTimer = 0
@@ -53,12 +54,24 @@ async function checkSession() {
   finally { checking.value=false }
 }
 async function submitLogin() {
-  login.busy=true;login.error=''
+  login.busy=true;login.error='';login.notice=''
   try { const me=await api<{username:string}>('/api/auth/login',{method:'POST',body:JSON.stringify({username:login.username,password:login.password})});user.value=me.username;login.password='';await openFolder(ROOT) }
   catch(e){login.error=(e as Error).message}
   finally{login.busy=false}
 }
 async function logout(){await api('/api/auth/logout',{method:'POST'});user.value=null;items.value=[];tasks.splice(0)}
+function showAccount(){account.username=user.value||'';account.currentPassword='';account.password='';account.confirmPassword='';account.error='';modal.value='account'}
+async function saveAccount(){
+  account.error=''
+  if(account.password.length<12){account.error='新密码至少需要 12 个字符';return}
+  if(account.password!==account.confirmPassword){account.error='两次输入的新密码不一致';return}
+  modalBusy.value=true
+  try{
+    await api('/api/auth/credentials',{method:'PATCH',body:JSON.stringify({current_password:account.currentPassword,username:account.username,password:account.password})})
+    modal.value=null;login.username=account.username;login.password='';login.notice='账户已更新，请使用新凭据重新登录';user.value=null;items.value=[];tasks.splice(0)
+  }catch(e){account.error=(e as Error).message}
+  finally{modalBusy.value=false}
+}
 
 async function openFolder(id:string){loading.value=true;try{const [meta,list]=await Promise.all([api<{file:DriveFile;breadcrumbs:DriveFile[]}>(`/api/files/${id}`),api<{items:DriveFile[]}>(`/api/files/${id}/children`)]);currentId.value=id;current.value=meta.file;breadcrumbs.value=meta.breadcrumbs;items.value=list.items;selected.value=null}catch(e){notify((e as Error).message)}finally{loading.value=false}}
 async function createFolder(){const name=window.prompt('新文件夹名称');if(!name)return;try{await api('/api/directories',{method:'POST',body:JSON.stringify({parent_id:currentId.value,name})});await openFolder(currentId.value);notify('文件夹已创建','success')}catch(e){notify((e as Error).message)}}
@@ -94,11 +107,11 @@ onMounted(checkSession)
   <div v-if="checking" class="splash"><div class="brand-mark">C</div><div class="spinner"></div></div>
   <main v-else-if="!user" class="login-page">
     <section class="login-visual"><div class="glow glow-a"></div><div class="glow glow-b"></div><div class="visual-copy"><span class="eyebrow">PRIVATE · DIRECT · YOURS</span><h1>你的文件，<br>安静地待在云上。</h1><p>轻量、自托管，文件直接往返你的 S3。</p></div><div class="cloud-card"><span>☁</span><div><strong>Browser ↔ S3</strong><small>文件内容不经过应用服务器</small></div></div></section>
-    <section class="login-panel"><form class="login-form" @submit.prevent="submitLogin"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div><p class="eyebrow dark">WELCOME BACK</p><h2>登录私人空间</h2><p class="muted">输入管理员凭据继续</p></div><label>用户名<input v-model="login.username" autocomplete="username" maxlength="128" required></label><label>密码<input v-model="login.password" type="password" autocomplete="current-password" maxlength="1024" required></label><p v-if="login.error" class="form-error">{{ login.error }}</p><button class="primary wide" :disabled="login.busy">{{ login.busy ? '正在验证…' : '进入我的网盘' }}</button></form></section>
+    <section class="login-panel"><form class="login-form" @submit.prevent="submitLogin"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div><p class="eyebrow dark">WELCOME BACK</p><h2>登录私人空间</h2><p class="muted">首次启动的随机凭据可在容器日志中查看</p></div><label>用户名<input v-model="login.username" autocomplete="username" maxlength="128" required></label><label>密码<input v-model="login.password" type="password" autocomplete="current-password" maxlength="1024" required></label><p v-if="login.notice" class="form-success">{{ login.notice }}</p><p v-if="login.error" class="form-error">{{ login.error }}</p><button class="primary wide" :disabled="login.busy">{{ login.busy ? '正在验证…' : '进入我的网盘' }}</button></form></section>
   </main>
 
   <div v-else class="app-shell" @dragover.prevent="dragActive=true" @dragleave.self="dragActive=false" @drop.prevent="onDrop">
-    <header class="topbar"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div class="top-actions"><span class="connection"><i></i>S3 直连</span><button class="avatar" :title="user" @click="logout">{{ user.slice(0,1).toUpperCase() }}<span>退出</span></button></div></header>
+    <header class="topbar"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div class="top-actions"><span class="connection"><i></i>S3 直连</span><button class="avatar" :title="`${user} · 账户设置`" @click="showAccount">{{ user.slice(0,1).toUpperCase() }}<span>账户设置</span></button><button class="top-logout" @click="logout">退出</button></div></header>
     <aside class="sidebar"><button class="nav active"><span>▰</span>我的文件</button><div class="sidebar-note"><span>私密空间</span><p>元数据保存在 SQLite，文件内容保存在 S3。</p></div></aside>
     <section class="content">
       <div class="content-head"><div><nav class="breadcrumbs" aria-label="路径"><button v-for="crumb in breadcrumbs" :key="crumb.id" @click="openFolder(crumb.id)">{{ crumb.name || '我的文件' }}<span>/</span></button></nav><h1>{{ current?.name || '我的文件' }}</h1><p>{{ items.length }} 个项目 · {{ pathTitle }}</p></div><div class="actions"><button class="secondary" @click="createFolder">＋ 新建文件夹</button><button class="primary" @click="chooseFiles">↑ 上传文件</button><input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}"></div></div>
@@ -110,7 +123,7 @@ onMounted(checkSession)
     <div v-if="dragActive" class="drop-zone"><div><span>↓</span><h2>释放以上传到 {{ current?.name || '我的文件' }}</h2><p>文件将直接发送到 S3</p></div></div>
     <section v-if="tasks.length" class="upload-panel"><header><div><strong>上传</strong><span v-if="unfinished.length">{{ unfinished.length }} 项进行中</span></div><button @click="clearFinished">清除已完成</button></header><div class="task-list"><article v-for="task in tasks" :key="task.id"><div class="task-top"><span class="task-icon">↑</span><div><strong>{{ task.file.name }}</strong><small>{{ formatSize(task.file.size) }} · {{ task.status==='queued'?'等待中':task.status==='uploading'?'正在上传':task.status==='done'?'已完成':task.status==='cancelled'?'已取消':task.error }}</small></div><b>{{ task.progress }}%</b><button v-if="task.status==='queued'||task.status==='uploading'" @click="cancelUpload(task)">×</button><button v-else-if="task.status==='failed'" @click="retry(task)">重试</button></div><div class="progress"><i :class="task.status" :style="{width:`${task.progress}%`}"></i></div></article></div></section>
 
-    <div v-if="modal" class="modal-backdrop" @click.self="modal=null"><section v-if="modal==='rename'" class="modal"><header><div><p class="eyebrow dark">EDIT</p><h2>重命名</h2></div><button @click="modal=null">×</button></header><label>新名称<input v-model="renameValue" maxlength="1024" @keyup.enter="saveRename"></label><footer><button class="secondary" @click="modal=null">取消</button><button class="primary" :disabled="modalBusy" @click="saveRename">保存</button></footer></section><section v-else-if="modal==='move'" class="modal folder-modal"><header><div><p class="eyebrow dark">MOVE</p><h2>移动「{{ selected?.name }}」</h2></div><button @click="modal=null">×</button></header><div v-if="modalBusy" class="state small"><div class="spinner"></div></div><div v-else class="folder-list"><button v-for="folder in folders" :key="folder.id" :style="{paddingLeft:`${18+folder.depth*22}px`}" @click="moveTo(folder.id)"><span>▰</span>{{ folder.name }}</button></div></section><section v-else class="preview-modal"><header><strong>{{ selected?.name }}</strong><button @click="modal=null">×</button></header><img v-if="selected" :src="`/api/files/${selected.id}/preview`" :alt="selected.name"><footer><button class="primary" @click="selected&&download(selected)">↓ 下载原图</button></footer></section></div>
+    <div v-if="modal" class="modal-backdrop" @click.self="modal=null"><section v-if="modal==='rename'" class="modal"><header><div><p class="eyebrow dark">EDIT</p><h2>重命名</h2></div><button @click="modal=null">×</button></header><label>新名称<input v-model="renameValue" maxlength="1024" @keyup.enter="saveRename"></label><footer><button class="secondary" @click="modal=null">取消</button><button class="primary" :disabled="modalBusy" @click="saveRename">保存</button></footer></section><section v-else-if="modal==='move'" class="modal folder-modal"><header><div><p class="eyebrow dark">MOVE</p><h2>移动「{{ selected?.name }}」</h2></div><button @click="modal=null">×</button></header><div v-if="modalBusy" class="state small"><div class="spinner"></div></div><div v-else class="folder-list"><button v-for="folder in folders" :key="folder.id" :style="{paddingLeft:`${18+folder.depth*22}px`}" @click="moveTo(folder.id)"><span>▰</span>{{ folder.name }}</button></div></section><section v-else-if="modal==='account'" class="modal account-modal"><header><div><p class="eyebrow dark">SECURITY</p><h2>账户设置</h2></div><button @click="modal=null">×</button></header><form @submit.prevent="saveAccount"><p class="modal-hint">修改后会退出所有已登录设备，请使用新凭据重新登录。</p><label>管理员用户名<input v-model="account.username" autocomplete="username" maxlength="128" required></label><label>当前密码<input v-model="account.currentPassword" type="password" autocomplete="current-password" maxlength="1024" required></label><label>新密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><label>确认新密码<input v-model="account.confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><p v-if="account.error" class="form-error">{{ account.error }}</p><footer><button type="button" class="secondary" @click="modal=null">取消</button><button class="primary" :disabled="modalBusy">{{ modalBusy?'正在保存…':'更新并退出' }}</button></footer></form></section><section v-else class="preview-modal"><header><strong>{{ selected?.name }}</strong><button @click="modal=null">×</button></header><img v-if="selected" :src="`/api/files/${selected.id}/preview`" :alt="selected.name"><footer><button class="primary" @click="selected&&download(selected)">↓ 下载原图</button></footer></section></div>
     <div v-if="toast.text" class="toast" :class="toast.kind">{{ toast.text }}</div>
   </div>
 </template>

@@ -19,6 +19,15 @@ import (
 
 const sessionLifetime = 30 * 24 * time.Hour
 
+var ErrInvalidCredentials = errors.New("invalid credentials")
+
+type InitialCredentials struct {
+	Created   bool
+	Generated bool
+	Username  string
+	Password  string
+}
+
 type Params struct {
 	Memory      uint32
 	Iterations  uint32
@@ -35,37 +44,48 @@ type Service struct {
 	Params   Params
 }
 
-func (s *Service) Initialize(ctx context.Context, username, password string) error {
+func (s *Service) Initialize(ctx context.Context, username, password string) (InitialCredentials, error) {
 	var existing string
 	err := s.DB.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='admin_password_hash'`).Scan(&existing)
 	if err == nil {
-		return nil
+		return InitialCredentials{}, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return InitialCredentials{}, err
 	}
-	if username == "" || password == "" {
-		return errors.New("ADMIN_USERNAME and ADMIN_PASSWORD are required on first startup")
+	if username == "" {
+		username = "admin"
+	}
+	generated := password == ""
+	if generated {
+		password = rand.Text()
 	}
 	if len(username) > 128 || len(password) < 12 || len(password) > 1024 {
-		return errors.New("administrator username/password length is invalid (password minimum is 12 characters)")
+		return InitialCredentials{}, errors.New("administrator username/password length is invalid (password minimum is 12 characters)")
 	}
 	hash, err := HashPassword(password, s.params())
 	if err != nil {
-		return err
+		return InitialCredentials{}, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return InitialCredentials{}, err
 	}
 	defer tx.Rollback()
 	for key, value := range map[string]string{"admin_username": username, "admin_password_hash": hash} {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)`, key, value, now); err != nil {
-			return err
+			return InitialCredentials{}, err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return InitialCredentials{}, err
+	}
+	credentials := InitialCredentials{Created: true, Generated: generated, Username: username}
+	if generated {
+		credentials.Password = password
+	}
+	return credentials, nil
 }
 
 func (s *Service) Login(ctx context.Context, username, password string) (string, time.Time, error) {
@@ -78,7 +98,7 @@ func (s *Service) Login(ctx context.Context, username, password string) (string,
 	}
 	valid, err := VerifyPassword(password, savedHash)
 	if err != nil || subtle.ConstantTimeCompare([]byte(username), []byte(savedUser)) != 1 || !valid {
-		return "", time.Time{}, errors.New("invalid credentials")
+		return "", time.Time{}, ErrInvalidCredentials
 	}
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
@@ -88,6 +108,75 @@ func (s *Service) Login(ctx context.Context, username, password string) (string,
 	expires := time.Now().UTC().Add(sessionLifetime)
 	_, err = s.DB.ExecContext(ctx, `INSERT INTO sessions(id, token_hash, created_at, expires_at) VALUES(?,?,?,?)`, ids.New(), TokenHash(token), time.Now().UTC().Format(time.RFC3339Nano), expires.Format(time.RFC3339Nano))
 	return token, expires, err
+}
+
+func (s *Service) ChangeCredentials(ctx context.Context, currentUsername, currentPassword, newUsername, newPassword string) error {
+	if newUsername == "" || len(newUsername) > 128 || len(newPassword) < 12 || len(newPassword) > 1024 {
+		return errors.New("administrator username/password length is invalid (password minimum is 12 characters)")
+	}
+	var savedUser, savedHash string
+	if err := s.DB.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='admin_username'`).Scan(&savedUser); err != nil {
+		return err
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='admin_password_hash'`).Scan(&savedHash); err != nil {
+		return err
+	}
+	valid, err := VerifyPassword(currentPassword, savedHash)
+	if err != nil || subtle.ConstantTimeCompare([]byte(currentUsername), []byte(savedUser)) != 1 || !valid {
+		return ErrInvalidCredentials
+	}
+	newHash, err := HashPassword(newPassword, s.params())
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE settings SET value=?,updated_at=? WHERE key='admin_username'`, newUsername, now); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE settings SET value=?,updated_at=? WHERE key='admin_password_hash'`, newHash, now); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Service) ResetCredentials(ctx context.Context, username string) (InitialCredentials, error) {
+	if username == "" {
+		username = "admin"
+	}
+	if len(username) > 128 {
+		return InitialCredentials{}, errors.New("administrator username length is invalid")
+	}
+	password := rand.Text()
+	hash, err := HashPassword(password, s.params())
+	if err != nil {
+		return InitialCredentials{}, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return InitialCredentials{}, err
+	}
+	defer tx.Rollback()
+	for key, value := range map[string]string{"admin_username": username, "admin_password_hash": hash} {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`, key, value, now); err != nil {
+			return InitialCredentials{}, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions`); err != nil {
+		return InitialCredentials{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return InitialCredentials{}, err
+	}
+	return InitialCredentials{Generated: true, Username: username, Password: password}, nil
 }
 
 func (s *Service) Authenticate(ctx context.Context, token string) (string, error) {

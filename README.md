@@ -25,11 +25,12 @@ flowchart LR
 
 ```bash
 cp .env.example .env
-# 至少修改 ADMIN_PASSWORD 和 S3_SECRET_KEY
+# 至少修改 S3_SECRET_KEY；ADMIN_PASSWORD 留空会自动生成一次性密码
 docker compose up -d
+docker compose logs cloud
 ```
 
-打开 <http://localhost:8080>，使用 `.env` 中的管理员账户登录。MinIO 控制台位于 <http://localhost:9001>。
+打开 <http://localhost:8080>。如果没有配置 `ADMIN_PASSWORD`，首次成功启动时会在 `cloud` 容器日志中打印一次管理员用户名和随机密码；登录后点击右上角头像进入账户设置并立即修改。MinIO 控制台位于 <http://localhost:9001>。
 
 Podman 用户可以运行：
 
@@ -82,8 +83,8 @@ set -a; . ./.env; set +a
 | `APP_DATA_DIR` | `/data` | SQLite 数据目录 |
 | `APP_BASE_URL` | `http://localhost:8080` | 用于同源写请求校验 |
 | `COOKIE_SECURE` | 根据 Base URL | 生产必须为 `true`；HTTP 本地开发设为 `false` |
-| `ADMIN_USERNAME` | 无 | 首次初始化时必需 |
-| `ADMIN_PASSWORD` | 无 | 首次初始化时必需，至少 12 字符；只保存 Argon2id hash |
+| `ADMIN_USERNAME` | `admin` | 首次初始化使用的管理员用户名 |
+| `ADMIN_PASSWORD` | 随机生成 | 可选；设置时至少 12 字符，未设置时首次启动生成一次性密码；只保存 Argon2id hash |
 | `S3_ENDPOINT` | AWS 默认 | S3-compatible endpoint；AWS S3 可留空 |
 | `S3_PUBLIC_ENDPOINT` | 与 `S3_ENDPOINT` 相同 | 浏览器可访问的签名 URL endpoint；容器内外主机名不同时设置 |
 | `S3_REGION` | `us-east-1` | Bucket region |
@@ -96,7 +97,19 @@ set -a; . ./.env; set +a
 | `PART_SIZE` | `16777216` | 分片大小，最小 5 MiB |
 | `UPLOAD_EXPIRES` | `24h` | 未完成上传的清理期限 |
 
-管理员设置只在数据库第一次初始化时读取。之后修改环境变量不会重置已有密码，避免部署配置漂移意外改密。
+管理员设置只在数据库第一次初始化时读取。之后修改环境变量不会重置已有密码，避免部署配置漂移意外改密。随机密码只在新数据库首次成功启动时打印一次，不会在容器重启时再次显示；可通过右上角头像进入账户设置修改用户名和密码，修改后所有现有会话都会失效。
+
+首次凭据会进入容器日志，任何能够读取日志的人都可能看到它。请在首次登录后立即修改密码，并限制部署平台与日志系统的访问权限；如果不希望凭据出现在日志中，请在首次启动前显式配置 `ADMIN_PASSWORD`。
+
+如果已有数据库的管理员凭据丢失，不要删除数据卷。停止服务后运行一次恢复命令，它会保留文件与元数据、撤销已有会话，并在终端打印新的随机凭据：
+
+```bash
+docker compose stop cloud
+docker compose run --rm --no-deps cloud reset-admin
+docker compose start cloud
+```
+
+可在命令末尾指定新用户名，例如 `cloud reset-admin owner`。恢复密码同样只显示一次，登录后请立即从右上角账户设置中修改。
 
 ## S3 权限
 

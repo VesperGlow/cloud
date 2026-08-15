@@ -73,6 +73,7 @@ func (s *Server) Handler() http.Handler {
 			r.Use(s.requireAuth)
 			r.Post("/auth/logout", s.logout)
 			r.Get("/auth/me", s.me)
+			r.Patch("/auth/credentials", s.changeCredentials)
 			r.Get("/files/{id}", s.getFile)
 			r.Get("/files/{id}/children", s.children)
 			r.Get("/files/{id}/download", s.download)
@@ -161,11 +162,43 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie("cloud_session"); err == nil {
 		s.auth.Logout(r.Context(), c.Value)
 	}
-	http.SetCookie(w, &http.Cookie{Name: "cloud_session", Value: "", Path: "/", HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode, MaxAge: -1, Expires: time.Unix(1, 0)})
+	s.clearSessionCookie(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"username": r.Context().Value(userKey{}).(string)})
+}
+
+func (s *Server) changeCredentials(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		CurrentPassword string `json:"current_password"`
+		Username        string `json:"username"`
+		Password        string `json:"password"`
+	}
+	if err := decodeJSON(w, r, &in); err != nil {
+		return
+	}
+	if in.Username == "" || len(in.Username) > 128 || len(in.Password) < 12 || len(in.Password) > 1024 || len(in.CurrentPassword) > 1024 {
+		problem(w, http.StatusBadRequest, "username is required and password must be between 12 and 1024 characters")
+		return
+	}
+	currentUsername := r.Context().Value(userKey{}).(string)
+	if err := s.auth.ChangeCredentials(r.Context(), currentUsername, in.CurrentPassword, in.Username, in.Password); err != nil {
+		if errors.Is(err, auth.ErrInvalidCredentials) {
+			problem(w, http.StatusUnauthorized, "current password is incorrect")
+			return
+		}
+		s.log.Error("credential change failed", "error", err)
+		problem(w, http.StatusInternalServerError, "could not update credentials")
+		return
+	}
+	s.clearSessionCookie(w)
+	s.log.Info("administrator credentials changed", "previous_user", currentUsername, "user", in.Username)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{Name: "cloud_session", Value: "", Path: "/", HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode, MaxAge: -1, Expires: time.Unix(1, 0)})
 }
 
 type userKey struct{}

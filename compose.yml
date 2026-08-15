@@ -13,7 +13,7 @@ services:
       APP_BASE_URL: "${APP_BASE_URL:-http://localhost:8080}"
       COOKIE_SECURE: "${COOKIE_SECURE:-false}"
       ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
-      ADMIN_PASSWORD: "${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
       S3_ENDPOINT: http://minio:9000
       S3_PUBLIC_ENDPOINT: "${S3_PUBLIC_ENDPOINT:-http://localhost:9000}"
       S3_REGION: "${S3_REGION:-us-east-1}"
