@@ -200,7 +200,7 @@ Bucket 必须保持私有。浏览器访问对象依赖 Presigned URL，而不�
 
 ## 内置阅读器
 
-点击 `.epub` 文件（或超过 1 MiB 的 `.txt` 文件）即可在网盘里直接阅读，也可以随时用文件操作区的“阅读”按钮打开；`/read/{file_id}` 深链可直接进入某本书。阅读逻辑整合自 [VesperGlow/reader](https://github.com/VesperGlow/reader)，去掉了它独立的账号/书架/上传，复用本服务的认证、文件树与 S3 块存储：
+点击 `.epub` 文件（或超过 1 MiB 的 `.txt` 文件）即可在网盘里直接阅读，也可以随时用文件操作区的“阅读”按钮打开；`/read/{file_id}` 深链可直接进入某本书。阅读逻辑**原样移植自 [VesperGlow/reader](https://github.com/VesperGlow/reader)**（前端直接复用其 reader.js 与样式，仅把 API 接到网盘），去掉了它独立的账号/书架/上传，复用本服务的认证、文件树与 S3 块存储：
 
 - **服务端解析**：EPUB 解包、OPF/spine、目录（EPUB3 nav + NCX 回退）、封面与系列元数据抽取全部在 Go 服务端完成；正文按白名单重建 HTML（脚本、事件处理器、`javascript:` 等危险内容按构造不会出现），内嵌图片改写为 `/api/files/{id}/book/assets/{n}` 分发。TXT 自动识别 UTF-8/GBK 编码，并按“第…章”式标题生成目录。
 - **解析缓存**：解析结果按文件的内容哈希（清单键）缓存，最近 3 本 keep-alive；内容寻址保证缓存永不陈旧，同一本书再次打开零解析。
