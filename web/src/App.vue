@@ -259,8 +259,8 @@ async function runUpload(task:UploadTask){
     if(task.cancelled){await abortRemote(task);return}
     // 4) 完成上传；409 时按缺失列表修复并重试。
     await completeWithRepair(task,created.upload_id,blocks)
-    task.progress=100;task.status='done';await openFolder(currentId.value)
-  }catch(e){if(task.cancelled){task.status='cancelled'}else{task.status='failed';task.error=(e as Error).message}}
+    task.progress=100;task.status='done';await openFolder(currentId.value);scheduleAutoClear()
+  }catch(e){if(task.cancelled){task.status='cancelled';scheduleAutoClear()}else{task.status='failed';task.error=(e as Error).message}}
 }
 
 async function sha256Hex(blob:Blob):Promise<string>{
@@ -353,7 +353,10 @@ function percentage(done:number,total:number){return total===0?100:Math.min(99,M
 async function cancelUpload(task:UploadTask){task.cancelled=true;task.requests.forEach(x=>x.abort());await abortRemote(task);task.status='cancelled'}
 async function abortRemote(task:UploadTask){if(task.uploadId){try{await api(`/api/uploads/${task.uploadId}`,{method:'DELETE'})}catch{/* stale cleanup retries later */}}}
 async function retry(task:UploadTask){await abortRemote(task);task.status='queued';task.error='';task.uploadId=undefined;task.requests=[];task.cancelled=false;pumpQueue()}
-function clearFinished(){for(let i=tasks.length-1;i>=0;i--)if(['done','cancelled'].includes(tasks[i].status))tasks.splice(i,1)}
+function clearFinished(){for(let i=tasks.length-1;i>=0;i--)if(['done','cancelled'].includes(tasks[i].status))tasks.splice(i,1);window.clearTimeout(autoClearTimer)}
+// 全部上传结束后自动收起上传面板（失败项保留，供重试）。
+let autoClearTimer=0
+function scheduleAutoClear(){window.clearTimeout(autoClearTimer);if(unfinished.value.length)return;autoClearTimer=window.setTimeout(clearFinished,4000)}
 function formatSize(bytes:number){if(bytes===0)return'0 B';const units=['B','KB','MB','GB','TB'];const i=Math.min(Math.floor(Math.log(bytes)/Math.log(1024)),4);return`${(bytes/1024**i).toFixed(i?1:0)} ${units[i]}`}
 function formatDate(value:string){const d=new Date(value);return Number.isNaN(d.valueOf())?'—':new Intl.DateTimeFormat('zh-CN',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}).format(d)}
 

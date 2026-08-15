@@ -220,3 +220,14 @@
   .reader-bar-title strong{font-size:15px}
   .reader-action-btn{padding:4px 10px}
 }
+
+/* ===== 阅读器布局修正：悬浮式工具栏（对齐原版 reader）=====
+   视口恒为整屏，顶栏/底栏只是悬浮叠层；隐藏工具不改变视口尺寸，
+   分栏与文字绝不挪动，也不触发整书重排（翻页卡顿的主因之一）。 */
+body.reader-open{overflow:hidden}
+.modal-backdrop.reading{overflow:hidden}
+.reader-shell{display:block}
+.reader-bar{position:absolute;top:0;left:0;right:0}
+.reader-viewport{position:absolute;inset:0;touch-action:pan-y}
+.reader-footer{position:absolute;left:0;right:0;bottom:0}
+.reader-zones{z-index:6}

@@ -55,6 +55,7 @@ onMounted(async () => {
   const savedSize = Number(localStorage.getItem('reader-font-size'))
   if (Number.isFinite(savedSize) && savedSize > 0) fontSize.value = Math.max(14, Math.min(32, savedSize))
   applyPrefs()
+  document.body.classList.add('reader-open')
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('resize', scheduleRelayout)
   window.visualViewport?.addEventListener('resize', scheduleRelayout)
@@ -64,6 +65,7 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   flushProgress()
+  document.body.classList.remove('reader-open')
   window.removeEventListener('keydown', onKeydown)
   window.removeEventListener('resize', scheduleRelayout)
   window.visualViewport?.removeEventListener('resize', scheduleRelayout)
@@ -144,7 +146,9 @@ function measure(){
   node.style.boxSizing = 'border-box'
   node.style.width = `${width}px`
   node.style.height = `${height}px`
-  node.style.padding = `28px ${sidePad}px 24px`
+  // 悬浮式工具栏：栏高固定为整屏，顶部留出顶栏高度，底部由悬浮的底栏覆盖；
+  // 显示/隐藏工具只是叠层变化，视口与分栏永远不变 → 文字绝不挪动。
+  node.style.padding = `64px ${sidePad}px 24px`
   node.style.columnWidth = `${Math.max(1, width - 2 * sidePad)}px`
   node.style.columnGap = `${2 * sidePad}px`
   node.style.columnFill = 'auto'
