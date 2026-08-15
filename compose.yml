@@ -1,6 +1,6 @@
 services:
   cloud:
-    build: .
+    image: "${CLOUD_IMAGE:-ghcr.io/vesperglow/cloud:latest}"
     restart: unless-stopped
     depends_on:
       minio-init:

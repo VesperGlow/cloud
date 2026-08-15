@@ -21,12 +21,12 @@ flowchart LR
 
 ## 快速开始（Docker / Podman）
 
-仓库内的 Compose 配置会启动 Cloud、MinIO，并自动创建私有 Bucket 和开发用 CORS。
+仓库内的 Compose 配置默认拉取已发布的多架构镜像 `ghcr.io/vesperglow/cloud:latest`，同时启动 MinIO，并自动创建私有 Bucket 和开发用 CORS。
 
 ```bash
 cp .env.example .env
 # 至少修改 ADMIN_PASSWORD 和 S3_SECRET_KEY
-docker compose up -d --build
+docker compose up -d
 ```
 
 打开 <http://localhost:8080>，使用 `.env` 中的管理员账户登录。MinIO 控制台位于 <http://localhost:9001>。
@@ -34,8 +34,16 @@ docker compose up -d --build
 Podman 用户可以运行：
 
 ```bash
-podman compose up -d --build
+podman compose up -d
 ```
+
+也可以直接拉取镜像：
+
+```bash
+docker pull ghcr.io/vesperglow/cloud:latest
+```
+
+每次 `main` 更新会发布 `latest` 和完整 commit SHA 标签；`v*` Git tag 还会发布对应版本标签。若 GHCR Package 尚未设为 Public，请先登录 GHCR，或在 GitHub Package 设置中将其改为公开。
 
 生产环境应将 `APP_BASE_URL` 改为实际 HTTPS 地址，将 `COOKIE_SECURE=true`，使用高熵密码，并将 Bucket CORS 的来源改为同一个 HTTPS Origin。Compose 自带 MinIO 主要用于单机部署和本地体验；也可以删除 `minio` / `minio-init` 服务并指向已有 S3-compatible 存储。
 
@@ -50,6 +58,13 @@ npm run build
 cd ..
 go test ./...
 go build -o cloud ./cmd/server
+```
+
+从当前源码构建容器并让 Compose 使用本地镜像：
+
+```bash
+docker build -t cloud:local .
+CLOUD_IMAGE=cloud:local docker compose up -d
 ```
 
 运行：
