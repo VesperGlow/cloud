@@ -27,7 +27,7 @@ type ObjectInfo struct {
 type Storage interface {
 	Ping(context.Context) error
 	PresignPut(context.Context, string, string, time.Duration) (string, error)
-	PresignGet(context.Context, string, string, bool, time.Duration) (string, error)
+	PresignGet(context.Context, string, string, string, bool, time.Duration) (string, error)
 	Head(context.Context, string) (ObjectInfo, error)
 	Delete(context.Context, string) error
 	CreateMultipart(context.Context, string, string) (string, error)
@@ -83,13 +83,17 @@ func (s *S3) PresignPut(ctx context.Context, key, mime string, expiry time.Durat
 	}
 	return out.URL, nil
 }
-func (s *S3) PresignGet(ctx context.Context, key, filename string, inline bool, expiry time.Duration) (string, error) {
+func (s *S3) PresignGet(ctx context.Context, key, filename, mime string, inline bool, expiry time.Duration) (string, error) {
 	disposition := "attachment"
 	if inline {
 		disposition = "inline"
 	}
 	disposition += "; filename*=UTF-8''" + strings.ReplaceAll(url.PathEscape(filename), "+", "%20")
-	out, err := s.presign.PresignGetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key), ResponseContentDisposition: aws.String(disposition)}, s3.WithPresignExpires(expiry))
+	in := &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key), ResponseContentDisposition: aws.String(disposition)}
+	if mime != "" {
+		in.ResponseContentType = aws.String(mime)
+	}
+	out, err := s.presign.PresignGetObject(ctx, in, s3.WithPresignExpires(expiry))
 	if err != nil {
 		return "", err
 	}

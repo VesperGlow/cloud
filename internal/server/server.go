@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,6 +70,7 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	r.Get("/readyz", s.ready)
+	r.Get("/s/{token}", s.publicShare)
 	r.Route("/api", func(r chi.Router) {
 		r.Post("/auth/login", s.login)
 		r.Group(func(r chi.Router) {
@@ -78,6 +82,9 @@ func (s *Server) Handler() http.Handler {
 			r.Get("/files/{id}/children", s.children)
 			r.Get("/files/{id}/download", s.download)
 			r.Get("/files/{id}/preview", s.preview)
+			r.Get("/files/{id}/share", s.getShare)
+			r.Post("/files/{id}/share", s.createShare)
+			r.Delete("/files/{id}/share", s.revokeShare)
 			r.Post("/directories", s.createDirectory)
 			r.Patch("/files/{id}", s.patchFile)
 			r.Delete("/files/{id}", s.deleteFile)
@@ -450,11 +457,111 @@ func (s *Server) redirectObject(w http.ResponseWriter, r *http.Request, inline b
 		problem(w, 415, "preview is not available for this file type")
 		return
 	}
-	u, err := s.storage.PresignGet(r.Context(), f.objectKey, f.Name, inline, s.cfg.PresignExpires)
+	u, err := s.storage.PresignGet(r.Context(), f.objectKey, f.Name, responseMime(f), inline, s.cfg.PresignExpires)
 	if err != nil {
 		problem(w, 502, "could not create download URL")
 		return
 	}
+	http.Redirect(w, r, u, http.StatusFound)
+}
+
+func responseMime(f File) string {
+	if f.MimeType != "" && f.MimeType != "application/octet-stream" {
+		return f.MimeType
+	}
+	switch strings.ToLower(filepath.Ext(f.Name)) {
+	case ".yaml", ".yml":
+		return "application/yaml; charset=utf-8"
+	case ".json":
+		return "application/json; charset=utf-8"
+	case ".txt", ".conf", ".ini":
+		return "text/plain; charset=utf-8"
+	default:
+		return f.MimeType
+	}
+}
+
+func newShareToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func (s *Server) getShare(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var token, created string
+	err := s.db.QueryRowContext(r.Context(), `SELECT s.token,s.created_at FROM shares s JOIN files f ON f.id=s.file_id WHERE s.file_id=? AND f.kind='file' AND f.status='ready'`, id).Scan(&token, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	if err != nil {
+		problem(w, http.StatusInternalServerError, "could not read share")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"active": true, "url": s.cfg.BaseURL + "/s/" + token, "created_at": created})
+}
+
+func (s *Server) createShare(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	f, err := s.file(r.Context(), id)
+	if err != nil || f.Kind != "file" || f.Status != "ready" {
+		problem(w, http.StatusNotFound, "ready file not found")
+		return
+	}
+	token, err := newShareToken()
+	if err != nil {
+		problem(w, http.StatusInternalServerError, "could not generate share link")
+		return
+	}
+	created := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = s.db.ExecContext(r.Context(), `INSERT INTO shares(file_id,token,created_at) VALUES(?,?,?) ON CONFLICT(file_id) DO UPDATE SET token=excluded.token,created_at=excluded.created_at`, id, token, created)
+	if err != nil {
+		problem(w, http.StatusInternalServerError, "could not create share link")
+		return
+	}
+	s.log.Info("file share created", "file_id", id)
+	writeJSON(w, http.StatusCreated, map[string]any{"active": true, "url": s.cfg.BaseURL + "/s/" + token, "created_at": created})
+}
+
+func (s *Server) revokeShare(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if _, err := s.db.ExecContext(r.Context(), `DELETE FROM shares WHERE file_id=?`, id); err != nil {
+		problem(w, http.StatusInternalServerError, "could not revoke share link")
+		return
+	}
+	s.log.Info("file share revoked", "file_id", id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) publicShare(w http.ResponseWriter, r *http.Request) {
+	token := chi.URLParam(r, "token")
+	if len(token) < 32 || len(token) > 128 {
+		problem(w, http.StatusNotFound, "share not found")
+		return
+	}
+	var f File
+	var parent, mime, etag sql.NullString
+	err := s.db.QueryRowContext(r.Context(), `SELECT f.id,f.parent_id,f.name,f.kind,COALESCE(f.object_key,''),f.size,f.mime_type,f.etag,f.status,f.created_at,f.updated_at FROM shares s JOIN files f ON f.id=s.file_id WHERE s.token=? AND f.kind='file' AND f.status='ready'`, token).Scan(&f.ID, &parent, &f.Name, &f.Kind, &f.objectKey, &f.Size, &mime, &etag, &f.Status, &f.CreatedAt, &f.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		problem(w, http.StatusNotFound, "share not found")
+		return
+	}
+	if err != nil {
+		problem(w, http.StatusInternalServerError, "could not open share")
+		return
+	}
+	f.MimeType = mime.String
+	u, err := s.storage.PresignGet(r.Context(), f.objectKey, f.Name, responseMime(f), true, s.cfg.PresignExpires)
+	if err != nil {
+		problem(w, http.StatusBadGateway, "could not create shared download URL")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Robots-Tag", "noindex, nofollow, noarchive")
 	http.Redirect(w, r, u, http.StatusFound)
 }
 

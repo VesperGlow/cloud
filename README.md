@@ -175,10 +175,29 @@ Bucket 必须保持私有。浏览器访问对象依赖 Presigned URL，而不�
 | `DELETE` | `/api/files/{id}` | 删除文件或空目录 |
 | `GET` | `/api/files/{id}/download` | 302 到 Presigned 下载 URL |
 | `GET` | `/api/files/{id}/preview` | 302 到图片预览 URL |
+| `GET` / `POST` / `DELETE` | `/api/files/{id}/share` | 查询、创建/重置或停止公开分享 |
+| `GET` | `/s/{token}` | 无需登录，通过稳定分享地址读取文件 |
 | `POST` | `/api/uploads` | 创建 Single PUT / Multipart 上传 |
 | `GET` | `/api/uploads/{id}/parts` | 分批签发分片 URL，最多 50 个 |
 | `POST` | `/api/uploads/{id}/complete` | 服务端完成并 `HeadObject` 验证 |
 | `DELETE` | `/api/uploads/{id}` | 取消并清理待上传元数据 |
+
+## 公开分享与 YAML 订阅
+
+文件操作区的“分享”按钮可以创建一个高熵公开链接。链接长期有效，任何持有者无需登录即可访问；重新生成链接会立即废弃旧地址，“停止分享”会撤销当前地址。删除文件时对应分享也会自动删除。
+
+公开入口不会让文件经过应用服务器，而是每次签发一个短期 S3 URL 并返回 302。对于 `.yaml` / `.yml` 文件，响应会声明 `application/yaml`，可以把分享地址直接用作 Mihomo/Clash 等支持 HTTP URL 的订阅或 provider 地址：
+
+```yaml
+proxy-providers:
+  private:
+    type: http
+    url: "https://drive.example.com/s/REPLACE_WITH_SHARE_TOKEN"
+    path: ./proxy_providers/private.yaml
+    interval: 3600
+```
+
+分享 URL 等同于访问凭据，请不要发布到公开仓库、聊天群或日志中。若怀疑泄露，请立即重新生成或停止分享。
 
 ## 数据模型与一致性
 

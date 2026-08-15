@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -27,7 +28,7 @@ func (m *mockStorage) PresignPut(_ context.Context, key, _ string, _ time.Durati
 	m.objects[key] = storage.ObjectInfo{}
 	return "https://s3.example/put", nil
 }
-func (m *mockStorage) PresignGet(context.Context, string, string, bool, time.Duration) (string, error) {
+func (m *mockStorage) PresignGet(context.Context, string, string, string, bool, time.Duration) (string, error) {
 	return "https://s3.example/get", nil
 }
 func (m *mockStorage) Head(_ context.Context, key string) (storage.ObjectInfo, error) {
@@ -159,6 +160,64 @@ func TestDirectoryCannotMoveIntoDescendant(t *testing.T) {
 	rr := a.request("PATCH", "/api/files/"+parent.ID, map[string]any{"parent_id": child.ID}, true)
 	if rr.Code != 400 {
 		t.Fatalf("cycle status=%d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestShareLinkCanBeReadRotatedAndRevoked(t *testing.T) {
+	a := newTestApp(t)
+	id := "11111111-1111-4111-8111-111111111111"
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := a.db.Exec(`INSERT INTO files(id,parent_id,name,kind,object_key,size,mime_type,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, id, RootID, "profile.yaml", "file", "objects/profile", 42, "application/octet-stream", "ready", now, now); err != nil {
+		t.Fatal(err)
+	}
+	createdRR := a.request("POST", "/api/files/"+id+"/share", nil, true)
+	if createdRR.Code != http.StatusCreated {
+		t.Fatalf("create share=%d: %s", createdRR.Code, createdRR.Body.String())
+	}
+	created := decode[struct {
+		Active bool   `json:"active"`
+		URL    string `json:"url"`
+	}](t, createdRR)
+	if !created.Active {
+		t.Fatal("created share is inactive")
+	}
+	shareURL, err := url.Parse(created.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicRR := a.request("GET", shareURL.Path, nil, false)
+	if publicRR.Code != http.StatusFound || publicRR.Header().Get("Location") != "https://s3.example/get" {
+		t.Fatalf("public share=%d location=%q", publicRR.Code, publicRR.Header().Get("Location"))
+	}
+	statusRR := a.request("GET", "/api/files/"+id+"/share", nil, true)
+	status := decode[struct {
+		Active bool   `json:"active"`
+		URL    string `json:"url"`
+	}](t, statusRR)
+	if !status.Active || status.URL != created.URL {
+		t.Fatalf("share status=%+v", status)
+	}
+	rotatedRR := a.request("POST", "/api/files/"+id+"/share", nil, true)
+	rotated := decode[struct{ URL string `json:"url"` }](t, rotatedRR)
+	if rotated.URL == created.URL {
+		t.Fatal("rotating share reused token")
+	}
+	if oldRR := a.request("GET", shareURL.Path, nil, false); oldRR.Code != http.StatusNotFound {
+		t.Fatalf("old share remains active: %d", oldRR.Code)
+	}
+	if revokedRR := a.request("DELETE", "/api/files/"+id+"/share", nil, true); revokedRR.Code != http.StatusNoContent {
+		t.Fatalf("revoke share=%d", revokedRR.Code)
+	}
+	rotatedURL, _ := url.Parse(rotated.URL)
+	if publicRR := a.request("GET", rotatedURL.Path, nil, false); publicRR.Code != http.StatusNotFound {
+		t.Fatalf("revoked share remains active: %d", publicRR.Code)
+	}
+}
+
+func TestResponseMimeRecognizesYAML(t *testing.T) {
+	got := responseMime(File{Name: "profile.yaml", MimeType: "application/octet-stream"})
+	if got != "application/yaml; charset=utf-8" {
+		t.Fatalf("yaml content type=%q", got)
 	}
 }
 
