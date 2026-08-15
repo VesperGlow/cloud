@@ -101,6 +101,10 @@ export const ReaderApp = (function () {
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flush(); });
     window.addEventListener('pagehide', flush);
     window.addEventListener('beforeunload', flush);
+    window.addEventListener('blur', flush);
+    // 心跳保存：即使强刷/异常退出时 pagehide 的 keepalive 请求没送达，
+    // 进度也最多落后 15 秒，不会整个丢失。
+    setInterval(() => { if (active && isVisible()) saveProgress(); }, 15000);
   }
 
   // 左右滑动翻页（跟手拖动 + 松手吸附动画）。手指横向拖动时正文实时跟随，
@@ -369,6 +373,8 @@ export const ReaderApp = (function () {
     node.style.columnFill = 'auto';
     node.style.transition = 'none'; // 重排必须瞬时归位，不能沿用上次翻页残留的过渡
     node.style.transform = 'translateX(0px)';
+    if (currentAnim) { currentAnim.cancel(); currentAnim = null; }
+    lastX = 0;
     state.pageWidth = width;
     state.pageHeight = height;
     state.pageStep = width;
@@ -382,21 +388,24 @@ export const ReaderApp = (function () {
     updateTocActive();
   }
 
-  // 所有 transform 写入的唯一出口：拖动时即时更新，翻页/回弹时带缓动过渡。
-  // 仅在"上一次写入是未提交的瞬时位移（拖动/重排）"时才强制一次布局，
-  // 让过渡从手指刚离开的位置起步；普通点击/键盘翻页零强制回流，
-  // 消除整书多栏容器的同步排版导致的翻页卡顿。
-  let pendingNonAnimated = false;
+  // 所有 transform 写入的唯一出口。动画用 WAAPI 从 JS 记录的当前位置直接
+  // 插值：不读布局、不强制回流，全程合成器驱动——拖拽松手后的吸附翻页
+  // 立即开始，不被整本书的排版阻塞（这是"松手卡一下"的根源）。
+  let lastX = 0;
+  let currentAnim = null;
   function setTransform(state, x, animate) {
     const node = state.contentNode;
-    if (animate) {
-      if (pendingNonAnimated) void node.offsetWidth;
-      pendingNonAnimated = false;
-    } else {
-      pendingNonAnimated = true;
-    }
-    node.style.transition = animate ? 'transform .26s cubic-bezier(.22,.72,.26,1)' : 'none';
+    if (currentAnim) { currentAnim.cancel(); currentAnim = null; }
+    node.style.transition = 'none';
     node.style.transform = `translateX(${x}px)`;
+    if (animate && x !== lastX) {
+      currentAnim = node.animate(
+        [{ transform: `translateX(${lastX}px)` }, { transform: `translateX(${x}px)` }],
+        { duration: 260, easing: 'cubic-bezier(.22,.72,.26,1)' }
+      );
+      currentAnim.onfinish = () => { currentAnim = null; };
+    }
+    lastX = x;
   }
 
   function mapTocPages(state) {
