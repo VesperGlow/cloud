@@ -383,10 +383,18 @@ export const ReaderApp = (function () {
   }
 
   // 所有 transform 写入的唯一出口：拖动时即时更新，翻页/回弹时带缓动过渡。
-  // animate 前先强制一次布局，确保过渡从"手指刚离开的位置"起步而不是上一帧。
+  // 仅在"上一次写入是未提交的瞬时位移（拖动/重排）"时才强制一次布局，
+  // 让过渡从手指刚离开的位置起步；普通点击/键盘翻页零强制回流，
+  // 消除整书多栏容器的同步排版导致的翻页卡顿。
+  let pendingNonAnimated = false;
   function setTransform(state, x, animate) {
     const node = state.contentNode;
-    if (animate) void node.offsetWidth;
+    if (animate) {
+      if (pendingNonAnimated) void node.offsetWidth;
+      pendingNonAnimated = false;
+    } else {
+      pendingNonAnimated = true;
+    }
     node.style.transition = animate ? 'transform .26s cubic-bezier(.22,.72,.26,1)' : 'none';
     node.style.transform = `translateX(${x}px)`;
   }
@@ -539,15 +547,20 @@ export const ReaderApp = (function () {
   }
 
   // ---- 目录 ----
+  let tocButtons = [];
+  let lastTocActive = -1;
   function renderToc() {
     const list = els.tocList;
     const entries = active?.tocEntries || [];
+    tocButtons = [];
+    lastTocActive = -1;
     if (!entries.length) {
       list.innerHTML = `<p class="toc-empty">${active?.kind === 'txt' ? '没有识别到“第…章”格式的章节标题。' : '这本 EPUB 没有提供可用目录。'}</p>`;
       return;
     }
     list.innerHTML = entries.map((entry, index) => `<button class="toc-item" data-toc-index="${index}" style="--toc-indent:${Math.min(4, entry.depth || 0) * 16}px">${escapeHtml(entry.label)}</button>`).join('');
-    list.querySelectorAll('[data-toc-index]').forEach(button => button.onclick = () => {
+    tocButtons = [...list.querySelectorAll('[data-toc-index]')];
+    tocButtons.forEach(button => button.onclick = () => {
       const index = Number(button.dataset.tocIndex);
       const entry = active.tocEntries[index];
       goToPage(active, tocTargetPage(active, entry, index));
@@ -563,7 +576,9 @@ export const ReaderApp = (function () {
     if (!entries.length) return;
     let activeIndex = 0;
     for (let index = 0; index < entries.length; index++) if (entries[index].page <= active.currentPage) activeIndex = index;
-    els.tocList.querySelectorAll('[data-toc-index]').forEach((button, index) => button.classList.toggle('active', index === activeIndex));
+    if (activeIndex === lastTocActive) return; // 翻页只在跨章时更新高亮，避免每次翻页重写整份目录
+    lastTocActive = activeIndex;
+    tocButtons.forEach((button, index) => button.classList.toggle('active', index === activeIndex));
   }
 
   function openToc() {

@@ -296,3 +296,9 @@ body.reader-open{overflow:hidden}
 #reader-view.dark .reader-viewport,#reader-view.dark .reader-page,#reader-view.dark .reader-loading{background:#191b1b}
 #reader-view.dark .toc-drawer{background:#232626}
 #reader-view.dark .toc-item:hover,#reader-view.dark .toc-item.active{background:#191b1b}
+
+/* 阅读时暂停背景装饰动画：翻页期间合成器不再为遮挡的动画浪费每帧工作 */
+body.reader-open .connection i,
+body.reader-open .connection i:before,
+body.reader-open .connection i:after,
+body.reader-open .storage-bar i{animation:none}
