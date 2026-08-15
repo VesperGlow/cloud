@@ -194,12 +194,14 @@ const swipeStyle=computed(()=>({
   transition:swipe.active?'none':'transform .24s cubic-bezier(.22,.8,.3,1)',
 }))
 function onStagePointerDown(e:PointerEvent){
-  if(modal.value!=='preview'||!stageSwipeable.value)return
+  if(modal.value!=='preview')return
   // 上/下一张按钮自己处理点击，不要被滑动手势的 pointer capture 劫持
   if(e.target instanceof Element&&e.target.closest('.preview-nav'))return
   if(e.pointerType==='mouse'&&e.button!==0)return
-  if(swipe.active)return // 多点触控时放弃滑动手势
+  // 所有媒体类型都记录"按下起点是否在舞台空白处"，用于点击空白关闭预览
   swipeStartedOnStage=e.target===stageEl.value
+  if(!stageSwipeable.value)return // 视频/音频/单图：不接管指针，交给点击判定
+  if(swipe.active)return // 多点触控时放弃滑动手势
   swipe.active=true;swipe.pointerId=e.pointerId;swipe.startX=e.clientX;swipe.startY=e.clientY;swipe.dx=0;swipe.dy=0
   stageEl.value?.setPointerCapture(e.pointerId)
 }
@@ -213,8 +215,8 @@ function onStagePointerEnd(e:PointerEvent){
   swipe.active=false;swipe.dx=0;swipe.dy=0
   if(Math.abs(dx)>60&&Math.abs(dx)>Math.abs(dy)*1.25)changePreview(dx<0?1:-1)
 }
-// pointer capture 会把点击事件重定向到舞台：只有按下时确实落在舞台空白处
-// 的点击才关闭预览，点图片或按钮都不会误触发退出。
+// 点击舞台空白处关闭预览：图片（pointer capture 会把点击重定向到舞台）、
+// 视频、音频、单张图片通用；点媒体本体或按钮都不会误触发退出。
 function onStageClick(e:MouseEvent){
   if(swipeStartedOnStage&&e.target===stageEl.value)closeModal()
   swipeStartedOnStage=false
