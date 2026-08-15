@@ -29,7 +29,7 @@ onBeforeUnmount(() => {
 <template>
   <section id="reader-view" ref="rootEl" class="reader-shell">
     <header class="reader-bar">
-      <button id="reader-back" class="reader-icon-btn" aria-label="返回">‹</button>
+      <button id="reader-back" class="reader-icon-btn" aria-label="返回"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg></button>
       <div class="reader-bar-title"><strong id="reader-title">正在打开…</strong><small id="reader-kind"></small></div>
       <button class="reader-icon-btn" id="toc-button" aria-label="打开目录" aria-expanded="false">☰</button>
     </header>

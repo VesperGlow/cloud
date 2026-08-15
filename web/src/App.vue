@@ -64,7 +64,7 @@ const previewDownloadLabel = computed(() => selected.value ? isImage(selected.va
 function notify(text:string, kind:'error'|'success'='error') { toast.text=text;toast.kind=kind;window.clearTimeout(toastTimer);toastTimer=window.setTimeout(()=>toast.text='',3600) }
 
 function isBook(item:DriveFile){return item.kind==='file'&&item.status==='ready'&&/\.(epub|txt)$/i.test(item.name)}
-function openReader(item:DriveFile){readerFile.value=item;openModal('reader')}
+function openReader(item:DriveFile){readerFile.value=item;openModal('reader');history.replaceState({cloudNav:true},'','/read/'+item.id)}
 async function checkSession() {
   try { const me=await api<ProfileResponse>('/api/auth/me');user.value=me.username;hasAvatar.value=me.has_avatar;await openFolder(ROOT);openDeepLink() }
   catch { user.value=null;hasAvatar.value=false }
@@ -130,7 +130,10 @@ let popChain:Promise<void>=Promise.resolve()
 function handlePopState(){
   const action=navActions.value.pop()
   if(!action)return
-  if(action.kind==='modal-close'){modal.value=null;return}
+  if(action.kind==='modal-close'){
+    if(modal.value==='reader')history.replaceState({cloudNav:true},'','/')
+    modal.value=null;return
+  }
   popChain=popChain.then(async()=>{
     suppressHistory=true
     try{await openFolder(action.id)}finally{suppressHistory=false}

@@ -14,7 +14,8 @@ export const ReaderApp = (function () {
 
   let root = null;
   let els = {};
-  let initialized = false;
+  let initialized = false; // 全局监听只绑一次
+  let boundViewport = null; // 已绑定事件的骨架实例
   let active = null; // 当前展示的书 state
   let onExit = null;
   let progressSaveChain = Promise.resolve();
@@ -28,7 +29,8 @@ export const ReaderApp = (function () {
   //          currentPage, pageCount, pageWidth, pageHeight, restoreRatio }
 
   function init(rootElement) {
-    if (initialized) return;
+    // 每次挂载都重新抓取骨架元素：Vue 弹窗关闭时会销毁整个骨架，
+    // 缓存里的 els 会指向已卸载的旧 DOM，必须重绑到新骨架。
     root = rootElement || document;
     const scope = root === document ? document : root;
     els = {
@@ -58,12 +60,18 @@ export const ReaderApp = (function () {
       fontSmaller: scope.querySelector('#font-smaller'),
       fontLarger: scope.querySelector('#font-larger'),
     };
-    bindEvents();
-    loadPrefs();
-    initialized = true;
+    if (els.viewport && els.viewport !== boundViewport) {
+      bindElementEvents();
+      boundViewport = els.viewport;
+    }
+    if (!initialized) {
+      bindGlobalEvents();
+      loadPrefs();
+      initialized = true;
+    }
   }
 
-  function bindEvents() {
+  function bindElementEvents() {
     const guardZone = handler => () => { if (Date.now() < suppressZoneClick) return; handler(); };
     els.prevZone && (els.prevZone.onclick = guardZone(previous));
     els.centerZone && (els.centerZone.onclick = guardZone(toggleTools));
@@ -81,7 +89,9 @@ export const ReaderApp = (function () {
     els.fontSlider && (els.fontSlider.oninput = event => setReaderFontSize(Number(event.target.value)));
     els.fontSmaller && (els.fontSmaller.onclick = () => stepFontSize(-1));
     els.fontLarger && (els.fontLarger.onclick = () => stepFontSize(1));
+  }
 
+  function bindGlobalEvents() {
     // 地址栏滑入/滑出（dvh 变化）有时只动 visualViewport 而不触发 window.resize，两个都听。
     // 仅在视口尺寸真正变化时才重排，避免 visualViewport 的杂音事件造成无谓重排；
     // 改字号引起的重排走 setReaderFontSize 直接调用，不经过这里。
@@ -224,7 +234,7 @@ export const ReaderApp = (function () {
 
   // ---- 打开书籍 ----
   async function openBook(bookId, options = {}) {
-    if (!initialized) init(options.root || document);
+    init(options.root || document); // 每次都重抓骨架（弹窗重挂载后 DOM 是新实例）
     bookId = String(bookId);
     if (options.onExit) onExit = options.onExit;
     show();
