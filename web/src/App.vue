@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import DOMPurify from 'dompurify'
+import { marked } from 'marked'
 import { computed, onMounted, reactive, ref } from 'vue'
 
 const ROOT = '00000000-0000-0000-0000-000000000000'
@@ -22,12 +24,13 @@ const dragActive = ref(false)
 const toast = reactive({ text:'', kind:'error' as 'error'|'success' })
 const tasks = reactive<UploadTask[]>([])
 const selected = ref<DriveFile|null>(null)
-const modal = ref<'rename'|'move'|'preview'|'share'|'account'|null>(null)
+const modal = ref<'rename'|'move'|'preview'|'share'|'account'|'editor'|null>(null)
 const renameValue = ref('')
 const folders = ref<FolderOption[]>([])
 const modalBusy = ref(false)
 const account = reactive({ username:'', currentPassword:'', password:'', confirmPassword:'', error:'' })
 const share = reactive({ active:false, url:'', createdAt:'', busy:false, error:'', copied:false })
+const editor = reactive({ isNew:false, fileId:'', name:'', originalName:'', content:'', original:'', etag:'', mode:'edit' as 'edit'|'split'|'preview', busy:false, error:'' })
 const fileInput = ref<HTMLInputElement|null>(null)
 const viewMode = ref<'list'|'grid'>('list')
 let activeUploads = 0
@@ -35,6 +38,10 @@ let toastTimer = 0
 
 const pathTitle = computed(() => breadcrumbs.value.map(x => x.name || '我的文件').join(' / '))
 const unfinished = computed(() => tasks.filter(t => t.status !== 'done' && t.status !== 'cancelled'))
+const editorDirty = computed(() => editor.content !== editor.original || editor.name !== editor.originalName)
+const editorBytes = computed(() => new Blob([editor.content]).size)
+const editorIsMarkdown = computed(() => /\.(md|markdown)$/i.test(editor.name))
+const renderedMarkdown = computed(() => DOMPurify.sanitize(marked.parse(editor.content, { async:false }) as string))
 
 async function api<T>(path:string, init:RequestInit = {}):Promise<T> {
   const headers = new Headers(init.headers)
@@ -90,8 +97,33 @@ async function createShare(replace=false){if(!selected.value)return;if(replace&&
 async function revokeShare(){if(!selected.value||!window.confirm('停止分享后，现有订阅链接会立即失效。继续吗？'))return;share.busy=true;share.error='';try{await api(`/api/files/${selected.value.id}/share`,{method:'DELETE'});share.active=false;share.url='';share.createdAt='';share.copied=false;notify('分享已停止','success')}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
 async function copyShare(){if(!share.url)return;try{await navigator.clipboard.writeText(share.url);share.copied=true;window.setTimeout(()=>share.copied=false,2200)}catch{share.error='复制失败，请手动选择链接复制'}}
 function isImage(item:DriveFile){return ['image/jpeg','image/png','image/webp','image/gif'].includes(item.mime_type||'')}
+function isEditable(item:DriveFile){return item.kind==='file'&&item.status==='ready'&&item.size<=1024*1024&&/\.(md|markdown|txt|ya?ml|json|toml|ini|conf|log|csv)$/i.test(item.name)}
 function previewURL(item:DriveFile){return `/api/files/${item.id}/preview`}
-function openItem(item:DriveFile){if(item.kind==='directory')openFolder(item.id);else if(isImage(item))showPreview(item)}
+function openItem(item:DriveFile){if(item.kind==='directory')openFolder(item.id);else if(isEditable(item))openEditor(item);else if(isImage(item))showPreview(item)}
+function newDocument(){selected.value=null;editor.isNew=true;editor.fileId='';editor.name='未命名文档.md';editor.originalName=editor.name;editor.content='';editor.original='';editor.etag='';editor.mode='edit';editor.busy=false;editor.error='';modal.value='editor'}
+async function openEditor(item:DriveFile){
+  selected.value=item;editor.isNew=false;editor.fileId=item.id;editor.name=item.name;editor.originalName=item.name;editor.content='';editor.original='';editor.etag='';editor.mode='edit';editor.error='';editor.busy=true;modal.value='editor'
+  try{const data=await api<{content:string;etag:string}>(`/api/files/${item.id}/content`);editor.content=data.content;editor.original=data.content;editor.etag=data.etag||''}
+  catch(e){editor.error=(e as Error).message}
+  finally{editor.busy=false}
+}
+async function saveDocument(){
+  editor.error=''
+  if(editor.isNew&&!editor.name.trim()){editor.error='请输入文件名';return}
+  if(!/\.(md|markdown|txt|ya?ml|json|toml|ini|conf|log|csv)$/i.test(editor.name)){editor.error='支持 Markdown、TXT、YAML、JSON、TOML、INI、CONF、LOG 和 CSV';return}
+  if(editorBytes.value>1024*1024){editor.error='可编辑文档不能超过 1 MiB';return}
+  editor.busy=true
+  try{
+    const saved=editor.isNew
+      ?await api<DriveFile>('/api/documents',{method:'POST',body:JSON.stringify({parent_id:currentId.value,name:editor.name.trim(),content:editor.content})})
+      :await api<DriveFile>(`/api/files/${editor.fileId}/content`,{method:'PUT',body:JSON.stringify({content:editor.content,etag:editor.etag})})
+    editor.isNew=false;editor.fileId=saved.id;editor.name=saved.name;editor.originalName=saved.name;editor.etag=saved.etag||'';editor.original=editor.content;selected.value=saved
+    await openFolder(currentId.value);notify('文档已保存','success')
+  }catch(e){editor.error=(e as Error).message}
+  finally{editor.busy=false}
+}
+function closeEditor(){if(editorDirty.value&&!window.confirm('还有未保存的修改，确定关闭吗？'))return;modal.value=null}
+function closeBackdrop(){if(modal.value==='editor')closeEditor();else modal.value=null}
 function hideBrokenImage(event:Event){(event.target as HTMLImageElement).hidden=true}
 function setViewMode(mode:'list'|'grid'){viewMode.value=mode;localStorage.setItem('cloud-view-mode',mode)}
 function download(item:DriveFile){window.location.assign(`/api/files/${item.id}/download`)}
@@ -117,7 +149,7 @@ onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='l
 <template>
   <div v-if="checking" class="splash"><div class="brand-mark">C</div><div class="spinner"></div></div>
   <main v-else-if="!user" class="login-page">
-    <section class="login-visual"><div class="glow glow-a"></div><div class="glow glow-b"></div><div class="visual-copy"><span class="eyebrow">PRIVATE · DIRECT · YOURS</span><h1>你的文件，<br>安静地待在云上。</h1><p>轻量、自托管，文件直接往返你的 S3。</p></div><div class="cloud-card"><span>☁</span><div><strong>Browser ↔ S3</strong><small>文件内容不经过应用服务器</small></div></div></section>
+    <section class="login-visual"><div class="glow glow-a"></div><div class="glow glow-b"></div><div class="visual-copy"><span class="eyebrow">PRIVATE · DIRECT · YOURS</span><h1>你的文件，<br>安静地待在云上。</h1><p>轻量、自托管，大文件直接往返你的 S3。</p></div><div class="cloud-card"><span>☁</span><div><strong>Browser ↔ S3</strong><small>上传下载直连对象存储</small></div></div></section>
     <section class="login-panel"><form class="login-form" @submit.prevent="submitLogin"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div><p class="eyebrow dark">WELCOME BACK</p><h2>登录私人空间</h2><p class="muted">首次启动的随机凭据可在容器日志中查看</p></div><label>用户名<input v-model="login.username" autocomplete="username" maxlength="128" required></label><label>密码<input v-model="login.password" type="password" autocomplete="current-password" maxlength="1024" required></label><p v-if="login.notice" class="form-success">{{ login.notice }}</p><p v-if="login.error" class="form-error">{{ login.error }}</p><button class="primary wide" :disabled="login.busy">{{ login.busy ? '正在验证…' : '进入我的网盘' }}</button></form></section>
   </main>
 
@@ -125,15 +157,16 @@ onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='l
     <header class="topbar"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div class="top-actions"><span class="connection"><i></i>S3 直连</span><button class="account-button" title="打开账户设置" @click="showAccount"><span class="avatar-badge">{{ user.slice(0,1).toUpperCase() }}</span><span class="account-copy"><b>{{ user }}</b><small>账户设置</small></span></button><button class="top-logout" @click="logout">退出</button></div></header>
     <aside class="sidebar"><button class="nav active"><span>▰</span>我的文件</button><div class="sidebar-note"><span>私密空间</span><p>元数据保存在 SQLite，文件内容保存在 S3。</p></div></aside>
     <section class="content">
-      <div class="content-head"><div><nav class="breadcrumbs" aria-label="路径"><button v-for="crumb in breadcrumbs" :key="crumb.id" @click="openFolder(crumb.id)">{{ crumb.name || '我的文件' }}<span>/</span></button></nav><h1>{{ current?.name || '我的文件' }}</h1><p>{{ items.length }} 个项目 · {{ pathTitle }}</p></div><div class="actions"><div class="view-switch" role="group" aria-label="文件显示方式"><button :class="{active:viewMode==='list'}" title="列表视图" aria-label="列表视图" @click="setViewMode('list')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg></button><button :class="{active:viewMode==='grid'}" title="大图标视图" aria-label="大图标视图" @click="setViewMode('grid')"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg></button></div><button class="secondary" @click="createFolder">＋ 新建文件夹</button><button class="primary" @click="chooseFiles">↑ 上传文件</button><input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}"></div></div>
+      <div class="content-head"><div><nav class="breadcrumbs" aria-label="路径"><button v-for="crumb in breadcrumbs" :key="crumb.id" @click="openFolder(crumb.id)">{{ crumb.name || '我的文件' }}<span>/</span></button></nav><h1>{{ current?.name || '我的文件' }}</h1><p>{{ items.length }} 个项目 · {{ pathTitle }}</p></div><div class="actions"><div class="view-switch" role="group" aria-label="文件显示方式"><button :class="{active:viewMode==='list'}" title="列表视图" aria-label="列表视图" @click="setViewMode('list')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg></button><button :class="{active:viewMode==='grid'}" title="大图标视图" aria-label="大图标视图" @click="setViewMode('grid')"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg></button></div><button class="secondary" @click="newDocument">＋ 新建文档</button><button class="secondary" @click="createFolder">＋ 新建文件夹</button><button class="primary" @click="chooseFiles">↑ 上传文件</button><input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}"></div></div>
       <div v-if="loading" class="state"><div class="spinner"></div><p>正在读取文件…</p></div>
-      <div v-else-if="!items.length" class="state empty"><div class="empty-icon">⌁</div><h3>这里还是空的</h3><p>拖放文件到这里，或创建第一个文件夹。</p><button class="primary" @click="chooseFiles">上传文件</button></div>
+      <div v-else-if="!items.length" class="state empty"><div class="empty-icon">⌁</div><h3>这里还是空的</h3><p>拖放文件到这里，或新建一篇文档。</p><div class="empty-actions"><button class="secondary" @click="newDocument">新建文档</button><button class="primary" @click="chooseFiles">上传文件</button></div></div>
       <div v-else-if="viewMode==='list'" class="file-table">
         <div class="table-head"><span>名称</span><span>大小</span><span>修改时间</span><span>操作</span></div>
         <div v-for="item in items" :key="item.id" class="file-row" :class="{mutedrow:item.status!=='ready'}" @dblclick="openItem(item)">
-          <div class="file-name"><button class="file-icon" :class="{directory:item.kind==='directory',image:isImage(item)}" :title="item.kind==='directory'?'打开文件夹':isImage(item)?'预览图片':'文件'" @click="openItem(item)"><span v-if="item.kind==='directory'" class="folder-glyph">▰</span><img v-else-if="isImage(item)" :src="previewURL(item)" :alt="item.name" loading="lazy" @error="hideBrokenImage"><span v-else>◇</span></button><div><strong>{{ item.name }}</strong><small v-if="item.status!=='ready'">{{ item.status }}</small><small v-else>{{ item.kind==='directory'?'文件夹':item.mime_type||'文件' }}</small></div></div>
+          <div class="file-name"><button class="file-icon" :class="{directory:item.kind==='directory',image:isImage(item),document:isEditable(item)}" :title="item.kind==='directory'?'打开文件夹':isEditable(item)?'编辑文档':isImage(item)?'预览图片':'文件'" @click="openItem(item)"><span v-if="item.kind==='directory'" class="folder-glyph">▰</span><img v-else-if="isImage(item)" :src="previewURL(item)" :alt="item.name" loading="lazy" @error="hideBrokenImage"><span v-else-if="isEditable(item)">▤</span><span v-else>◇</span></button><div><strong>{{ item.name }}</strong><small v-if="item.status!=='ready'">{{ item.status }}</small><small v-else>{{ item.kind==='directory'?'文件夹':item.mime_type||'文件' }}</small></div></div>
           <span>{{ item.kind==='directory'?'—':formatSize(item.size) }}</span><span>{{ formatDate(item.updated_at) }}</span>
           <div class="row-actions">
+            <button v-if="isEditable(item)" title="编辑" aria-label="编辑" @click="openEditor(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path d="m13.8 6.2 3.2 3.2"/></svg></button>
             <button v-if="isImage(item)" title="预览" aria-label="预览" @click="showPreview(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.6"/></svg></button>
             <button v-if="item.kind==='file'" title="下载" aria-label="下载" @click="download(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg></button>
             <button v-if="item.kind==='file'" title="分享" aria-label="分享" @click="showShare(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.6-4.4M8.2 13.2l7.6 4.4"/></svg></button>
@@ -145,9 +178,10 @@ onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='l
       </div>
       <div v-else class="file-grid">
         <article v-for="item in items" :key="item.id" class="file-card" :class="{mutedrow:item.status!=='ready'}" @dblclick="openItem(item)">
-          <button class="card-preview" :title="item.kind==='directory'?'打开文件夹':isImage(item)?'预览图片':'文件'" @click="openItem(item)"><img v-if="isImage(item)" :src="previewURL(item)" :alt="item.name" loading="lazy" @error="hideBrokenImage"><span v-else-if="item.kind==='directory'" class="large-folder">▰</span><span v-else class="large-file">◇</span></button>
+          <button class="card-preview" :title="item.kind==='directory'?'打开文件夹':isEditable(item)?'编辑文档':isImage(item)?'预览图片':'文件'" @click="openItem(item)"><img v-if="isImage(item)" :src="previewURL(item)" :alt="item.name" loading="lazy" @error="hideBrokenImage"><span v-else-if="item.kind==='directory'" class="large-folder">▰</span><span v-else-if="isEditable(item)" class="large-document">▤</span><span v-else class="large-file">◇</span></button>
           <div class="card-info"><strong :title="item.name">{{ item.name }}</strong><small>{{ item.kind==='directory'?'文件夹':formatSize(item.size) }} · {{ formatDate(item.updated_at) }}</small></div>
           <div class="card-actions">
+            <button v-if="isEditable(item)" title="编辑" aria-label="编辑" @click="openEditor(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path d="m13.8 6.2 3.2 3.2"/></svg></button>
             <button v-if="isImage(item)" title="预览" aria-label="预览" @click="showPreview(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.6"/></svg></button>
             <button v-if="item.kind==='file'" title="下载" aria-label="下载" @click="download(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg></button>
             <button v-if="item.kind==='file'" title="分享" aria-label="分享" @click="showShare(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.6-4.4M8.2 13.2l7.6 4.4"/></svg></button>
@@ -162,21 +196,34 @@ onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='l
     <div v-if="dragActive" class="drop-zone"><div><span>↓</span><h2>释放以上传到 {{ current?.name || '我的文件' }}</h2><p>文件将直接发送到 S3</p></div></div>
     <section v-if="tasks.length" class="upload-panel"><header><div><strong>上传</strong><span v-if="unfinished.length">{{ unfinished.length }} 项进行中</span></div><button @click="clearFinished">清除已完成</button></header><div class="task-list"><article v-for="task in tasks" :key="task.id"><div class="task-top"><span class="task-icon">↑</span><div><strong>{{ task.file.name }}</strong><small>{{ formatSize(task.file.size) }} · {{ task.status==='queued'?'等待中':task.status==='uploading'?'正在上传':task.status==='done'?'已完成':task.status==='cancelled'?'已取消':task.error }}</small></div><b>{{ task.progress }}%</b><button v-if="task.status==='queued'||task.status==='uploading'" @click="cancelUpload(task)">×</button><button v-else-if="task.status==='failed'" @click="retry(task)">重试</button></div><div class="progress"><i :class="task.status" :style="{width:`${task.progress}%`}"></i></div></article></div></section>
 
-    <div v-if="modal" class="modal-backdrop" :class="{previewing:modal==='preview'}" @click.self="modal=null">
+    <div v-if="modal" class="modal-backdrop" :class="{previewing:modal==='preview',editing:modal==='editor'}" @click.self="closeBackdrop">
       <section v-if="modal==='rename'" class="modal"><header><div><p class="eyebrow dark">EDIT</p><h2>重命名</h2></div><button @click="modal=null">×</button></header><label>新名称<input v-model="renameValue" maxlength="1024" @keyup.enter="saveRename"></label><footer><button class="secondary" @click="modal=null">取消</button><button class="primary" :disabled="modalBusy" @click="saveRename">保存</button></footer></section>
       <section v-else-if="modal==='move'" class="modal folder-modal"><header><div><p class="eyebrow dark">MOVE</p><h2>移动「{{ selected?.name }}」</h2></div><button @click="modal=null">×</button></header><div v-if="modalBusy" class="state small"><div class="spinner"></div></div><div v-else class="folder-list"><button v-for="folder in folders" :key="folder.id" :style="{paddingLeft:`${18+folder.depth*22}px`}" @click="moveTo(folder.id)"><span>▰</span>{{ folder.name }}</button></div></section>
       <section v-else-if="modal==='account'" class="modal account-modal"><header><div><p class="eyebrow dark">SECURITY</p><h2>账户设置</h2></div><button @click="modal=null">×</button></header><form @submit.prevent="saveAccount"><p class="modal-hint">修改后会退出所有已登录设备，请使用新凭据重新登录。</p><label>管理员用户名<input v-model="account.username" autocomplete="username" maxlength="128" required></label><label>当前密码<input v-model="account.currentPassword" type="password" autocomplete="current-password" maxlength="1024" required></label><label>新密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><label>确认新密码<input v-model="account.confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><p v-if="account.error" class="form-error">{{ account.error }}</p><footer><button type="button" class="secondary" @click="modal=null">取消</button><button class="primary" :disabled="modalBusy">{{ modalBusy?'正在保存…':'更新并退出' }}</button></footer></form></section>
+      <section v-else-if="modal==='editor'" class="document-editor">
+        <header class="editor-header">
+          <div class="editor-title"><span>▤</span><div><input v-if="editor.isNew" v-model="editor.name" aria-label="文档文件名" maxlength="1024"><strong v-else :title="editor.name">{{ editor.name }}</strong><small>{{ editor.isNew?'保存在当前文件夹':'文本编辑器' }}</small></div></div>
+          <div v-if="editorIsMarkdown" class="editor-tabs" role="group" aria-label="编辑器视图"><button :class="{active:editor.mode==='edit'}" @click="editor.mode='edit'">编辑</button><button :class="{active:editor.mode==='split'}" @click="editor.mode='split'">分栏</button><button :class="{active:editor.mode==='preview'}" @click="editor.mode='preview'">预览</button></div>
+          <div class="editor-actions"><span v-if="editor.isNew||editorDirty" class="unsaved-dot">未保存</span><button class="primary" :disabled="editor.busy||(!editor.isNew&&!editorDirty)" @click="saveDocument">{{ editor.busy?'保存中…':'保存' }}</button><button class="editor-close" aria-label="关闭编辑器" @click="closeEditor">×</button></div>
+        </header>
+        <div v-if="editor.busy&&!editor.content" class="state editor-loading"><div class="spinner"></div><p>正在打开文档…</p></div>
+        <div v-else class="editor-workspace" :class="[`mode-${editor.mode}`,{markdown:editorIsMarkdown}]">
+          <textarea v-if="editor.mode!=='preview'" v-model="editor.content" autofocus spellcheck="false" aria-label="文档内容" @keydown.ctrl.s.prevent="saveDocument" @keydown.meta.s.prevent="saveDocument"></textarea>
+          <article v-if="editorIsMarkdown&&editor.mode!=='edit'" class="markdown-preview" v-html="renderedMarkdown"></article>
+        </div>
+        <footer class="editor-status"><span>{{ editorBytes.toLocaleString() }} 字节 · UTF-8 · 最大 1 MiB</span><span v-if="editor.error" class="form-error">{{ editor.error }}</span><span v-else>Ctrl / ⌘ + S 保存</span></footer>
+      </section>
       <section v-else-if="modal==='share'" class="modal share-modal">
-        <header><div><p class="eyebrow dark">PUBLIC LINK</p><h2>分享「{{ selected?.name }}」</h2></div><button @click="modal=null">×</button></header>
+        <header><div class="share-title"><span>↗</span><div><h2>分享文件</h2><p :title="selected?.name">{{ selected?.name }}</p></div></div><button @click="modal=null">×</button></header>
         <div v-if="share.busy" class="state small"><div class="spinner"></div><p>正在准备分享…</p></div>
         <template v-else-if="share.active">
-          <div class="share-notice"><span>↗</span><div><strong>任何拿到链接的人都能访问</strong><p>链接长期有效，适合用作 YAML 订阅；重新生成或停止分享后立即失效。</p></div></div>
-          <label>分享链接<div class="share-link"><input :value="share.url" readonly @focus="($event.target as HTMLInputElement).select()"><button type="button" class="primary" @click="copyShare">{{ share.copied?'已复制':'复制' }}</button></div></label>
-          <p v-if="share.createdAt" class="share-created">创建于 {{ formatDate(share.createdAt) }}</p>
+          <p class="share-description">任何拿到链接的人都能直接读取该文件。重新生成或停止分享后，旧链接立即失效。</p>
+          <div class="share-link"><input :value="share.url" aria-label="分享链接" readonly @focus="($event.target as HTMLInputElement).select()"><button type="button" class="primary" @click="copyShare">{{ share.copied?'已复制':'复制链接' }}</button></div>
+          <p v-if="share.createdAt" class="share-created">公开链接 · 创建于 {{ formatDate(share.createdAt) }}</p>
           <p v-if="share.error" class="form-error">{{ share.error }}</p>
           <footer class="share-footer"><button class="danger-text" :disabled="share.busy" @click="revokeShare">停止分享</button><button class="secondary" :disabled="share.busy" @click="createShare(true)">重新生成链接</button></footer>
         </template>
-        <template v-else><div class="share-empty"><span>↗</span><h3>创建公开分享链接</h3><p>无需登录即可读取这个文件。上传 YAML 后，可将生成的地址直接填写到订阅客户端。</p><button class="primary" :disabled="share.busy" @click="createShare(false)">创建分享链接</button></div><p v-if="share.error" class="form-error">{{ share.error }}</p></template>
+        <template v-else><p class="share-description">创建后，无需登录即可通过链接读取这个文件。你可以随时重新生成或停止分享。</p><button class="primary share-create" :disabled="share.busy" @click="createShare(false)">创建公开链接</button><p v-if="share.error" class="form-error">{{ share.error }}</p></template>
       </section>
       <section v-else class="preview-modal" @click.self="modal=null">
         <header class="preview-bar"><div><strong>{{ selected?.name }}</strong><small v-if="selected">{{ formatSize(selected.size) }} · {{ selected.mime_type }}</small></div><button aria-label="关闭预览" @click="modal=null">×</button></header>

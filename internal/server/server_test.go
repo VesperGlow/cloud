@@ -20,6 +20,7 @@ import (
 
 type mockStorage struct {
 	objects   map[string]storage.ObjectInfo
+	contents  map[string][]byte
 	deleteErr error
 }
 
@@ -38,11 +39,28 @@ func (m *mockStorage) Head(_ context.Context, key string) (storage.ObjectInfo, e
 	}
 	return v, nil
 }
+func (m *mockStorage) Read(_ context.Context, key string, limit int64) ([]byte, error) {
+	data, ok := m.contents[key]
+	if !ok {
+		return nil, errors.New("not found")
+	}
+	if int64(len(data)) > limit {
+		return nil, storage.ErrObjectTooLarge
+	}
+	return append([]byte(nil), data...), nil
+}
+func (m *mockStorage) Write(_ context.Context, key, _ string, data []byte) (storage.ObjectInfo, error) {
+	m.contents[key] = append([]byte(nil), data...)
+	info := storage.ObjectInfo{Size: int64(len(data)), ETag: `"mock-etag"`}
+	m.objects[key] = info
+	return info, nil
+}
 func (m *mockStorage) Delete(_ context.Context, key string) error {
 	if m.deleteErr != nil {
 		return m.deleteErr
 	}
 	delete(m.objects, key)
+	delete(m.contents, key)
 	return nil
 }
 func (m *mockStorage) CreateMultipart(context.Context, string, string) (string, error) {
@@ -74,7 +92,7 @@ func newTestApp(t *testing.T) *testApp {
 	if _, err := a.Initialize(context.Background(), "admin", "a-secure-test-password"); err != nil {
 		t.Fatal(err)
 	}
-	store := &mockStorage{objects: map[string]storage.ObjectInfo{}}
+	store := &mockStorage{objects: map[string]storage.ObjectInfo{}, contents: map[string][]byte{}}
 	cfg := config.Config{BaseURL: "http://example.test", MultipartThreshold: 100, PartSize: 5 * 1024 * 1024, PresignExpires: time.Minute, UploadExpires: time.Hour}
 	app := &testApp{t: t, db: db, store: store, handler: New(db, store, a, cfg, nil).Handler()}
 	resp := app.request("POST", "/api/auth/login", map[string]any{"username": "admin", "password": "a-secure-test-password"}, false)
@@ -218,6 +236,42 @@ func TestResponseMimeRecognizesYAML(t *testing.T) {
 	got := responseMime(File{Name: "profile.yaml", MimeType: "application/octet-stream"})
 	if got != "application/yaml; charset=utf-8" {
 		t.Fatalf("yaml content type=%q", got)
+	}
+}
+
+func TestCreateReadAndUpdateDocument(t *testing.T) {
+	a := newTestApp(t)
+	createdRR := a.request("POST", "/api/documents", map[string]any{"parent_id": RootID, "name": "notes.md", "content": "# First\n"}, true)
+	if createdRR.Code != http.StatusCreated {
+		t.Fatalf("create document=%d: %s", createdRR.Code, createdRR.Body.String())
+	}
+	created := decode[File](t, createdRR)
+	if created.Status != "ready" || created.MimeType != "text/markdown; charset=utf-8" {
+		t.Fatalf("created document=%+v", created)
+	}
+	readRR := a.request("GET", "/api/files/"+created.ID+"/content", nil, true)
+	if readRR.Code != http.StatusOK {
+		t.Fatalf("read document=%d: %s", readRR.Code, readRR.Body.String())
+	}
+	read := decode[struct {
+		Content string `json:"content"`
+		ETag    string `json:"etag"`
+	}](t, readRR)
+	if read.Content != "# First\n" || read.ETag == "" {
+		t.Fatalf("document content=%q etag=%q", read.Content, read.ETag)
+	}
+	conflictRR := a.request("PUT", "/api/files/"+created.ID+"/content", map[string]any{"content": "changed", "etag": "wrong"}, true)
+	if conflictRR.Code != http.StatusConflict {
+		t.Fatalf("stale edit=%d: %s", conflictRR.Code, conflictRR.Body.String())
+	}
+	updatedRR := a.request("PUT", "/api/files/"+created.ID+"/content", map[string]any{"content": "# Saved\n", "etag": read.ETag}, true)
+	if updatedRR.Code != http.StatusOK {
+		t.Fatalf("update document=%d: %s", updatedRR.Code, updatedRR.Body.String())
+	}
+	reread := a.request("GET", "/api/files/"+created.ID+"/content", nil, true)
+	got := decode[struct{ Content string `json:"content"` }](t, reread)
+	if got.Content != "# Saved\n" {
+		t.Fatalf("updated content=%q", got.Content)
 	}
 }
 

@@ -1,8 +1,11 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 	"time"
@@ -24,11 +27,15 @@ type ObjectInfo struct {
 	ETag string
 }
 
+var ErrObjectTooLarge = errors.New("object exceeds read limit")
+
 type Storage interface {
 	Ping(context.Context) error
 	PresignPut(context.Context, string, string, time.Duration) (string, error)
 	PresignGet(context.Context, string, string, string, bool, time.Duration) (string, error)
 	Head(context.Context, string) (ObjectInfo, error)
+	Read(context.Context, string, int64) ([]byte, error)
+	Write(context.Context, string, string, []byte) (ObjectInfo, error)
 	Delete(context.Context, string) error
 	CreateMultipart(context.Context, string, string) (string, error)
 	PresignPart(context.Context, string, string, int32, time.Duration) (string, error)
@@ -105,6 +112,32 @@ func (s *S3) Head(ctx context.Context, key string) (ObjectInfo, error) {
 		return ObjectInfo{}, err
 	}
 	return ObjectInfo{Size: aws.ToInt64(out.ContentLength), ETag: aws.ToString(out.ETag)}, nil
+}
+func (s *S3) Read(ctx context.Context, key string, limit int64) ([]byte, error) {
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
+	if err != nil {
+		return nil, err
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(out.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, ErrObjectTooLarge
+	}
+	return data, nil
+}
+func (s *S3) Write(ctx context.Context, key, mime string, data []byte) (ObjectInfo, error) {
+	in := &s3.PutObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key), Body: bytes.NewReader(data), ContentLength: aws.Int64(int64(len(data)))}
+	if mime != "" {
+		in.ContentType = aws.String(mime)
+	}
+	out, err := s.client.PutObject(ctx, in)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	return ObjectInfo{Size: int64(len(data)), ETag: aws.ToString(out.ETag)}, nil
 }
 func (s *S3) Delete(ctx context.Context, key string) error {
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})

@@ -1,8 +1,8 @@
 # Cloud
 
-Cloud 是一个轻量、单用户、自托管的私人 S3 网盘。Go 服务只处理认证、SQLite 文件树元数据和 S3 控制面；上传与下载的文件内容通过短期 Presigned URL 在浏览器和 S3 之间直传，不经过应用服务器。
+Cloud 是一个轻量、单用户、自托管的私人 S3 网盘。Go 服务主要处理认证、SQLite 文件树元数据和 S3 控制面；普通上传与下载通过短期 Presigned URL 在浏览器和 S3 之间直传。内置编辑器读写不超过 1 MiB 的文本文件时会经过应用服务，以便校验 UTF-8、大小和并发修改。
 
-它不是 Nextcloud 的替代品：没有多用户、共享、WebDAV、在线编辑、同步客户端或企业权限系统。
+它不是 Nextcloud 的替代品：没有多用户协作、WebDAV、Office 套件、同步客户端或企业权限系统。
 
 ## 架构
 
@@ -175,6 +175,8 @@ Bucket 必须保持私有。浏览器访问对象依赖 Presigned URL，而不�
 | `DELETE` | `/api/files/{id}` | 删除文件或空目录 |
 | `GET` | `/api/files/{id}/download` | 302 到 Presigned 下载 URL |
 | `GET` | `/api/files/{id}/preview` | 302 到图片预览 URL |
+| `GET` / `PUT` | `/api/files/{id}/content` | 读取或保存可编辑文本文件，含 ETag 冲突保护 |
+| `POST` | `/api/documents` | 在指定目录新建 UTF-8 文本文档 |
 | `GET` / `POST` / `DELETE` | `/api/files/{id}/share` | 查询、创建/重置或停止公开分享 |
 | `GET` | `/s/{token}` | 无需登录，通过稳定分享地址读取文件 |
 | `POST` | `/api/uploads` | 创建 Single PUT / Multipart 上传 |
@@ -182,27 +184,31 @@ Bucket 必须保持私有。浏览器访问对象依赖 Presigned URL，而不�
 | `POST` | `/api/uploads/{id}/complete` | 服务端完成并 `HeadObject` 验证 |
 | `DELETE` | `/api/uploads/{id}` | 取消并清理待上传元数据 |
 
-## 公开分享与 YAML 订阅
+## 公开分享
 
 文件操作区的“分享”按钮可以创建一个高熵公开链接。链接长期有效，任何持有者无需登录即可访问；重新生成链接会立即废弃旧地址，“停止分享”会撤销当前地址。删除文件时对应分享也会自动删除。
 
-公开入口不会让文件经过应用服务器，而是每次签发一个短期 S3 URL 并返回 302。对于 `.yaml` / `.yml` 文件，响应会声明 `application/yaml`，可以把分享地址直接用作 Mihomo/Clash 等支持 HTTP URL 的订阅或 provider 地址：
-
-```yaml
-proxy-providers:
-  private:
-    type: http
-    url: "https://drive.example.com/s/REPLACE_WITH_SHARE_TOKEN"
-    path: ./proxy_providers/private.yaml
-    interval: 3600
-```
+公开入口不会让文件经过应用服务器，而是每次签发一个短期 S3 URL 并返回 302，同时按文件扩展名返回适合的内容类型。分享地址是稳定的原始文件读取地址，因此也能用于任何支持 HTTP URL 的客户端。
 
 分享 URL 等同于访问凭据，请不要发布到公开仓库、聊天群或日志中。若怀疑泄露，请立即重新生成或停止分享。
+
+## 文档编辑器
+
+点击 `.md`、`.markdown`、`.txt`、`.yaml`、`.yml`、`.json`、`.toml`、`.ini`、`.conf`、`.log` 或 `.csv` 文件即可打开编辑器；当前目录也可以直接新建文档。Markdown 支持编辑、分栏和安全过滤后的预览，`Ctrl/⌘ + S` 可保存。
+
+编辑器只接受 UTF-8 且不超过 1 MiB 的文件。保存会覆盖同一个 S3 对象并更新 SQLite 中的大小、MIME 和 ETag；若文件已被其他页面修改，旧编辑会收到 `409 Conflict`，不会静默覆盖新内容。已有公开分享链接无需重建，会读取保存后的最新内容。
+
+## S3 对象与分片
+
+界面中的目录、显示名和层级保存在 SQLite；每个逻辑文件对应一个 `objects/<随机 UUID>` S3 对象。Bucket 控制台看到的 UUID 是不可读的物理对象键，不代表一个文件被拆成了多块。
+
+超过阈值的大文件在上传过程中使用 S3 Multipart 分片并行传输，完成后由 S3 合并成一个对象。本项目没有再做内容级切块或跨文件去重：对单用户网盘而言，这会增加清单一致性、删除回收、下载请求数、分享跳转和灾难恢复的复杂度，却通常没有足够收益。
 
 ## 数据模型与一致性
 
 - `files`：文件树、显示名、随机 Object Key、大小、MIME、ETag 和状态；固定 root ID 为 `00000000-0000-0000-0000-000000000000`。
 - `uploads`：Single/Multipart 控制状态、预期大小、S3 Upload ID 和过期时间。
+- `shares`：文件与高熵公开 token 的一对一映射。
 - `sessions`：只保存 Session Token 的 SHA-256 hash，不保存明文 Token。
 - `settings`：管理员用户名和 Argon2id 密码 hash。
 

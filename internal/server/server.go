@@ -31,7 +31,8 @@ import (
 )
 
 const RootID = "00000000-0000-0000-0000-000000000000"
-const maxJSONBody = 1 << 20
+const maxJSONBody = 7 << 20
+const maxDocumentBytes = 1 << 20
 
 type Server struct {
 	db      *sql.DB
@@ -82,10 +83,13 @@ func (s *Server) Handler() http.Handler {
 			r.Get("/files/{id}/children", s.children)
 			r.Get("/files/{id}/download", s.download)
 			r.Get("/files/{id}/preview", s.preview)
+			r.Get("/files/{id}/content", s.getDocument)
+			r.Put("/files/{id}/content", s.updateDocument)
 			r.Get("/files/{id}/share", s.getShare)
 			r.Post("/files/{id}/share", s.createShare)
 			r.Delete("/files/{id}/share", s.revokeShare)
 			r.Post("/directories", s.createDirectory)
+			r.Post("/documents", s.createDocument)
 			r.Patch("/files/{id}", s.patchFile)
 			r.Delete("/files/{id}", s.deleteFile)
 			r.Post("/uploads", s.createUpload)
@@ -332,6 +336,158 @@ func (s *Server) createDirectory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, f)
 }
 
+type documentInput struct {
+	ParentID string `json:"parent_id"`
+	Name     string `json:"name"`
+	Content  string `json:"content"`
+	ETag     string `json:"etag"`
+}
+
+func editableDocumentName(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".md", ".markdown", ".txt", ".yaml", ".yml", ".json", ".toml", ".ini", ".conf", ".log", ".csv":
+		return true
+	default:
+		return false
+	}
+}
+
+func documentMime(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".md", ".markdown":
+		return "text/markdown; charset=utf-8"
+	case ".yaml", ".yml":
+		return "application/yaml; charset=utf-8"
+	case ".json":
+		return "application/json; charset=utf-8"
+	case ".toml":
+		return "application/toml; charset=utf-8"
+	case ".csv":
+		return "text/csv; charset=utf-8"
+	default:
+		return "text/plain; charset=utf-8"
+	}
+}
+
+func validateDocument(name, content string) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
+	if !editableDocumentName(name) {
+		return errors.New("this file type cannot be edited as text")
+	}
+	if !utf8.ValidString(content) {
+		return errors.New("document must contain valid UTF-8 text")
+	}
+	if len([]byte(content)) > maxDocumentBytes {
+		return errors.New("editable documents cannot exceed 1 MiB")
+	}
+	return nil
+}
+
+func (s *Server) createDocument(w http.ResponseWriter, r *http.Request) {
+	var in documentInput
+	if decodeJSON(w, r, &in) != nil {
+		return
+	}
+	if err := validateDocument(in.Name, in.Content); err != nil {
+		problem(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	parent, err := s.file(r.Context(), in.ParentID)
+	if err != nil || parent.Kind != "directory" || parent.Status != "ready" {
+		problem(w, http.StatusBadRequest, "parent directory is invalid")
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	f := File{ID: ids.New(), ParentID: &in.ParentID, Name: in.Name, Kind: "file", Size: int64(len([]byte(in.Content))), MimeType: documentMime(in.Name), Status: "pending", CreatedAt: now, UpdatedAt: now, objectKey: "objects/" + ids.New()}
+	_, err = s.db.ExecContext(r.Context(), `INSERT INTO files(id,parent_id,name,kind,object_key,size,mime_type,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, f.ID, in.ParentID, f.Name, f.Kind, f.objectKey, f.Size, f.MimeType, f.Status, now, now)
+	if isConflict(err) {
+		problem(w, http.StatusConflict, "an item with that name already exists")
+		return
+	}
+	if err != nil {
+		problem(w, http.StatusInternalServerError, "could not create document")
+		return
+	}
+	info, err := s.storage.Write(r.Context(), f.objectKey, f.MimeType, []byte(in.Content))
+	if err != nil {
+		_, _ = s.db.ExecContext(r.Context(), `DELETE FROM files WHERE id=?`, f.ID)
+		problem(w, http.StatusBadGateway, "object storage write failed")
+		return
+	}
+	if _, err = s.db.ExecContext(r.Context(), `UPDATE files SET size=?,etag=?,status='ready',updated_at=? WHERE id=?`, info.Size, info.ETag, now, f.ID); err != nil {
+		_ = s.storage.Delete(r.Context(), f.objectKey)
+		_, _ = s.db.ExecContext(r.Context(), `DELETE FROM files WHERE id=?`, f.ID)
+		problem(w, http.StatusInternalServerError, "document was not saved")
+		return
+	}
+	created, _ := s.file(r.Context(), f.ID)
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (s *Server) getDocument(w http.ResponseWriter, r *http.Request) {
+	f, err := s.file(r.Context(), chi.URLParam(r, "id"))
+	if err != nil || f.Kind != "file" || f.Status != "ready" {
+		problem(w, http.StatusNotFound, "ready file not found")
+		return
+	}
+	if !editableDocumentName(f.Name) {
+		problem(w, http.StatusUnsupportedMediaType, "this file type cannot be edited as text")
+		return
+	}
+	if f.Size > maxDocumentBytes {
+		problem(w, http.StatusRequestEntityTooLarge, "editable documents cannot exceed 1 MiB")
+		return
+	}
+	data, err := s.storage.Read(r.Context(), f.objectKey, maxDocumentBytes)
+	if errors.Is(err, storage.ErrObjectTooLarge) {
+		problem(w, http.StatusRequestEntityTooLarge, "editable documents cannot exceed 1 MiB")
+		return
+	}
+	if err != nil {
+		problem(w, http.StatusBadGateway, "object storage read failed")
+		return
+	}
+	if !utf8.Valid(data) {
+		problem(w, http.StatusUnsupportedMediaType, "file is not valid UTF-8 text")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"content": string(data), "etag": f.ETag, "updated_at": f.UpdatedAt})
+}
+
+func (s *Server) updateDocument(w http.ResponseWriter, r *http.Request) {
+	f, err := s.file(r.Context(), chi.URLParam(r, "id"))
+	if err != nil || f.Kind != "file" || f.Status != "ready" {
+		problem(w, http.StatusNotFound, "ready file not found")
+		return
+	}
+	var in documentInput
+	if decodeJSON(w, r, &in) != nil {
+		return
+	}
+	if err := validateDocument(f.Name, in.Content); err != nil {
+		problem(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if in.ETag != "" && f.ETag != "" && in.ETag != f.ETag {
+		problem(w, http.StatusConflict, "document changed elsewhere; reopen it before saving")
+		return
+	}
+	info, err := s.storage.Write(r.Context(), f.objectKey, documentMime(f.Name), []byte(in.Content))
+	if err != nil {
+		problem(w, http.StatusBadGateway, "object storage write failed")
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err = s.db.ExecContext(r.Context(), `UPDATE files SET size=?,mime_type=?,etag=?,updated_at=? WHERE id=?`, info.Size, documentMime(f.Name), info.ETag, now, f.ID); err != nil {
+		problem(w, http.StatusInternalServerError, "document content changed but metadata update failed")
+		return
+	}
+	updated, _ := s.file(r.Context(), f.ID)
+	writeJSON(w, http.StatusOK, updated)
+}
+
 func (s *Server) patchFile(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if id == RootID {
@@ -470,11 +626,17 @@ func responseMime(f File) string {
 		return f.MimeType
 	}
 	switch strings.ToLower(filepath.Ext(f.Name)) {
+	case ".md", ".markdown":
+		return "text/markdown; charset=utf-8"
 	case ".yaml", ".yml":
 		return "application/yaml; charset=utf-8"
 	case ".json":
 		return "application/json; charset=utf-8"
-	case ".txt", ".conf", ".ini":
+	case ".toml":
+		return "application/toml; charset=utf-8"
+	case ".csv":
+		return "text/csv; charset=utf-8"
+	case ".txt", ".conf", ".ini", ".log":
 		return "text/plain; charset=utf-8"
 	default:
 		return f.MimeType
