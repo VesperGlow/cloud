@@ -1,6 +1,6 @@
 # Cloud
 
-Cloud 是一个轻量、单用户、自托管的私人 S3 网盘，存储层采用 Seafile 式的**内容寻址块存储**：每个文件被切成固定大小的块，块以 SHA-256 内容寻址存入 S3，同一内容跨文件只存一份；块列表写入 JSON 清单（Seafile "fs object" 的等价物），SQLite 里的文件树只保存指向清单的键。Go 服务处理认证、SQLite 元数据和 S3 控制面；浏览器把块直传 S3，单块文件下载仍走短期 Presigned URL 直连，多块文件由服务端流式拼接（支持 Range）。内置编辑器读写不超过 1 MiB 的文本文件时会经过应用服务，以便校验 UTF-8、大小和并发修改。
+Cloud 是一个轻量、单用户、自托管的私人 S3 网盘，存储层采用 Seafile 式的**内容寻址块存储**：每个文件被切成固定大小的块，块以 SHA-256 内容寻址存入 S3，同一内容跨文件只存一份；块列表写入 JSON 清单（Seafile "fs object" 的等价物），SQLite 里的文件树只保存指向清单的键。Go 服务处理认证、SQLite 元数据和 S3 控制面；浏览器把块直传 S3，单块文件下载仍走短期 Presigned URL 直连，多块文件由服务端流式拼接（支持 Range）。内置**阅读器**：EPUB/TXT 在服务端解析清洗，前端按视口分栏分页，支持目录、滑动翻页、进度与字号/明暗偏好。内置编辑器读写不超过 1 MiB 的文本文件时会经过应用服务，以便校验 UTF-8、大小和并发修改。
 
 它不是 Nextcloud 的替代品：没有多用户协作、WebDAV、Office 套件、同步客户端或企业权限系统。
 
@@ -177,6 +177,11 @@ Bucket 必须保持私有。浏览器访问对象依赖 Presigned URL，而不�
 | `GET` | `/api/files/{id}/download` | 302 到 Presigned 下载 URL |
 | `GET` | `/api/files/{id}/preview` | 302 到图片预览 URL |
 | `GET` / `PUT` | `/api/files/{id}/content` | 读取或保存可编辑文本文件，含 ETag 冲突保护 |
+| `GET` | `/api/files/{id}/book` | 阅读器元数据：格式、标题、封面与目录 |
+| `GET` | `/api/files/{id}/book/content` | EPUB 清洗后的正文 HTML 或 TXT 全文与目录 |
+| `GET` | `/api/files/{id}/book/assets/{n}` | EPUB 内嵌图片 |
+| `GET` | `/api/files/{id}/book/cover` | EPUB 内嵌封面 |
+| `GET` / `PUT` | `/api/files/{id}/book/progress` | 阅读进度（页数与总页数） |
 | `POST` | `/api/documents` | 在指定目录新建 UTF-8 文本文档 |
 | `GET` / `POST` / `DELETE` | `/api/files/{id}/share` | 查询、创建/重置或停止公开分享 |
 | `GET` | `/s/{token}` | 无需登录，通过稳定分享地址读取文件 |
@@ -193,9 +198,17 @@ Bucket 必须保持私有。浏览器访问对象依赖 Presigned URL，而不�
 
 分享 URL 等同于访问凭据，请不要发布到公开仓库、聊天群或日志中。若怀疑泄露，请立即重新生成或停止分享。
 
-## 文档编辑器
+## 内置阅读器
 
-点击 `.md`、`.markdown`、`.txt`、`.yaml`、`.yml`、`.json`、`.toml`、`.ini`、`.conf`、`.log` 或 `.csv` 文件即可打开编辑器；当前目录也可以直接新建文档。Markdown 支持编辑、分栏和安全过滤后的预览，`Ctrl/⌘ + S` 可保存。
+点击 `.epub` 文件（或超过 1 MiB 的 `.txt` 文件）即可在网盘里直接阅读，也可以随时用文件操作区的“阅读”按钮打开；`/read/{file_id}` 深链可直接进入某本书。阅读逻辑整合自 [VesperGlow/reader](https://github.com/VesperGlow/reader)，去掉了它独立的账号/书架/上传，复用本服务的认证、文件树与 S3 块存储：
+
+- **服务端解析**：EPUB 解包、OPF/spine、目录（EPUB3 nav + NCX 回退）、封面与系列元数据抽取全部在 Go 服务端完成；正文按白名单重建 HTML（脚本、事件处理器、`javascript:` 等危险内容按构造不会出现），内嵌图片改写为 `/api/files/{id}/book/assets/{n}` 分发。TXT 自动识别 UTF-8/GBK 编码，并按“第…章”式标题生成目录。
+- **解析缓存**：解析结果按文件的内容哈希（清单键）缓存，最近 3 本 keep-alive；内容寻址保证缓存永不陈旧，同一本书再次打开零解析。
+- **分栏分页**：整本书放进一个 CSS 多栏容器（每栏=一屏），浏览器负责重排，`translateX` 切页；桌面点击左右热区、键盘方向键/PageUp/PageDown/空格翻页，移动端左右滑动跟手翻页（快速轻扫或拖过 1/4 屏判定）。
+- **进度与偏好**：阅读进度按百分比防抖保存（`/api/files/{id}/book/progress`），跨设备重开回到大致位置；字号（14–32px）与明暗主题独立记忆，重排时按页顶文字锚点对位不跳行。
+- 上限：EPUB 128 MiB、TXT 16 MiB；更大的文件请下载后离线阅读。
+
+## 文档编辑器点击 `.md`、`.markdown`、`.txt`、`.yaml`、`.yml`、`.json`、`.toml`、`.ini`、`.conf`、`.log` 或 `.csv` 文件即可打开编辑器；当前目录也可以直接新建文档。Markdown 支持编辑、分栏和安全过滤后的预览，`Ctrl/⌘ + S` 可保存。
 
 编辑器只接受 UTF-8 且不超过 1 MiB 的文件。保存会把新内容切块并写入新的清单对象，再更新 SQLite 中的大小、MIME 与 ETag——ETag 即清单的 SHA-256 内容哈希，天然代表内容版本；若文件已被其他页面修改，旧编辑会收到 `409 Conflict`，不会静默覆盖新内容。旧清单与旧块由垃圾回收器回收。已有公开分享链接无需重建，会读取保存后的最新内容。
 
@@ -265,6 +278,7 @@ docker compose start cloud
 - 登录限速是单实例内存状态；这符合单实例 MVP 的部署模型。
 - 块上传不做跨浏览器断点恢复；取消或过期会清理元数据，孤儿块由回收器回收，网络失败可在当前页面重试。
 - 删除是异步回收：文件删除后其内容对象仍占用空间，直到下一次垃圾回收（宽限期过后）。
+- 阅读器不解析 PDF/MOBI；EPUB 上限 128 MiB、TXT 上限 16 MiB，且解析缓存为单实例内存（最多 3 本）。
 
 ## 测试
 
@@ -276,4 +290,4 @@ go build ./...
 docker build -t cloud:test .
 ```
 
-测试覆盖登录、Session、Session 过期、密码盐、头像生命周期、媒体预览与空间统计、文本编辑、公开分享（单块跳转与多块流式 Range）、同目录名称冲突、root 保护、目录循环、块上传 `pending → ready`、块登记、缺失块修复响应、布局校验、多块下载 Range、去重共享、空文件、垃圾回收与遗留对象迁移。GitHub Actions 会对每次 push / PR 重复执行这些检查。
+测试覆盖登录、Session、Session 过期、密码盐、头像生命周期、媒体预览与空间统计、文本编辑、公开分享（单块跳转与多块流式 Range）、同目录名称冲突、root 保护、目录循环、块上传 `pending → ready`、块登记、缺失块修复响应、布局校验、多块下载 Range、去重共享、空文件、垃圾回收、遗留对象迁移，以及阅读器（EPUB 解包/目录/白名单清洗/图片重写、TXT 编码与章节偏移、进度存取、接口鉴权）。GitHub Actions 会对每次 push / PR 重复执行这些检查。

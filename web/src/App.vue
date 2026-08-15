@@ -2,6 +2,9 @@
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { api } from './api'
+import type { DriveFile } from './api'
+import ReaderView from './Reader.vue'
 
 const ROOT = '00000000-0000-0000-0000-000000000000'
 const FILE_CONCURRENCY = 3
@@ -9,7 +12,6 @@ const BLOCK_PUT_CONCURRENCY = 4
 const BLOCK_REGISTER_BATCH = 1000
 const COMPLETE_RETRIES = 3
 
-interface DriveFile { id:string; parent_id:string|null; name:string; kind:'file'|'directory'; size:number; mime_type?:string; etag?:string; status:'pending'|'ready'|'deleting'|'failed'; created_at:string; updated_at:string }
 interface UploadTask { id:string; file:File; progress:number; status:'queued'|'uploading'|'done'|'failed'|'cancelled'; error:string; cancelled:boolean; uploadId?:string; requests:XMLHttpRequest[] }
 interface FolderOption { id:string; name:string; depth:number }
 interface ShareResponse { active:boolean; url?:string; created_at?:string }
@@ -30,8 +32,9 @@ const dragActive = ref(false)
 const toast = reactive({ text:'', kind:'error' as 'error'|'success' })
 const tasks = reactive<UploadTask[]>([])
 const selected = ref<DriveFile|null>(null)
-type ModalName = 'rename'|'move'|'preview'|'share'|'account'|'editor'
+type ModalName = 'rename'|'move'|'preview'|'share'|'account'|'editor'|'reader'
 const modal = ref<ModalName|null>(null)
+const readerFile = ref<DriveFile|null>(null)
 const renameValue = ref('')
 const folders = ref<FolderOption[]>([])
 const modalBusy = ref(false)
@@ -58,26 +61,24 @@ const galleryIndex = computed(() => selected.value ? galleryItems.value.findInde
 const hasGalleryNavigation = computed(() => galleryIndex.value>=0&&galleryItems.value.length>1)
 const previewDownloadLabel = computed(() => selected.value ? isImage(selected.value)?'下载原图':isVideo(selected.value)?'下载视频':isAudio(selected.value)?'下载音频':'下载文件' : '下载文件')
 
-async function api<T>(path:string, init:RequestInit = {}):Promise<T> {
-  const headers = new Headers(init.headers)
-  if (init.body && !headers.has('Content-Type')) headers.set('Content-Type','application/json')
-  const response = await fetch(path, { ...init, headers, credentials:'same-origin' })
-  if (!response.ok) {
-    let message = `请求失败 (${response.status})`
-    let payload: unknown = null
-    try { payload = await response.json(); message = (payload as {error?:{message?:string}}).error?.message || message } catch { /* ignore */ }
-    const error = new Error(message) as Error & { status?:number; data?:unknown }; error.status=response.status; error.data=payload; throw error
-  }
-  if (response.status === 204) return undefined as T
-  return response.json() as Promise<T>
-}
-
 function notify(text:string, kind:'error'|'success'='error') { toast.text=text;toast.kind=kind;window.clearTimeout(toastTimer);toastTimer=window.setTimeout(()=>toast.text='',3600) }
 
+function isBook(item:DriveFile){return item.kind==='file'&&item.status==='ready'&&/\.(epub|txt)$/i.test(item.name)}
+function openReader(item:DriveFile){readerFile.value=item;openModal('reader')}
 async function checkSession() {
-  try { const me=await api<ProfileResponse>('/api/auth/me');user.value=me.username;hasAvatar.value=me.has_avatar;await openFolder(ROOT) }
+  try { const me=await api<ProfileResponse>('/api/auth/me');user.value=me.username;hasAvatar.value=me.has_avatar;await openFolder(ROOT);openDeepLink() }
   catch { user.value=null;hasAvatar.value=false }
   finally { checking.value=false }
+}
+// 深链 /read/{fileId}：登录后直接打开阅读器。
+async function openDeepLink(){
+  const m=location.pathname.match(/^\/read\/([^/]+)\/?$/)
+  if(!m)return
+  history.replaceState({cloudNav:true},'','/')
+  try{
+    const data=await api<{file:DriveFile}>(`/api/files/${decodeURIComponent(m[1])}`)
+    if(data.file.kind==='file'&&isBook(data.file))openReader(data.file)
+  }catch{/* 文件不存在或不可读：留在首页 */}
 }
 async function submitLogin() {
   login.busy=true;login.error='';login.notice=''
@@ -159,7 +160,7 @@ function isAudio(item:DriveFile){return item.kind==='file'&&item.status==='ready
 function isMedia(item:DriveFile){return isImage(item)||isVideo(item)||isAudio(item)}
 function isEditable(item:DriveFile){return item.kind==='file'&&item.status==='ready'&&item.size<=1024*1024&&/\.(md|markdown|txt|ya?ml|json|toml|ini|conf|log|csv)$/i.test(item.name)}
 function previewURL(item:DriveFile){return `/api/files/${item.id}/preview`}
-function openItem(item:DriveFile){if(item.kind==='directory')openFolder(item.id);else if(isEditable(item))openEditor(item);else if(isMedia(item))showPreview(item)}
+function openItem(item:DriveFile){if(item.kind==='directory')openFolder(item.id);else if(isBook(item)&&(!isEditable(item)||/\.epub$/i.test(item.name)))openReader(item);else if(isEditable(item))openEditor(item);else if(isMedia(item))showPreview(item)}
 function changePreview(direction:-1|1){if(!hasGalleryNavigation.value)return;const next=(galleryIndex.value+direction+galleryItems.value.length)%galleryItems.value.length;selected.value=galleryItems.value[next]}
 function handlePreviewKey(event:KeyboardEvent){if(modal.value!=='preview')return;if(event.key==='ArrowLeft'||event.key==='ArrowRight'){event.preventDefault();changePreview(event.key==='ArrowLeft'?-1:1)}}
 
@@ -374,7 +375,7 @@ onBeforeUnmount(()=>{window.removeEventListener('keydown',handlePreviewKey);wind
       <div v-if="viewMode==='grid'&&selected&&!modal" class="selection-toolbar" role="toolbar" aria-label="所选项目操作">
         <button class="selection-close" title="取消选择" aria-label="取消选择" @click="selected=null">×</button><span class="selection-summary"><b>1 项</b><small>已选择 {{ formatSize(selected.size) }}</small></span>
         <div class="selection-actions">
-          <button v-if="selected.kind==='directory'||isEditable(selected)||isMedia(selected)" @click="openItem(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path v-if="selected.kind==='directory'" d="M3 7h7l2 2h9v9H3z"/><path v-else-if="isEditable(selected)" d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path v-else-if="isImage(selected)" d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><path v-else d="M8 5v14l11-7Z"/></svg><span>{{ selected.kind==='directory'?'打开':isEditable(selected)?'编辑文本':isImage(selected)?'预览':'播放' }}</span></button>
+          <button v-if="selected.kind==='directory'||isEditable(selected)||isMedia(selected)||isBook(selected)" @click="openItem(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path v-if="selected.kind==='directory'" d="M3 7h7l2 2h9v9H3z"/><path v-else-if="isEditable(selected)&&!isBook(selected)" d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path v-else-if="isBook(selected)" d="M12 5c-1.7-1.4-4.2-2-8-2v14c3.8 0 6.3.6 8 2 1.7-1.4 4.2-2 8-2V3c-3.8 0-6.3.6-8 2Zm0 0v14"/><path v-else-if="isImage(selected)" d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><path v-else d="M8 5v14l11-7Z"/></svg><span>{{ selected.kind==='directory'?'打开':isBook(selected)?'阅读':isEditable(selected)?'编辑文本':isImage(selected)?'预览':'播放' }}</span></button>
           <button v-if="selected.kind==='file'" @click="download(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg><span>下载</span></button>
           <button v-if="selected.kind==='file'" @click="showShare(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.6-4.4M8.2 13.2l7.6 4.4"/></svg><span>分享</span></button>
           <button @click="showRename(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 5v14M9 19h6"/></svg><span>重命名</span></button>
@@ -392,6 +393,7 @@ onBeforeUnmount(()=>{window.removeEventListener('keydown',handlePreviewKey);wind
           <div class="row-actions">
             <button v-if="isEditable(item)" title="编辑" aria-label="编辑" @click="openEditor(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path d="m13.8 6.2 3.2 3.2"/></svg></button>
             <button v-if="isMedia(item)" :title="isImage(item)?'预览':'播放'" :aria-label="isImage(item)?'预览':'播放'" @click="showPreview(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><template v-if="isImage(item)"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.6"/></template><path v-else d="M8 5v14l11-7Z"/></svg></button>
+            <button v-if="isBook(item)" title="阅读" aria-label="阅读" @click="openReader(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5c-1.7-1.4-4.2-2-8-2v14c3.8 0 6.3.6 8 2 1.7-1.4 4.2-2 8-2V3c-3.8 0-6.3.6-8 2Zm0 0v14"/></svg></button>
             <button v-if="item.kind==='file'" title="下载" aria-label="下载" @click="download(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg></button>
             <button v-if="item.kind==='file'" title="分享" aria-label="分享" @click="showShare(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.6-4.4M8.2 13.2l7.6 4.4"/></svg></button>
             <button title="重命名" aria-label="重命名" @click="showRename(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 5v14M9 19h6"/></svg></button>
@@ -412,7 +414,8 @@ onBeforeUnmount(()=>{window.removeEventListener('keydown',handlePreviewKey);wind
     <div v-if="dragActive" class="drop-zone"><div><span>↓</span><h2>释放以上传到 {{ current?.name || '我的文件' }}</h2><p>文件将按内容块直传 S3，重复内容自动去重</p></div></div>
     <section v-if="tasks.length" class="upload-panel"><header><div><strong>上传</strong><span v-if="unfinished.length">{{ unfinished.length }} 项进行中</span></div><button @click="clearFinished">清除已完成</button></header><div class="task-list"><article v-for="task in tasks" :key="task.id"><div class="task-top"><span class="task-icon">↑</span><div><strong>{{ task.file.name }}</strong><small>{{ formatSize(task.file.size) }} · {{ task.status==='queued'?'等待中':task.status==='uploading'?'正在上传':task.status==='done'?'已完成':task.status==='cancelled'?'已取消':task.error }}</small></div><b>{{ task.progress }}%</b><button v-if="task.status==='queued'||task.status==='uploading'" @click="cancelUpload(task)">×</button><button v-else-if="task.status==='failed'" @click="retry(task)">重试</button></div><div class="progress"><i :class="task.status" :style="{width:`${task.progress}%`}"></i></div></article></div></section>
 
-    <div v-if="modal" class="modal-backdrop" :class="{previewing:modal==='preview',editing:modal==='editor'}" @click.self="closeBackdrop">
+    <div v-if="modal" class="modal-backdrop" :class="{previewing:modal==='preview',editing:modal==='editor',reading:modal==='reader'}" @click.self="closeBackdrop">
+      <ReaderView v-if="modal==='reader'&&readerFile" :file="readerFile" @close="closeModal" />
       <section v-if="modal==='rename'" class="modal"><header><div><p class="eyebrow dark">EDIT</p><h2>重命名</h2></div><button @click="closeModal">×</button></header><label>新名称<input v-model="renameValue" maxlength="1024" @keyup.enter="saveRename"></label><footer><button class="secondary" @click="closeModal">取消</button><button class="primary" :disabled="modalBusy" @click="saveRename">保存</button></footer></section>
       <section v-else-if="modal==='move'" class="modal folder-modal"><header><div><p class="eyebrow dark">MOVE</p><h2>移动「{{ selected?.name }}」</h2></div><button @click="closeModal">×</button></header><div v-if="modalBusy" class="state small"><div class="spinner"></div></div><div v-else class="folder-list"><button v-for="folder in folders" :key="folder.id" :style="{paddingLeft:`${18+folder.depth*22}px`}" @click="moveTo(folder.id)"><span>▰</span>{{ folder.name }}</button></div></section>
       <section v-else-if="modal==='account'" class="modal account-modal"><header><div><p class="eyebrow dark">PROFILE & SECURITY</p><h2>账户设置</h2></div><button @click="closeModal">×</button></header><div class="account-layout"><section class="avatar-settings"><div class="avatar-large"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像"><span v-else>{{ user.slice(0,1).toUpperCase() }}</span></div><h3>个人头像</h3><p>支持 JPG、PNG、GIF 和 WebP，最大 2 MiB。</p><div class="avatar-actions"><button type="button" class="secondary" :disabled="avatar.busy" @click="chooseAvatar">{{ avatar.busy?'处理中…':hasAvatar?'更换头像':'上传头像' }}</button><button v-if="hasAvatar" type="button" class="danger-text" :disabled="avatar.busy" @click="removeAvatar">移除</button></div><input ref="avatarInput" hidden type="file" accept="image/jpeg,image/png,image/gif,image/webp" @change="e=>{const el=e.target as HTMLInputElement;if(el.files?.[0])uploadAvatar(el.files[0]);el.value=''}"><p v-if="avatar.error" class="form-error">{{ avatar.error }}</p></section><form @submit.prevent="saveAccount"><div><h3>登录凭据</h3><p class="modal-hint">修改后会退出所有已登录设备，请使用新凭据重新登录。</p></div><label>管理员用户名<input v-model="account.username" autocomplete="username" maxlength="128" required></label><label>当前密码<input v-model="account.currentPassword" type="password" autocomplete="current-password" maxlength="1024" required></label><div class="account-passwords"><label>新密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><label>确认新密码<input v-model="account.confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label></div><p v-if="account.error" class="form-error">{{ account.error }}</p><footer><button type="button" class="secondary" @click="closeModal">取消</button><button class="primary" :disabled="modalBusy">{{ modalBusy?'正在保存…':'更新并退出' }}</button></footer></form></div></section>

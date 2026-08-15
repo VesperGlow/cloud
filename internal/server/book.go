@@ -1,0 +1,220 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/VesperGlow/cloud/internal/reader"
+	"github.com/VesperGlow/cloud/internal/storage"
+	"github.com/go-chi/chi/v5"
+)
+
+// 内置阅读器：EPUB/TXT 在服务端解析（按内容哈希缓存），前端负责分栏分页。
+
+func isReadableFile(f File) bool {
+	switch strings.ToLower(filepath.Ext(f.Name)) {
+	case ".epub", ".txt":
+		return true
+	}
+	return false
+}
+
+func (s *Server) readerFile(w http.ResponseWriter, r *http.Request) (File, bool) {
+	f, err := s.file(r.Context(), chi.URLParam(r, "id"))
+	if err != nil || f.Kind != "file" || f.Status != "ready" {
+		problem(w, http.StatusNotFound, "ready file not found")
+		return File{}, false
+	}
+	if !isReadableFile(f) {
+		problem(w, http.StatusUnsupportedMediaType, "只支持阅读 EPUB 和 TXT 文件")
+		return File{}, false
+	}
+	if f.Size > reader.MaxEPUB {
+		problem(w, http.StatusRequestEntityTooLarge, "文件太大，请下载后离线阅读")
+		return File{}, false
+	}
+	return f, true
+}
+
+func (s *Server) loadBook(ctx context.Context, f File) (*reader.Book, error) {
+	if b := reader.DefaultCache.Get(f.objectKey); b != nil {
+		return b, nil
+	}
+	rc, err := s.openBookSource(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	book, err := reader.Parse(f.Name, rc, f.Size, fmt.Sprintf("/api/files/%s/book/assets", f.ID))
+	if err != nil {
+		return nil, err
+	}
+	reader.DefaultCache.Put(f.objectKey, book)
+	return book, nil
+}
+
+func (s *Server) bookInfo(w http.ResponseWriter, r *http.Request) {
+	f, ok := s.readerFile(w, r)
+	if !ok {
+		return
+	}
+	book, err := s.loadBook(r.Context(), f)
+	if err != nil {
+		problem(w, http.StatusUnprocessableEntity, "无法解析这本书："+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"format": book.Format,
+		"title":  book.Title,
+		"name":   f.Name,
+		"cover":  len(book.Cover) > 0,
+		"toc":    book.TOC,
+	})
+}
+
+func (s *Server) bookContent(w http.ResponseWriter, r *http.Request) {
+	f, ok := s.readerFile(w, r)
+	if !ok {
+		return
+	}
+	book, err := s.loadBook(r.Context(), f)
+	if err != nil {
+		problem(w, http.StatusUnprocessableEntity, "无法解析这本书："+err.Error())
+		return
+	}
+	if book.Format == "epub" {
+		writeJSON(w, http.StatusOK, map[string]any{"kind": "epub", "html": book.HTML, "toc": book.TOC})
+	} else {
+		writeJSON(w, http.StatusOK, map[string]any{"kind": "txt", "text": book.Text, "toc": book.TOC})
+	}
+}
+
+func (s *Server) bookAsset(w http.ResponseWriter, r *http.Request) {
+	f, ok := s.readerFile(w, r)
+	if !ok {
+		return
+	}
+	book, err := s.loadBook(r.Context(), f)
+	if err != nil {
+		problem(w, http.StatusUnprocessableEntity, "无法解析这本书："+err.Error())
+		return
+	}
+	idx, err := strconv.Atoi(chi.URLParam(r, "index"))
+	if err != nil || idx < 0 || idx >= len(book.Assets) {
+		problem(w, http.StatusNotFound, "asset not found")
+		return
+	}
+	asset := book.Assets[idx]
+	w.Header().Set("Content-Type", asset.ContentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(asset.Data)))
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(asset.Data)
+}
+
+func (s *Server) bookCover(w http.ResponseWriter, r *http.Request) {
+	f, ok := s.readerFile(w, r)
+	if !ok {
+		return
+	}
+	book, err := s.loadBook(r.Context(), f)
+	if err != nil {
+		problem(w, http.StatusUnprocessableEntity, "无法解析这本书："+err.Error())
+		return
+	}
+	if len(book.Cover) == 0 {
+		problem(w, http.StatusNotFound, "这本书没有内嵌封面")
+		return
+	}
+	w.Header().Set("Content-Type", reader.AssetContentType(book.CoverExt))
+	w.Header().Set("Content-Length", strconv.Itoa(len(book.Cover)))
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(book.Cover)
+}
+
+type bookProgress struct {
+	Page       int64  `json:"page"`
+	TotalPages *int64 `json:"total_pages"`
+}
+
+func progressKey(fileID string) string { return "book_progress/" + fileID }
+
+func (s *Server) bookProgress(w http.ResponseWriter, r *http.Request) {
+	f, ok := s.readerFile(w, r)
+	if !ok {
+		return
+	}
+	var raw string
+	err := s.db.QueryRowContext(r.Context(), `SELECT value FROM settings WHERE key=?`, progressKey(f.ID)).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeJSON(w, http.StatusOK, map[string]any{"page": 0, "total_pages": nil})
+		return
+	}
+	if err != nil {
+		problem(w, http.StatusInternalServerError, "could not read progress")
+		return
+	}
+	var p bookProgress
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"page": 0, "total_pages": nil})
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func (s *Server) saveBookProgress(w http.ResponseWriter, r *http.Request) {
+	f, ok := s.readerFile(w, r)
+	if !ok {
+		return
+	}
+	var in bookProgress
+	if decodeJSON(w, r, &in) != nil {
+		return
+	}
+	if in.Page < 0 || in.Page > 1<<20 || (in.TotalPages != nil && (*in.TotalPages < 0 || *in.TotalPages > 1<<20)) {
+		problem(w, http.StatusBadRequest, "progress values are invalid")
+		return
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		problem(w, http.StatusBadRequest, "progress values are invalid")
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err = s.db.ExecContext(r.Context(), `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`, progressKey(f.ID), string(raw), now); err != nil {
+		problem(w, http.StatusInternalServerError, "could not save progress")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// openBookSource 兼容升级前的整对象键（启动迁移完成前的小窗口）。
+func (s *Server) openBookSource(ctx context.Context, f File) (io.ReadSeekCloser, error) {
+	rc, err := s.storage.Open(ctx, f.objectKey)
+	if err == nil {
+		return rc, nil
+	}
+	if !storage.IsManifestKey(f.objectKey) {
+		data, rawErr := s.storage.GetObject(ctx, f.objectKey, reader.MaxEPUB)
+		if rawErr != nil {
+			return nil, err
+		}
+		return readSeekNopCloser{Reader: bytes.NewReader(data)}, nil
+	}
+	return nil, err
+}
+
+type readSeekNopCloser struct{ *bytes.Reader }
+
+func (readSeekNopCloser) Close() error { return nil }

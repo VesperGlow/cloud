@@ -1,6 +1,7 @@
 package server
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -876,5 +877,135 @@ func TestBlockLayoutHelpers(t *testing.T) {
 	}
 	if expectedBlockSize(20, 8, 0) != 8 || expectedBlockSize(20, 8, 1) != 8 || expectedBlockSize(20, 8, 2) != 4 {
 		t.Fatal("expectedBlockSize is wrong")
+	}
+}
+
+// ---- 内置阅读器 ----
+
+func fakePNG(w, h int) []byte {
+	data := make([]byte, 33)
+	copy(data, []byte("\x89PNG\r\n\x1a\n"))
+	data[12], data[13], data[14], data[15] = 'I', 'H', 'D', 'R'
+	data[16] = byte(w >> 24)
+	data[17] = byte(w >> 16)
+	data[18] = byte(w >> 8)
+	data[19] = byte(w)
+	data[20] = byte(h >> 24)
+	data[21] = byte(h >> 16)
+	data[22] = byte(h >> 8)
+	data[23] = byte(h)
+	return data
+}
+
+func buildEPUB(t *testing.T) []byte {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	zw := zip.NewWriter(buf)
+	write := func(name, content string) {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(content))
+	}
+	write("mimetype", "application/epub+zip")
+	write("META-INF/container.xml", `<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`)
+	write("OEBPS/content.opf", `<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>测试书</dc:title><meta name="cover" content="cover-img"/></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/><item id="cover-img" href="img/cover.png" media-type="image/png"/><item id="fig" href="img/fig.png" media-type="image/png"/></manifest><spine><itemref idref="ch1"/></spine></package>`)
+	write("OEBPS/nav.xhtml", `<html xmlns="http://www.w3.org/1999/xhtml"><body><nav epub:type="toc"><ol><li><a href="ch1.xhtml#sec1">第一章</a></li></ol></nav></body></html>`)
+	write("OEBPS/ch1.xhtml", `<html xmlns="http://www.w3.org/1999/xhtml"><body><h1 id="sec1">第一章 开始</h1><p>你好世界</p><script>alert(1)</script><p><img src="img/fig.png" alt="插图"/></p></body></html>`)
+	write("OEBPS/img/cover.png", string(fakePNG(300, 400)))
+	write("OEBPS/img/fig.png", string(fakePNG(10, 20)))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestBookEndpointsTXT(t *testing.T) {
+	a := newTestApp(t)
+	content := []byte("第一章 开始\n正文一行\n第二章 继续\n")
+	f := a.readyFile(t, "book.txt", content)
+	info := a.request("GET", "/api/files/"+f.ID+"/book", nil, true)
+	if info.Code != http.StatusOK {
+		t.Fatalf("book info=%d: %s", info.Code, info.Body.String())
+	}
+	meta := decode[struct {
+		Format string `json:"format"`
+		Title  string `json:"title"`
+		Cover  bool   `json:"cover"`
+		TOC    []struct {
+			Label  string `json:"label"`
+			Offset int64  `json:"offset"`
+		} `json:"toc"`
+	}](t, info)
+	if meta.Format != "txt" || meta.Cover || len(meta.TOC) != 2 || meta.TOC[0].Label != "第一章 开始" {
+		t.Fatalf("meta=%+v", meta)
+	}
+	body := a.request("GET", "/api/files/"+f.ID+"/book/content", nil, true)
+	if body.Code != http.StatusOK {
+		t.Fatalf("content=%d: %s", body.Code, body.Body.String())
+	}
+	model := decode[struct {
+		Kind string `json:"kind"`
+		Text string `json:"text"`
+	}](t, body)
+	if model.Kind != "txt" || model.Text != string(content) {
+		t.Fatalf("model=%+v", model)
+	}
+	put := a.request("PUT", "/api/files/"+f.ID+"/book/progress", map[string]any{"page": 3, "total_pages": 10}, true)
+	if put.Code != http.StatusNoContent {
+		t.Fatalf("save progress=%d: %s", put.Code, put.Body.String())
+	}
+	got := a.request("GET", "/api/files/"+f.ID+"/book/progress", nil, true)
+	progress := decode[struct {
+		Page       int64  `json:"page"`
+		TotalPages *int64 `json:"total_pages"`
+	}](t, got)
+	if progress.Page != 3 || progress.TotalPages == nil || *progress.TotalPages != 10 {
+		t.Fatalf("progress=%+v", progress)
+	}
+	pdf := a.readyFile(t, "doc.pdf", []byte("x"))
+	if rr := a.request("GET", "/api/files/"+pdf.ID+"/book", nil, true); rr.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("pdf book=%d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestBookEndpointsEPUB(t *testing.T) {
+	a := newTestApp(t)
+	fixture := buildEPUB(t)
+	f := a.readyFile(t, "book.epub", fixture)
+	info := a.request("GET", "/api/files/"+f.ID+"/book", nil, true)
+	if info.Code != http.StatusOK {
+		t.Fatalf("book info=%d: %s", info.Code, info.Body.String())
+	}
+	meta := decode[struct {
+		Format string `json:"format"`
+		Title  string `json:"title"`
+		Cover  bool   `json:"cover"`
+	}](t, info)
+	if meta.Format != "epub" || meta.Title != "测试书" || !meta.Cover {
+		t.Fatalf("meta=%+v", meta)
+	}
+	body := a.request("GET", "/api/files/"+f.ID+"/book/content", nil, true)
+	if body.Code != http.StatusOK {
+		t.Fatalf("content=%d: %s", body.Code, body.Body.String())
+	}
+	model := decode[struct {
+		Kind string `json:"kind"`
+		HTML string `json:"html"`
+	}](t, body)
+	if model.Kind != "epub" || !strings.Contains(model.HTML, "你好世界") || strings.Contains(model.HTML, "<script") {
+		t.Fatalf("html=%q", model.HTML)
+	}
+	asset := a.request("GET", "/api/files/"+f.ID+"/book/assets/0", nil, true)
+	if asset.Code != http.StatusOK || asset.Header().Get("Content-Type") != "image/png" || asset.Body.Len() != 33 {
+		t.Fatalf("asset=%d type=%q bytes=%d", asset.Code, asset.Header().Get("Content-Type"), asset.Body.Len())
+	}
+	cover := a.request("GET", "/api/files/"+f.ID+"/book/cover", nil, true)
+	if cover.Code != http.StatusOK || cover.Header().Get("Content-Type") != "image/png" || cover.Body.Len() != 33 {
+		t.Fatalf("cover=%d type=%q bytes=%d", cover.Code, cover.Header().Get("Content-Type"), cover.Body.Len())
+	}
+	if missing := a.request("GET", "/api/files/"+f.ID+"/book/assets/9", nil, true); missing.Code != http.StatusNotFound {
+		t.Fatalf("missing asset=%d", missing.Code)
 	}
 }
