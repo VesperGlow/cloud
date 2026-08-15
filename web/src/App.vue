@@ -139,6 +139,33 @@ function previewURL(item:DriveFile){return `/api/files/${item.id}/preview`}
 function openItem(item:DriveFile){if(item.kind==='directory')openFolder(item.id);else if(isEditable(item))openEditor(item);else if(isMedia(item))showPreview(item)}
 function changePreview(direction:-1|1){if(!hasGalleryNavigation.value)return;const next=(galleryIndex.value+direction+galleryItems.value.length)%galleryItems.value.length;selected.value=galleryItems.value[next]}
 function handlePreviewKey(event:KeyboardEvent){if(modal.value!=='preview')return;if(event.key==='ArrowLeft'||event.key==='ArrowRight'){event.preventDefault();changePreview(event.key==='ArrowLeft'?-1:1)}}
+
+// 手机端左右滑动切换上一张/下一张（参考 suzuka 的灯箱手势）：水平位移
+// 超过阈值且横轴占优时切图，跟手拖拽带过渡回弹。
+const swipe=reactive({active:false,pointerId:0,startX:0,startY:0,dx:0,dy:0})
+const stageEl=ref<HTMLElement|null>(null)
+const stageSwipeable=computed(()=>{const item=selected.value;return !!item&&isImage(item)&&hasGalleryNavigation.value})
+const swipeStyle=computed(()=>({
+  transform:`translateX(${swipe.active?swipe.dx:0}px)${swipe.active?' scale(.985)':''}`,
+  transition:swipe.active?'none':'transform .24s cubic-bezier(.22,.8,.3,1)',
+}))
+function onStagePointerDown(e:PointerEvent){
+  if(modal.value!=='preview'||!stageSwipeable.value)return
+  if(e.pointerType==='mouse'&&e.button!==0)return
+  if(swipe.active)return // 多点触控时放弃滑动手势
+  swipe.active=true;swipe.pointerId=e.pointerId;swipe.startX=e.clientX;swipe.startY=e.clientY;swipe.dx=0;swipe.dy=0
+  stageEl.value?.setPointerCapture(e.pointerId)
+}
+function onStagePointerMove(e:PointerEvent){
+  if(!swipe.active||e.pointerId!==swipe.pointerId)return
+  swipe.dx=e.clientX-swipe.startX;swipe.dy=e.clientY-swipe.startY
+}
+function onStagePointerEnd(e:PointerEvent){
+  if(!swipe.active||e.pointerId!==swipe.pointerId)return
+  const dx=swipe.dx,dy=swipe.dy
+  swipe.active=false;swipe.dx=0;swipe.dy=0
+  if(Math.abs(dx)>60&&Math.abs(dx)>Math.abs(dy)*1.25)changePreview(dx<0?1:-1)
+}
 function newDocument(){selected.value=null;editor.isNew=true;editor.fileId='';editor.name='未命名文档.md';editor.originalName=editor.name;editor.content='';editor.original='';editor.etag='';editor.mode='edit';editor.busy=false;editor.error='';modal.value='editor'}
 async function openEditor(item:DriveFile){
   selected.value=item;editor.isNew=false;editor.fileId=item.id;editor.name=item.name;editor.originalName=item.name;editor.content='';editor.original='';editor.etag='';editor.mode='edit';editor.error='';editor.busy=true;modal.value='editor'
@@ -300,17 +327,17 @@ onBeforeUnmount(()=>window.removeEventListener('keydown',handlePreviewKey))
 </script>
 
 <template>
-  <div v-if="checking" class="splash"><div class="brand-mark">C</div><div class="spinner"></div></div>
+  <div v-if="checking" class="splash"><div class="brand-mark"><img src="/logo.png" alt=""></div><div class="spinner"></div></div>
   <main v-else-if="!user" class="login-page">
     <section class="login-visual"><div class="glow glow-a"></div><div class="glow glow-b"></div><div class="visual-copy"><span class="eyebrow">PRIVATE · DIRECT · YOURS</span><h1>你的文件，<br>安静地待在云上。</h1><p>轻量、自托管，文件按内容块直传你的 S3。</p></div><div class="cloud-card"><span>☁</span><div><strong>Seafile 式块存储</strong><small>内容寻址 · 跨文件去重</small></div></div></section>
-    <section class="login-panel"><form class="login-form" @submit.prevent="submitLogin"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div><p class="eyebrow dark">WELCOME BACK</p><h2>登录私人空间</h2><p class="muted">首次启动的随机凭据可在容器日志中查看</p></div><label>用户名<input v-model="login.username" autocomplete="username" maxlength="128" required></label><label>密码<input v-model="login.password" type="password" autocomplete="current-password" maxlength="1024" required></label><p v-if="login.notice" class="form-success">{{ login.notice }}</p><p v-if="login.error" class="form-error">{{ login.error }}</p><button class="primary wide" :disabled="login.busy">{{ login.busy ? '正在验证…' : '进入我的网盘' }}</button></form></section>
+    <section class="login-panel"><form class="login-form" @submit.prevent="submitLogin"><div class="logo"><span class="brand-mark small"><img src="/logo.png" alt=""></span><span>Cloud</span></div><div><p class="eyebrow dark">WELCOME BACK</p><h2>登录私人空间</h2><p class="muted">首次启动的随机凭据可在容器日志中查看</p></div><label>用户名<input v-model="login.username" autocomplete="username" maxlength="128" required></label><label>密码<input v-model="login.password" type="password" autocomplete="current-password" maxlength="1024" required></label><p v-if="login.notice" class="form-success">{{ login.notice }}</p><p v-if="login.error" class="form-error">{{ login.error }}</p><button class="primary wide" :disabled="login.busy">{{ login.busy ? '正在验证…' : '进入我的网盘' }}</button></form></section>
   </main>
 
   <div v-else class="app-shell" @dragover.prevent="dragActive=true" @dragleave.self="dragActive=false" @drop.prevent="onDrop">
-    <header class="topbar"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div class="top-actions"><span class="connection"><i></i>S3 块直传</span><button class="account-button" title="打开账户设置" @click="showAccount"><span class="avatar-badge"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像" @error="hasAvatar=false"><template v-else>{{ user.slice(0,1).toUpperCase() }}</template></span><span class="account-copy"><b>{{ user }}</b><small>账户设置</small></span></button><button class="top-logout" @click="logout">退出</button></div></header>
-    <aside class="sidebar"><button class="nav active"><span>▰</span>我的文件</button><div class="sidebar-note"><span>总空间占用</span><strong>{{ formatSize(storageStats.total_bytes) }}</strong><small>{{ storageStats.file_count }} 个文件</small><p>统计所有已完成文件的逻辑大小；内容以 SHA-256 内容块存储在 S3，重复块全局去重。</p></div></aside>
+    <header class="topbar"><button class="logo brand-button" title="回到我的文件" @click="openFolder(ROOT)"><span class="brand-mark small"><img src="/logo.png" alt=""></span><span>Cloud</span></button><div class="top-actions"><span class="connection"><i></i>S3 块直传</span><button class="account-button" title="打开账户设置" @click="showAccount"><span class="avatar-badge"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像" @error="hasAvatar=false"><template v-else>{{ user.slice(0,1).toUpperCase() }}</template></span><span class="account-copy"><b>{{ user }}</b><small>账户设置</small></span></button><button class="top-logout" @click="logout">退出</button></div></header>
+    <aside class="sidebar"><button class="nav active" title="回到我的文件" @click="openFolder(ROOT)"><span>▰</span>我的文件</button><div class="sidebar-note"><span class="sidebar-label">存储空间</span><div class="storage-total"><strong>{{ formatSize(storageStats.total_bytes) }}</strong><small>逻辑占用</small></div><div class="storage-bar"><i></i></div><div class="storage-meta"><span class="storage-stat"><b>{{ storageStats.file_count }}</b><small>个文件</small></span><span class="storage-stat"><b>去重</b><small>SHA-256 块</small></span></div><p>内容以内容寻址块保存在 S3，重复内容只存一份。</p></div></aside>
     <section class="content" @click="clearSelectionFromBlank">
-      <div class="content-head"><div><nav class="breadcrumbs" aria-label="路径"><button v-for="crumb in breadcrumbs" :key="crumb.id" @click="openFolder(crumb.id)">{{ crumb.name || '我的文件' }}<span>/</span></button></nav><h1>{{ current?.name || '我的文件' }}</h1><p>{{ items.length }} 个项目 · {{ pathTitle }}</p></div><div class="actions"><div class="view-switch" role="group" aria-label="文件显示方式"><button :class="{active:viewMode==='list'}" title="列表视图" aria-label="列表视图" @click="setViewMode('list')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg></button><button :class="{active:viewMode==='grid'}" title="大图标视图" aria-label="大图标视图" @click="setViewMode('grid')"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg></button></div><button class="secondary" @click="newDocument">＋ 新建文档</button><button class="secondary" @click="createFolder">＋ 新建文件夹</button><button class="primary" @click="chooseFiles">↑ 上传文件</button><input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}"></div></div>
+      <div class="content-head"><div><nav class="breadcrumbs" aria-label="路径"><button v-for="crumb in breadcrumbs" :key="crumb.id" @click="openFolder(crumb.id)">{{ crumb.name || '我的文件' }}<span>/</span></button></nav><h1>{{ current?.name || '我的文件' }}</h1><p>{{ items.length }} 个项目 · {{ pathTitle }}</p><div class="mobile-stats"><span>总占用 <b>{{ formatSize(storageStats.total_bytes) }}</b></span><span>{{ storageStats.file_count }} 个文件</span></div></div><div class="actions"><div class="view-switch" role="group" aria-label="文件显示方式"><button :class="{active:viewMode==='list'}" title="列表视图" aria-label="列表视图" @click="setViewMode('list')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg></button><button :class="{active:viewMode==='grid'}" title="大图标视图" aria-label="大图标视图" @click="setViewMode('grid')"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg></button></div><button class="secondary" @click="newDocument">＋ 新建文档</button><button class="secondary" @click="createFolder">＋ 新建文件夹</button><button class="primary" @click="chooseFiles">↑ 上传文件</button><input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}"></div></div>
       <div v-if="viewMode==='grid'&&selected&&!modal" class="selection-toolbar" role="toolbar" aria-label="所选项目操作">
         <button class="selection-close" title="取消选择" aria-label="取消选择" @click="selected=null">×</button><span class="selection-summary"><b>1 项</b><small>已选择 {{ formatSize(selected.size) }}</small></span>
         <div class="selection-actions">
@@ -383,9 +410,9 @@ onBeforeUnmount(()=>window.removeEventListener('keydown',handlePreviewKey))
       </section>
       <section v-else class="preview-modal" @click.self="modal=null">
         <header class="preview-bar"><div><strong>{{ selected?.name }}</strong><small v-if="selected">{{ formatSize(selected.size) }} · {{ selected.mime_type||'媒体文件' }}</small></div><span v-if="galleryIndex>=0" class="preview-count">{{ galleryIndex+1 }} / {{ galleryItems.length }}</span><button aria-label="关闭预览" @click="modal=null">×</button></header>
-        <div class="preview-stage" @click.self="modal=null">
+        <div ref="stageEl" class="preview-stage" :class="{swipeable:stageSwipeable}" @click.self="modal=null" @pointerdown="onStagePointerDown" @pointermove="onStagePointerMove" @pointerup="onStagePointerEnd" @pointercancel="onStagePointerEnd">
           <button v-if="hasGalleryNavigation" class="preview-nav preview-prev" aria-label="上一项" @click.stop="changePreview(-1)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14.5 6-6 6 6 6"/></svg></button>
-          <img v-if="selected&&isImage(selected)" :key="selected.id" :src="previewURL(selected)" :alt="selected.name">
+          <img v-if="selected&&isImage(selected)" :key="selected.id" :src="previewURL(selected)" :alt="selected.name" :style="swipeStyle">
           <video v-else-if="selected&&isVideo(selected)" :key="selected.id" :src="previewURL(selected)" controls autoplay playsinline preload="metadata">你的浏览器不支持这个视频格式。</video>
           <div v-else-if="selected&&isAudio(selected)" class="audio-player-card"><span>♫</span><strong>{{ selected.name }}</strong><small>{{ formatSize(selected.size) }}</small><audio :key="selected.id" :src="previewURL(selected)" controls autoplay preload="metadata">你的浏览器不支持这个音频格式。</audio></div>
           <button v-if="hasGalleryNavigation" class="preview-nav preview-next" aria-label="下一项" @click.stop="changePreview(1)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.5 6 6 6-6 6"/></svg></button>
