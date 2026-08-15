@@ -163,6 +163,12 @@ function closeBackdrop(){if(modal.value==='editor')closeEditor();else modal.valu
 function hideBrokenImage(event:Event){(event.target as HTMLImageElement).hidden=true}
 function setViewMode(mode:'list'|'grid'){viewMode.value=mode;selected.value=null;localStorage.setItem('cloud-view-mode',mode)}
 function toggleSelection(item:DriveFile){selected.value=selected.value?.id===item.id?null:item}
+function clearSelectionFromBlank(event:MouseEvent){
+  if(!selected.value||modal.value)return
+  const target=event.target
+  if(!(target instanceof Element)||target.closest('button,a,input,textarea,select,[role="toolbar"],.file-card,.file-row'))return
+  selected.value=null
+}
 function download(item:DriveFile){window.location.assign(`/api/files/${item.id}/download`)}
 
 function chooseFiles(){fileInput.value?.click()}
@@ -194,7 +200,7 @@ onBeforeUnmount(()=>window.removeEventListener('keydown',handlePreviewKey))
   <div v-else class="app-shell" @dragover.prevent="dragActive=true" @dragleave.self="dragActive=false" @drop.prevent="onDrop">
     <header class="topbar"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div class="top-actions"><span class="connection"><i></i>S3 直连</span><button class="account-button" title="打开账户设置" @click="showAccount"><span class="avatar-badge"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像" @error="hasAvatar=false"><template v-else>{{ user.slice(0,1).toUpperCase() }}</template></span><span class="account-copy"><b>{{ user }}</b><small>账户设置</small></span></button><button class="top-logout" @click="logout">退出</button></div></header>
     <aside class="sidebar"><button class="nav active"><span>▰</span>我的文件</button><div class="sidebar-note"><span>总空间占用</span><strong>{{ formatSize(storageStats.total_bytes) }}</strong><small>{{ storageStats.file_count }} 个文件</small><p>统计所有已完成文件的逻辑大小，内容保存在 S3。</p></div></aside>
-    <section class="content">
+    <section class="content" @click="clearSelectionFromBlank">
       <div class="content-head"><div><nav class="breadcrumbs" aria-label="路径"><button v-for="crumb in breadcrumbs" :key="crumb.id" @click="openFolder(crumb.id)">{{ crumb.name || '我的文件' }}<span>/</span></button></nav><h1>{{ current?.name || '我的文件' }}</h1><p>{{ items.length }} 个项目 · {{ pathTitle }}</p></div><div class="actions"><div class="view-switch" role="group" aria-label="文件显示方式"><button :class="{active:viewMode==='list'}" title="列表视图" aria-label="列表视图" @click="setViewMode('list')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg></button><button :class="{active:viewMode==='grid'}" title="大图标视图" aria-label="大图标视图" @click="setViewMode('grid')"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg></button></div><button class="secondary" @click="newDocument">＋ 新建文档</button><button class="secondary" @click="createFolder">＋ 新建文件夹</button><button class="primary" @click="chooseFiles">↑ 上传文件</button><input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}"></div></div>
       <div v-if="viewMode==='grid'&&selected&&!modal" class="selection-toolbar" role="toolbar" aria-label="所选项目操作">
         <button class="selection-close" title="取消选择" aria-label="取消选择" @click="selected=null">×</button><span class="selection-summary"><b>1 项</b><small>已选择 {{ formatSize(selected.size) }}</small></span>
