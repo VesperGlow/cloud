@@ -1,0 +1,34 @@
+.form-success {
+  margin: -10px 0;
+  color: #15803d;
+  font-size: 13px;
+}
+
+.top-logout {
+  border: 0;
+  background: transparent;
+  color: #64748b;
+  font-size: 12px;
+  padding: 8px;
+}
+
+.top-logout:hover {
+  color: #1d4ed8;
+}
+
+.account-modal form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.account-modal .form-error {
+  margin: 0;
+}
+
+.modal-hint {
+  margin: -8px 0 2px;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.55;
+}

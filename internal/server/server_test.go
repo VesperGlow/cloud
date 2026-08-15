@@ -70,7 +70,7 @@ func newTestApp(t *testing.T) *testApp {
 		t.Fatal(err)
 	}
 	a := &auth.Service{DB: db, Params: auth.Params{Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32}}
-	if err := a.Initialize(context.Background(), "admin", "a-secure-test-password"); err != nil {
+	if _, err := a.Initialize(context.Background(), "admin", "a-secure-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	store := &mockStorage{objects: map[string]storage.ObjectInfo{}}
@@ -83,6 +83,30 @@ func newTestApp(t *testing.T) *testApp {
 	app.cookie = resp.Result().Cookies()[0]
 	t.Cleanup(func() { db.Close() })
 	return app
+}
+
+func TestChangeCredentialsRequiresCurrentPasswordAndRevokesSession(t *testing.T) {
+	a := newTestApp(t)
+	wrong := a.request("PATCH", "/api/auth/credentials", map[string]any{"current_password": "wrong-password", "username": "owner", "password": "a-new-secure-password"}, true)
+	if wrong.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong current password status=%d: %s", wrong.Code, wrong.Body.String())
+	}
+	changed := a.request("PATCH", "/api/auth/credentials", map[string]any{"current_password": "a-secure-test-password", "username": "owner", "password": "a-new-secure-password"}, true)
+	if changed.Code != http.StatusNoContent {
+		t.Fatalf("change status=%d: %s", changed.Code, changed.Body.String())
+	}
+	me := a.request("GET", "/api/auth/me", nil, true)
+	if me.Code != http.StatusUnauthorized {
+		t.Fatalf("old session remains valid: %d", me.Code)
+	}
+	oldLogin := a.request("POST", "/api/auth/login", map[string]any{"username": "admin", "password": "a-secure-test-password"}, false)
+	if oldLogin.Code != http.StatusUnauthorized {
+		t.Fatalf("old login status=%d", oldLogin.Code)
+	}
+	newLogin := a.request("POST", "/api/auth/login", map[string]any{"username": "owner", "password": "a-new-secure-password"}, false)
+	if newLogin.Code != http.StatusOK {
+		t.Fatalf("new login status=%d: %s", newLogin.Code, newLogin.Body.String())
+	}
 }
 func (a *testApp) request(method, path string, body any, authenticated bool) *httptest.ResponseRecorder {
 	a.t.Helper()

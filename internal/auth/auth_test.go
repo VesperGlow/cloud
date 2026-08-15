@@ -17,7 +17,7 @@ func TestLoginSessionAndExpiry(t *testing.T) {
 	}
 	defer db.Close()
 	svc := &Service{DB: db, Params: testParams}
-	if err := svc.Initialize(context.Background(), "admin", "a-secure-test-password"); err != nil {
+	if _, err := svc.Initialize(context.Background(), "admin", "a-secure-test-password"); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := svc.Login(context.Background(), "admin", "wrong-password"); err == nil {
@@ -35,6 +35,85 @@ func TestLoginSessionAndExpiry(t *testing.T) {
 	}
 	if _, err := svc.Authenticate(context.Background(), token); err == nil {
 		t.Fatal("expired session was accepted")
+	}
+}
+
+func TestInitializeGeneratesOneTimeCredentials(t *testing.T) {
+	db, err := database.Open(t.TempDir() + "/cloud.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	svc := &Service{DB: db, Params: testParams}
+	credentials, err := svc.Initialize(context.Background(), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !credentials.Created || !credentials.Generated || credentials.Username != "admin" || len(credentials.Password) < 12 {
+		t.Fatalf("unexpected credentials: created=%v generated=%v username=%q password_length=%d", credentials.Created, credentials.Generated, credentials.Username, len(credentials.Password))
+	}
+	if _, _, err := svc.Login(context.Background(), credentials.Username, credentials.Password); err != nil {
+		t.Fatalf("generated credentials cannot log in: %v", err)
+	}
+	again, err := svc.Initialize(context.Background(), "other", "another-secure-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Created || again.Generated || again.Password != "" {
+		t.Fatalf("credentials were exposed again: %+v", again)
+	}
+}
+
+func TestChangeCredentialsRevokesSessions(t *testing.T) {
+	db, err := database.Open(t.TempDir() + "/cloud.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	svc := &Service{DB: db, Params: testParams}
+	if _, err := svc.Initialize(context.Background(), "admin", "a-secure-test-password"); err != nil {
+		t.Fatal(err)
+	}
+	token, _, err := svc.Login(context.Background(), "admin", "a-secure-test-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ChangeCredentials(context.Background(), "admin", "a-secure-test-password", "owner", "a-new-secure-password"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Authenticate(context.Background(), token); err == nil {
+		t.Fatal("existing session was not revoked")
+	}
+	if _, _, err := svc.Login(context.Background(), "admin", "a-secure-test-password"); err == nil {
+		t.Fatal("old credentials were accepted")
+	}
+	if _, _, err := svc.Login(context.Background(), "owner", "a-new-secure-password"); err != nil {
+		t.Fatalf("new credentials were rejected: %v", err)
+	}
+}
+
+func TestResetCredentialsRecoversExistingDatabase(t *testing.T) {
+	db, err := database.Open(t.TempDir() + "/cloud.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	svc := &Service{DB: db, Params: testParams}
+	if _, err := svc.Initialize(context.Background(), "admin", "a-secure-test-password"); err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := svc.ResetCredentials(context.Background(), "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !credentials.Generated || credentials.Username != "owner" || credentials.Password == "" {
+		t.Fatalf("unexpected reset credentials: generated=%v username=%q password_length=%d", credentials.Generated, credentials.Username, len(credentials.Password))
+	}
+	if _, _, err := svc.Login(context.Background(), "admin", "a-secure-test-password"); err == nil {
+		t.Fatal("old credentials were accepted after reset")
+	}
+	if _, _, err := svc.Login(context.Background(), credentials.Username, credentials.Password); err != nil {
+		t.Fatalf("reset credentials were rejected: %v", err)
 	}
 }
 
