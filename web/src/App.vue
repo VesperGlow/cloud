@@ -30,7 +30,8 @@ const dragActive = ref(false)
 const toast = reactive({ text:'', kind:'error' as 'error'|'success' })
 const tasks = reactive<UploadTask[]>([])
 const selected = ref<DriveFile|null>(null)
-const modal = ref<'rename'|'move'|'preview'|'share'|'account'|'editor'|null>(null)
+type ModalName = 'rename'|'move'|'preview'|'share'|'account'|'editor'
+const modal = ref<ModalName|null>(null)
 const renameValue = ref('')
 const folders = ref<FolderOption[]>([])
 const modalBusy = ref(false)
@@ -85,7 +86,7 @@ async function submitLogin() {
   finally{login.busy=false}
 }
 async function logout(){await api('/api/auth/logout',{method:'POST'});user.value=null;hasAvatar.value=false;items.value=[];tasks.splice(0)}
-function showAccount(){account.username=user.value||'';account.currentPassword='';account.password='';account.confirmPassword='';account.error='';avatar.error='';modal.value='account'}
+function showAccount(){account.username=user.value||'';account.currentPassword='';account.password='';account.confirmPassword='';account.error='';avatar.error='';openModal('account')}
 function chooseAvatar(){avatarInput.value?.click()}
 async function uploadAvatar(file:File){
   avatar.error=''
@@ -112,21 +113,43 @@ async function saveAccount(){
   modalBusy.value=true
   try{
     await api('/api/auth/credentials',{method:'PATCH',body:JSON.stringify({current_password:account.currentPassword,username:account.username,password:account.password})})
-    modal.value=null;login.username=account.username;login.password='';login.notice='账户已更新，请使用新凭据重新登录';user.value=null;items.value=[];tasks.splice(0)
+    closeModal();login.username=account.username;login.password='';login.notice='账户已更新，请使用新凭据重新登录';user.value=null;items.value=[];tasks.splice(0)
   }catch(e){account.error=(e as Error).message}
   finally{modalBusy.value=false}
 }
 
-async function openFolder(id:string){loading.value=true;try{const [meta,list,stats]=await Promise.all([api<{file:DriveFile;breadcrumbs:DriveFile[]}>(`/api/files/${id}`),api<{items:DriveFile[]}>(`/api/files/${id}/children`),api<StorageStats>('/api/storage/stats')]);currentId.value=id;current.value=meta.file;breadcrumbs.value=meta.breadcrumbs;items.value=list.items;storageStats.total_bytes=stats.total_bytes;storageStats.file_count=stats.file_count;selected.value=null}catch(e){notify((e as Error).message)}finally{loading.value=false}}
+async function openFolder(id:string){loading.value=true;try{const [meta,list,stats]=await Promise.all([api<{file:DriveFile;breadcrumbs:DriveFile[]}>(`/api/files/${id}`),api<{items:DriveFile[]}>(`/api/files/${id}/children`),api<StorageStats>('/api/storage/stats')]);if(!suppressHistory&&id!==currentId.value){navActions.value.push({kind:'folder',id:currentId.value});window.history.pushState({cloudNav:true},'')}currentId.value=id;current.value=meta.file;breadcrumbs.value=meta.breadcrumbs;items.value=list.items;storageStats.total_bytes=stats.total_bytes;storageStats.file_count=stats.file_count;selected.value=null}catch(e){notify((e as Error).message)}finally{loading.value=false}}
+
+// 应用内导航历史：每次进入文件夹/打开弹窗都 pushState，系统返回键先关
+// 弹窗、再逐级返回上一屏，而不是直接退出整个应用。
+type NavAction={kind:'folder';id:string}|{kind:'modal-close'}
+const navActions=ref<NavAction[]>([])
+let suppressHistory=false
+let popChain:Promise<void>=Promise.resolve()
+function handlePopState(){
+  const action=navActions.value.pop()
+  if(!action)return
+  if(action.kind==='modal-close'){modal.value=null;return}
+  popChain=popChain.then(async()=>{
+    suppressHistory=true
+    try{await openFolder(action.id)}finally{suppressHistory=false}
+  })
+}
+function openModal(name:ModalName){
+  if(!modal.value){navActions.value.push({kind:'modal-close'});window.history.pushState({cloudNav:true},'')}
+  modal.value=name
+}
+function closeModal(){if(modal.value)window.history.back()}
+function goUp(){const parent=current.value?.parent_id;if(parent)openFolder(parent)}
 async function createFolder(){const name=window.prompt('新文件夹名称');if(!name)return;try{await api('/api/directories',{method:'POST',body:JSON.stringify({parent_id:currentId.value,name})});await openFolder(currentId.value);notify('文件夹已创建','success')}catch(e){notify((e as Error).message)}}
 async function removeItem(item:DriveFile){const text=item.kind==='directory'?'仅空文件夹可删除。确定删除吗？':'确定永久删除这个文件吗？';if(!window.confirm(`${text}\n\n${item.name}`))return;try{await api(`/api/files/${item.id}`,{method:'DELETE'});await openFolder(currentId.value);notify('已删除','success')}catch(e){notify((e as Error).message)}}
-function showRename(item:DriveFile){selected.value=item;renameValue.value=item.name;modal.value='rename'}
-async function saveRename(){if(!selected.value)return;modalBusy.value=true;try{await api(`/api/files/${selected.value.id}`,{method:'PATCH',body:JSON.stringify({name:renameValue.value})});modal.value=null;await openFolder(currentId.value);notify('已重命名','success')}catch(e){notify((e as Error).message)}finally{modalBusy.value=false}}
-async function showMove(item:DriveFile){selected.value=item;modalBusy.value=true;modal.value='move';folders.value=[];try{folders.value=await loadFolderTree()}catch(e){notify((e as Error).message);modal.value=null}finally{modalBusy.value=false}}
+function showRename(item:DriveFile){selected.value=item;renameValue.value=item.name;openModal('rename')}
+async function saveRename(){if(!selected.value)return;modalBusy.value=true;try{await api(`/api/files/${selected.value.id}`,{method:'PATCH',body:JSON.stringify({name:renameValue.value})});closeModal();await openFolder(currentId.value);notify('已重命名','success')}catch(e){notify((e as Error).message)}finally{modalBusy.value=false}}
+async function showMove(item:DriveFile){selected.value=item;modalBusy.value=true;openModal('move');folders.value=[];try{folders.value=await loadFolderTree()}catch(e){notify((e as Error).message);closeModal()}finally{modalBusy.value=false}}
 async function loadFolderTree():Promise<FolderOption[]>{const result:FolderOption[]=[{id:ROOT,name:'我的文件',depth:0}];const queue=[{id:ROOT,depth:0}];while(queue.length){const node=queue.shift()!;const data=await api<{items:DriveFile[]}>(`/api/files/${node.id}/children`);for(const child of data.items.filter(x=>x.kind==='directory'&&x.id!==selected.value?.id)){result.push({id:child.id,name:child.name,depth:node.depth+1});queue.push({id:child.id,depth:node.depth+1})}}return result}
-async function moveTo(parentId:string){if(!selected.value)return;modalBusy.value=true;try{await api(`/api/files/${selected.value.id}`,{method:'PATCH',body:JSON.stringify({parent_id:parentId})});modal.value=null;await openFolder(currentId.value);notify('已移动','success')}catch(e){notify((e as Error).message)}finally{modalBusy.value=false}}
-function showPreview(item:DriveFile){selected.value=item;modal.value='preview'}
-async function showShare(item:DriveFile){selected.value=item;modal.value='share';share.active=false;share.url='';share.createdAt='';share.error='';share.copied=false;share.busy=true;try{const data=await api<ShareResponse>(`/api/files/${item.id}/share`);share.active=data.active;share.url=data.url||'';share.createdAt=data.created_at||''}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
+async function moveTo(parentId:string){if(!selected.value)return;modalBusy.value=true;try{await api(`/api/files/${selected.value.id}`,{method:'PATCH',body:JSON.stringify({parent_id:parentId})});closeModal();await openFolder(currentId.value);notify('已移动','success')}catch(e){notify((e as Error).message)}finally{modalBusy.value=false}}
+function showPreview(item:DriveFile){selected.value=item;openModal('preview')}
+async function showShare(item:DriveFile){selected.value=item;openModal('share');share.active=false;share.url='';share.createdAt='';share.error='';share.copied=false;share.busy=true;try{const data=await api<ShareResponse>(`/api/files/${item.id}/share`);share.active=data.active;share.url=data.url||'';share.createdAt=data.created_at||''}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
 async function createShare(replace=false){if(!selected.value)return;if(replace&&!window.confirm('重新生成后，旧分享链接会立即失效。继续吗？'))return;share.busy=true;share.error='';share.copied=false;try{const data=await api<ShareResponse>(`/api/files/${selected.value.id}/share`,{method:'POST'});share.active=data.active;share.url=data.url||'';share.createdAt=data.created_at||''}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
 async function revokeShare(){if(!selected.value||!window.confirm('停止分享后，现有订阅链接会立即失效。继续吗？'))return;share.busy=true;share.error='';try{await api(`/api/files/${selected.value.id}/share`,{method:'DELETE'});share.active=false;share.url='';share.createdAt='';share.copied=false;notify('分享已停止','success')}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
 async function copyShare(){if(!share.url)return;try{await navigator.clipboard.writeText(share.url);share.copied=true;window.setTimeout(()=>share.copied=false,2200)}catch{share.error='复制失败，请手动选择链接复制'}}
@@ -144,6 +167,7 @@ function handlePreviewKey(event:KeyboardEvent){if(modal.value!=='preview')return
 // 超过阈值且横轴占优时切图，跟手拖拽带过渡回弹。
 const swipe=reactive({active:false,pointerId:0,startX:0,startY:0,dx:0,dy:0})
 const stageEl=ref<HTMLElement|null>(null)
+let swipeStartedOnStage=false
 const stageSwipeable=computed(()=>{const item=selected.value;return !!item&&isImage(item)&&hasGalleryNavigation.value})
 const swipeStyle=computed(()=>({
   transform:`translateX(${swipe.active?swipe.dx:0}px)${swipe.active?' scale(.985)':''}`,
@@ -151,8 +175,11 @@ const swipeStyle=computed(()=>({
 }))
 function onStagePointerDown(e:PointerEvent){
   if(modal.value!=='preview'||!stageSwipeable.value)return
+  // 上/下一张按钮自己处理点击，不要被滑动手势的 pointer capture 劫持
+  if(e.target instanceof Element&&e.target.closest('.preview-nav'))return
   if(e.pointerType==='mouse'&&e.button!==0)return
   if(swipe.active)return // 多点触控时放弃滑动手势
+  swipeStartedOnStage=e.target===stageEl.value
   swipe.active=true;swipe.pointerId=e.pointerId;swipe.startX=e.clientX;swipe.startY=e.clientY;swipe.dx=0;swipe.dy=0
   stageEl.value?.setPointerCapture(e.pointerId)
 }
@@ -166,9 +193,15 @@ function onStagePointerEnd(e:PointerEvent){
   swipe.active=false;swipe.dx=0;swipe.dy=0
   if(Math.abs(dx)>60&&Math.abs(dx)>Math.abs(dy)*1.25)changePreview(dx<0?1:-1)
 }
-function newDocument(){selected.value=null;editor.isNew=true;editor.fileId='';editor.name='未命名文档.md';editor.originalName=editor.name;editor.content='';editor.original='';editor.etag='';editor.mode='edit';editor.busy=false;editor.error='';modal.value='editor'}
+// pointer capture 会把点击事件重定向到舞台：只有按下时确实落在舞台空白处
+// 的点击才关闭预览，点图片或按钮都不会误触发退出。
+function onStageClick(e:MouseEvent){
+  if(swipeStartedOnStage&&e.target===stageEl.value)closeModal()
+  swipeStartedOnStage=false
+}
+function newDocument(){selected.value=null;editor.isNew=true;editor.fileId='';editor.name='未命名文档.md';editor.originalName=editor.name;editor.content='';editor.original='';editor.etag='';editor.mode='edit';editor.busy=false;editor.error='';openModal('editor')}
 async function openEditor(item:DriveFile){
-  selected.value=item;editor.isNew=false;editor.fileId=item.id;editor.name=item.name;editor.originalName=item.name;editor.content='';editor.original='';editor.etag='';editor.mode='edit';editor.error='';editor.busy=true;modal.value='editor'
+  selected.value=item;editor.isNew=false;editor.fileId=item.id;editor.name=item.name;editor.originalName=item.name;editor.content='';editor.original='';editor.etag='';editor.mode='edit';editor.error='';editor.busy=true;openModal('editor')
   try{const data=await api<{content:string;etag:string}>(`/api/files/${item.id}/content`);editor.content=data.content;editor.original=data.content;editor.etag=data.etag||''}
   catch(e){editor.error=(e as Error).message}
   finally{editor.busy=false}
@@ -188,8 +221,8 @@ async function saveDocument(){
   }catch(e){editor.error=(e as Error).message}
   finally{editor.busy=false}
 }
-function closeEditor(){if(editorDirty.value&&!window.confirm('还有未保存的修改，确定关闭吗？'))return;modal.value=null}
-function closeBackdrop(){if(modal.value==='editor')closeEditor();else modal.value=null}
+function closeEditor(){if(editorDirty.value&&!window.confirm('还有未保存的修改，确定关闭吗？'))return;closeModal()}
+function closeBackdrop(){if(modal.value==='editor')closeEditor();else closeModal()}
 function hideBrokenImage(event:Event){(event.target as HTMLImageElement).hidden=true}
 function setViewMode(mode:'list'|'grid'){viewMode.value=mode;selected.value=null;localStorage.setItem('cloud-view-mode',mode)}
 function toggleSelection(item:DriveFile){selected.value=selected.value?.id===item.id?null:item}
@@ -322,8 +355,8 @@ function clearFinished(){for(let i=tasks.length-1;i>=0;i--)if(['done','cancelled
 function formatSize(bytes:number){if(bytes===0)return'0 B';const units=['B','KB','MB','GB','TB'];const i=Math.min(Math.floor(Math.log(bytes)/Math.log(1024)),4);return`${(bytes/1024**i).toFixed(i?1:0)} ${units[i]}`}
 function formatDate(value:string){const d=new Date(value);return Number.isNaN(d.valueOf())?'—':new Intl.DateTimeFormat('zh-CN',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}).format(d)}
 
-onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='list'||saved==='grid')viewMode.value=saved;window.addEventListener('keydown',handlePreviewKey);checkSession()})
-onBeforeUnmount(()=>window.removeEventListener('keydown',handlePreviewKey))
+onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='list'||saved==='grid')viewMode.value=saved;window.addEventListener('keydown',handlePreviewKey);window.addEventListener('popstate',handlePopState);checkSession()})
+onBeforeUnmount(()=>{window.removeEventListener('keydown',handlePreviewKey);window.removeEventListener('popstate',handlePopState)})
 </script>
 
 <template>
@@ -337,7 +370,7 @@ onBeforeUnmount(()=>window.removeEventListener('keydown',handlePreviewKey))
     <header class="topbar"><button class="logo brand-button" title="回到我的文件" @click="openFolder(ROOT)"><span class="brand-mark small"><img src="/logo.png" alt=""></span><span>Cloud</span></button><div class="top-actions"><span class="connection"><i></i>S3 块直传</span><button class="account-button" title="打开账户设置" @click="showAccount"><span class="avatar-badge"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像" @error="hasAvatar=false"><template v-else>{{ user.slice(0,1).toUpperCase() }}</template></span><span class="account-copy"><b>{{ user }}</b><small>账户设置</small></span></button><button class="top-logout" @click="logout">退出</button></div></header>
     <aside class="sidebar"><button class="nav active" title="回到我的文件" @click="openFolder(ROOT)"><span>▰</span>我的文件</button><div class="sidebar-note"><span class="sidebar-label">存储空间</span><div class="storage-total"><strong>{{ formatSize(storageStats.total_bytes) }}</strong><small>逻辑占用</small></div><div class="storage-bar"><i></i></div><div class="storage-meta"><span class="storage-stat"><b>{{ storageStats.file_count }}</b><small>个文件</small></span><span class="storage-stat"><b>去重</b><small>SHA-256 块</small></span></div><p>内容以内容寻址块保存在 S3，重复内容只存一份。</p></div></aside>
     <section class="content" @click="clearSelectionFromBlank">
-      <div class="content-head"><div><nav class="breadcrumbs" aria-label="路径"><button v-for="crumb in breadcrumbs" :key="crumb.id" @click="openFolder(crumb.id)">{{ crumb.name || '我的文件' }}<span>/</span></button></nav><h1>{{ current?.name || '我的文件' }}</h1><p>{{ items.length }} 个项目 · {{ pathTitle }}</p><div class="mobile-stats"><span>总占用 <b>{{ formatSize(storageStats.total_bytes) }}</b></span><span>{{ storageStats.file_count }} 个文件</span></div></div><div class="actions"><div class="view-switch" role="group" aria-label="文件显示方式"><button :class="{active:viewMode==='list'}" title="列表视图" aria-label="列表视图" @click="setViewMode('list')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg></button><button :class="{active:viewMode==='grid'}" title="大图标视图" aria-label="大图标视图" @click="setViewMode('grid')"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg></button></div><button class="secondary" @click="newDocument">＋ 新建文档</button><button class="secondary" @click="createFolder">＋ 新建文件夹</button><button class="primary" @click="chooseFiles">↑ 上传文件</button><input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}"></div></div>
+      <div class="content-head"><div><nav class="breadcrumbs" aria-label="路径"><button v-for="crumb in breadcrumbs" :key="crumb.id" @click="openFolder(crumb.id)">{{ crumb.name || '我的文件' }}<span>/</span></button></nav><div class="title-row"><h1>{{ current?.name || '我的文件' }}</h1><button v-if="currentId!==ROOT&&current?.parent_id" class="up-button" title="返回上一级" aria-label="返回上一级" @click="goUp"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V6m0 0-5 5m5-5 5 5"/></svg></button></div><p>{{ items.length }} 个项目 · {{ pathTitle }}</p><div class="mobile-stats"><span>总占用 <b>{{ formatSize(storageStats.total_bytes) }}</b></span><span>{{ storageStats.file_count }} 个文件</span></div></div><div class="actions"><div class="view-switch" role="group" aria-label="文件显示方式"><button :class="{active:viewMode==='list'}" title="列表视图" aria-label="列表视图" @click="setViewMode('list')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg></button><button :class="{active:viewMode==='grid'}" title="大图标视图" aria-label="大图标视图" @click="setViewMode('grid')"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg></button></div><button class="secondary" @click="newDocument">＋ 新建文档</button><button class="secondary" @click="createFolder">＋ 新建文件夹</button><button class="primary" @click="chooseFiles">↑ 上传文件</button><input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}"></div></div>
       <div v-if="viewMode==='grid'&&selected&&!modal" class="selection-toolbar" role="toolbar" aria-label="所选项目操作">
         <button class="selection-close" title="取消选择" aria-label="取消选择" @click="selected=null">×</button><span class="selection-summary"><b>1 项</b><small>已选择 {{ formatSize(selected.size) }}</small></span>
         <div class="selection-actions">
@@ -380,9 +413,9 @@ onBeforeUnmount(()=>window.removeEventListener('keydown',handlePreviewKey))
     <section v-if="tasks.length" class="upload-panel"><header><div><strong>上传</strong><span v-if="unfinished.length">{{ unfinished.length }} 项进行中</span></div><button @click="clearFinished">清除已完成</button></header><div class="task-list"><article v-for="task in tasks" :key="task.id"><div class="task-top"><span class="task-icon">↑</span><div><strong>{{ task.file.name }}</strong><small>{{ formatSize(task.file.size) }} · {{ task.status==='queued'?'等待中':task.status==='uploading'?'正在上传':task.status==='done'?'已完成':task.status==='cancelled'?'已取消':task.error }}</small></div><b>{{ task.progress }}%</b><button v-if="task.status==='queued'||task.status==='uploading'" @click="cancelUpload(task)">×</button><button v-else-if="task.status==='failed'" @click="retry(task)">重试</button></div><div class="progress"><i :class="task.status" :style="{width:`${task.progress}%`}"></i></div></article></div></section>
 
     <div v-if="modal" class="modal-backdrop" :class="{previewing:modal==='preview',editing:modal==='editor'}" @click.self="closeBackdrop">
-      <section v-if="modal==='rename'" class="modal"><header><div><p class="eyebrow dark">EDIT</p><h2>重命名</h2></div><button @click="modal=null">×</button></header><label>新名称<input v-model="renameValue" maxlength="1024" @keyup.enter="saveRename"></label><footer><button class="secondary" @click="modal=null">取消</button><button class="primary" :disabled="modalBusy" @click="saveRename">保存</button></footer></section>
-      <section v-else-if="modal==='move'" class="modal folder-modal"><header><div><p class="eyebrow dark">MOVE</p><h2>移动「{{ selected?.name }}」</h2></div><button @click="modal=null">×</button></header><div v-if="modalBusy" class="state small"><div class="spinner"></div></div><div v-else class="folder-list"><button v-for="folder in folders" :key="folder.id" :style="{paddingLeft:`${18+folder.depth*22}px`}" @click="moveTo(folder.id)"><span>▰</span>{{ folder.name }}</button></div></section>
-      <section v-else-if="modal==='account'" class="modal account-modal"><header><div><p class="eyebrow dark">PROFILE & SECURITY</p><h2>账户设置</h2></div><button @click="modal=null">×</button></header><div class="account-layout"><section class="avatar-settings"><div class="avatar-large"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像"><span v-else>{{ user.slice(0,1).toUpperCase() }}</span></div><h3>个人头像</h3><p>支持 JPG、PNG、GIF 和 WebP，最大 2 MiB。</p><div class="avatar-actions"><button type="button" class="secondary" :disabled="avatar.busy" @click="chooseAvatar">{{ avatar.busy?'处理中…':hasAvatar?'更换头像':'上传头像' }}</button><button v-if="hasAvatar" type="button" class="danger-text" :disabled="avatar.busy" @click="removeAvatar">移除</button></div><input ref="avatarInput" hidden type="file" accept="image/jpeg,image/png,image/gif,image/webp" @change="e=>{const el=e.target as HTMLInputElement;if(el.files?.[0])uploadAvatar(el.files[0]);el.value=''}"><p v-if="avatar.error" class="form-error">{{ avatar.error }}</p></section><form @submit.prevent="saveAccount"><div><h3>登录凭据</h3><p class="modal-hint">修改后会退出所有已登录设备，请使用新凭据重新登录。</p></div><label>管理员用户名<input v-model="account.username" autocomplete="username" maxlength="128" required></label><label>当前密码<input v-model="account.currentPassword" type="password" autocomplete="current-password" maxlength="1024" required></label><div class="account-passwords"><label>新密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><label>确认新密码<input v-model="account.confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label></div><p v-if="account.error" class="form-error">{{ account.error }}</p><footer><button type="button" class="secondary" @click="modal=null">取消</button><button class="primary" :disabled="modalBusy">{{ modalBusy?'正在保存…':'更新并退出' }}</button></footer></form></div></section>
+      <section v-if="modal==='rename'" class="modal"><header><div><p class="eyebrow dark">EDIT</p><h2>重命名</h2></div><button @click="closeModal">×</button></header><label>新名称<input v-model="renameValue" maxlength="1024" @keyup.enter="saveRename"></label><footer><button class="secondary" @click="closeModal">取消</button><button class="primary" :disabled="modalBusy" @click="saveRename">保存</button></footer></section>
+      <section v-else-if="modal==='move'" class="modal folder-modal"><header><div><p class="eyebrow dark">MOVE</p><h2>移动「{{ selected?.name }}」</h2></div><button @click="closeModal">×</button></header><div v-if="modalBusy" class="state small"><div class="spinner"></div></div><div v-else class="folder-list"><button v-for="folder in folders" :key="folder.id" :style="{paddingLeft:`${18+folder.depth*22}px`}" @click="moveTo(folder.id)"><span>▰</span>{{ folder.name }}</button></div></section>
+      <section v-else-if="modal==='account'" class="modal account-modal"><header><div><p class="eyebrow dark">PROFILE & SECURITY</p><h2>账户设置</h2></div><button @click="closeModal">×</button></header><div class="account-layout"><section class="avatar-settings"><div class="avatar-large"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像"><span v-else>{{ user.slice(0,1).toUpperCase() }}</span></div><h3>个人头像</h3><p>支持 JPG、PNG、GIF 和 WebP，最大 2 MiB。</p><div class="avatar-actions"><button type="button" class="secondary" :disabled="avatar.busy" @click="chooseAvatar">{{ avatar.busy?'处理中…':hasAvatar?'更换头像':'上传头像' }}</button><button v-if="hasAvatar" type="button" class="danger-text" :disabled="avatar.busy" @click="removeAvatar">移除</button></div><input ref="avatarInput" hidden type="file" accept="image/jpeg,image/png,image/gif,image/webp" @change="e=>{const el=e.target as HTMLInputElement;if(el.files?.[0])uploadAvatar(el.files[0]);el.value=''}"><p v-if="avatar.error" class="form-error">{{ avatar.error }}</p></section><form @submit.prevent="saveAccount"><div><h3>登录凭据</h3><p class="modal-hint">修改后会退出所有已登录设备，请使用新凭据重新登录。</p></div><label>管理员用户名<input v-model="account.username" autocomplete="username" maxlength="128" required></label><label>当前密码<input v-model="account.currentPassword" type="password" autocomplete="current-password" maxlength="1024" required></label><div class="account-passwords"><label>新密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><label>确认新密码<input v-model="account.confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label></div><p v-if="account.error" class="form-error">{{ account.error }}</p><footer><button type="button" class="secondary" @click="closeModal">取消</button><button class="primary" :disabled="modalBusy">{{ modalBusy?'正在保存…':'更新并退出' }}</button></footer></form></div></section>
       <section v-else-if="modal==='editor'" class="document-editor">
         <header class="editor-header">
           <div class="editor-title"><span>▤</span><div><input v-if="editor.isNew" v-model="editor.name" aria-label="文档文件名" maxlength="1024"><strong v-else :title="editor.name">{{ editor.name }}</strong><small>{{ editor.isNew?'保存在当前文件夹':'文本编辑器' }}</small></div></div>
@@ -397,7 +430,7 @@ onBeforeUnmount(()=>window.removeEventListener('keydown',handlePreviewKey))
         <footer class="editor-status"><span>{{ editorBytes.toLocaleString() }} 字节 · UTF-8 · 最大 1 MiB</span><span v-if="editor.error" class="form-error">{{ editor.error }}</span><span v-else>Ctrl / ⌘ + S 保存</span></footer>
       </section>
       <section v-else-if="modal==='share'" class="modal share-modal">
-        <header><div class="share-title"><span>↗</span><div><h2>分享文件</h2><p :title="selected?.name">{{ selected?.name }}</p></div></div><button @click="modal=null">×</button></header>
+        <header><div class="share-title"><span>↗</span><div><h2>分享文件</h2><p :title="selected?.name">{{ selected?.name }}</p></div></div><button @click="closeModal">×</button></header>
         <div v-if="share.busy" class="state small"><div class="spinner"></div><p>正在准备分享…</p></div>
         <template v-else-if="share.active">
           <p class="share-description">任何拿到链接的人都能直接读取该文件。重新生成或停止分享后，旧链接立即失效。</p>
@@ -408,9 +441,9 @@ onBeforeUnmount(()=>window.removeEventListener('keydown',handlePreviewKey))
         </template>
         <template v-else><p class="share-description">创建后，无需登录即可通过链接读取这个文件。你可以随时重新生成或停止分享。</p><button class="primary share-create" :disabled="share.busy" @click="createShare(false)">创建公开链接</button><p v-if="share.error" class="form-error">{{ share.error }}</p></template>
       </section>
-      <section v-else class="preview-modal" @click.self="modal=null">
-        <header class="preview-bar"><div><strong>{{ selected?.name }}</strong><small v-if="selected">{{ formatSize(selected.size) }} · {{ selected.mime_type||'媒体文件' }}</small></div><span v-if="galleryIndex>=0" class="preview-count">{{ galleryIndex+1 }} / {{ galleryItems.length }}</span><button aria-label="关闭预览" @click="modal=null">×</button></header>
-        <div ref="stageEl" class="preview-stage" :class="{swipeable:stageSwipeable}" @click.self="modal=null" @pointerdown="onStagePointerDown" @pointermove="onStagePointerMove" @pointerup="onStagePointerEnd" @pointercancel="onStagePointerEnd">
+      <section v-else class="preview-modal" @click.self="closeModal">
+        <header class="preview-bar"><div><strong>{{ selected?.name }}</strong><small v-if="selected">{{ formatSize(selected.size) }} · {{ selected.mime_type||'媒体文件' }}</small></div><span v-if="galleryIndex>=0" class="preview-count">{{ galleryIndex+1 }} / {{ galleryItems.length }}</span><button aria-label="关闭预览" @click="closeModal">×</button></header>
+        <div ref="stageEl" class="preview-stage" :class="{swipeable:stageSwipeable}" @click="onStageClick" @pointerdown="onStagePointerDown" @pointermove="onStagePointerMove" @pointerup="onStagePointerEnd" @pointercancel="onStagePointerEnd">
           <button v-if="hasGalleryNavigation" class="preview-nav preview-prev" aria-label="上一项" @click.stop="changePreview(-1)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14.5 6-6 6 6 6"/></svg></button>
           <img v-if="selected&&isImage(selected)" :key="selected.id" :src="previewURL(selected)" :alt="selected.name" :style="swipeStyle">
           <video v-else-if="selected&&isVideo(selected)" :key="selected.id" :src="previewURL(selected)" controls autoplay playsinline preload="metadata">你的浏览器不支持这个视频格式。</video>
