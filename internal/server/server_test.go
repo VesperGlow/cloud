@@ -127,6 +127,34 @@ func TestChangeCredentialsRequiresCurrentPasswordAndRevokesSession(t *testing.T)
 		t.Fatalf("new login status=%d: %s", newLogin.Code, newLogin.Body.String())
 	}
 }
+
+func TestAvatarCanBeUploadedReadAndRemoved(t *testing.T) {
+	a := newTestApp(t)
+	const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+	uploaded := a.request("PUT", "/api/profile/avatar", map[string]any{"data_url": "data:image/png;base64," + png}, true)
+	if uploaded.Code != http.StatusNoContent {
+		t.Fatalf("upload avatar=%d: %s", uploaded.Code, uploaded.Body.String())
+	}
+	me := a.request("GET", "/api/auth/me", nil, true)
+	profile := decode[struct {
+		HasAvatar bool `json:"has_avatar"`
+	}](t, me)
+	if !profile.HasAvatar {
+		t.Fatal("profile does not report uploaded avatar")
+	}
+	avatar := a.request("GET", "/api/profile/avatar", nil, true)
+	if avatar.Code != http.StatusOK || avatar.Header().Get("Content-Type") != "image/png" || avatar.Body.Len() == 0 {
+		t.Fatalf("get avatar=%d type=%q bytes=%d", avatar.Code, avatar.Header().Get("Content-Type"), avatar.Body.Len())
+	}
+	removed := a.request("DELETE", "/api/profile/avatar", nil, true)
+	if removed.Code != http.StatusNoContent {
+		t.Fatalf("delete avatar=%d: %s", removed.Code, removed.Body.String())
+	}
+	if missing := a.request("GET", "/api/profile/avatar", nil, true); missing.Code != http.StatusNotFound {
+		t.Fatalf("deleted avatar remains available: %d", missing.Code)
+	}
+}
+
 func (a *testApp) request(method, path string, body any, authenticated bool) *httptest.ResponseRecorder {
 	a.t.Helper()
 	var data []byte

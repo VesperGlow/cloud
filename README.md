@@ -109,7 +109,7 @@ docker compose run --rm --no-deps cloud reset-admin
 docker compose start cloud
 ```
 
-可在命令末尾指定新用户名，例如 `cloud reset-admin owner`。恢复密码同样只显示一次，登录后请立即从右上角账户设置中修改。
+可在命令末尾指定新用户名，例如 `cloud reset-admin owner`。恢复密码同样只显示一次，登录后请立即从右上角账户设置中修改。账户设置也支持上传、更换和移除个人头像；头像文件保存在同一个私有 S3 Bucket 中，大小限制为 2 MiB。
 
 ## S3 权限
 
@@ -168,6 +168,7 @@ Bucket 必须保持私有。浏览器访问对象依赖 Presigned URL，而不�
 | `GET` | `/healthz`、`/readyz` | 存活与 SQLite 就绪检查 |
 | `POST` | `/api/auth/login`、`/api/auth/logout` | 登录与注销 |
 | `GET` | `/api/auth/me` | 当前管理员 |
+| `GET` / `PUT` / `DELETE` | `/api/profile/avatar` | 读取、更新或移除个人头像 |
 | `GET` | `/api/files/{id}` | 文件/目录与面包屑 |
 | `GET` | `/api/files/{id}/children` | 目录内容 |
 | `POST` | `/api/directories` | 新建目录 |
@@ -210,7 +211,7 @@ Bucket 必须保持私有。浏览器访问对象依赖 Presigned URL，而不�
 - `uploads`：Single/Multipart 控制状态、预期大小、S3 Upload ID 和过期时间。
 - `shares`：文件与高熵公开 token 的一对一映射。
 - `sessions`：只保存 Session Token 的 SHA-256 hash，不保存明文 Token。
-- `settings`：管理员用户名和 Argon2id 密码 hash。
+- `settings`：管理员用户名、Argon2id 密码 hash 和头像媒体类型；头像内容保存在 S3。
 
 SQLite 开启 `foreign_keys`、`busy_timeout` 与 WAL。文件名唯一性由数据库索引保证；目录移动通过 recursive CTE 阻止自环和移动到子孙目录。
 
@@ -242,7 +243,7 @@ docker compose start cloud
 
 ## 当前限制
 
-- 单用户；不提供注册、共享、WebDAV、OIDC、同步客户端或在线编辑。
+- 单用户；不提供注册、WebDAV、OIDC、同步客户端或 Office 文档协作编辑。
 - 目录必须为空才能删除，避免递归 S3 删除产生部分成功的数据不一致。
 - 图片只支持 JPEG、PNG、WebP 和 GIF 原图预览；没有缩略图、转码、OCR 或 EXIF 索引。
 - 登录限速是单实例内存状态；这符合单实例 MVP 的部署模型。
@@ -258,4 +259,4 @@ go build ./...
 docker build -t cloud:test .
 ```
 
-测试覆盖登录、Session、Session 过期、密码盐、同目录名称冲突、root 保护、目录循环、上传 `pending → ready` 和删除失败保留 `deleting` 元数据。GitHub Actions 会对每次 push / PR 重复执行这些检查。
+测试覆盖登录、Session、Session 过期、密码盐、头像生命周期、文本编辑、公开分享、同目录名称冲突、root 保护、目录循环、上传 `pending → ready` 和删除失败保留 `deleting` 元数据。GitHub Actions 会对每次 push / PR 重复执行这些检查。

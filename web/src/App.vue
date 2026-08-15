@@ -11,8 +11,11 @@ interface DriveFile { id:string; parent_id:string|null; name:string; kind:'file'
 interface UploadTask { id:string; file:File; progress:number; status:'queued'|'uploading'|'done'|'failed'|'cancelled'; error:string; cancelled:boolean; uploadId?:string; requests:XMLHttpRequest[] }
 interface FolderOption { id:string; name:string; depth:number }
 interface ShareResponse { active:boolean; url?:string; created_at?:string }
+interface ProfileResponse { username:string; has_avatar:boolean }
 
 const user = ref<string|null>(null)
+const hasAvatar = ref(false)
+const avatarVersion = ref(Date.now())
 const checking = ref(true)
 const login = reactive({ username:'admin', password:'', busy:false, error:'', notice:'' })
 const currentId = ref(ROOT)
@@ -29,9 +32,11 @@ const renameValue = ref('')
 const folders = ref<FolderOption[]>([])
 const modalBusy = ref(false)
 const account = reactive({ username:'', currentPassword:'', password:'', confirmPassword:'', error:'' })
+const avatar = reactive({ busy:false, error:'' })
 const share = reactive({ active:false, url:'', createdAt:'', busy:false, error:'', copied:false })
 const editor = reactive({ isNew:false, fileId:'', name:'', originalName:'', content:'', original:'', etag:'', mode:'edit' as 'edit'|'split'|'preview', busy:false, error:'' })
 const fileInput = ref<HTMLInputElement|null>(null)
+const avatarInput = ref<HTMLInputElement|null>(null)
 const viewMode = ref<'list'|'grid'>('list')
 let activeUploads = 0
 let toastTimer = 0
@@ -42,6 +47,7 @@ const editorDirty = computed(() => editor.content !== editor.original || editor.
 const editorBytes = computed(() => new Blob([editor.content]).size)
 const editorIsMarkdown = computed(() => /\.(md|markdown)$/i.test(editor.name))
 const renderedMarkdown = computed(() => DOMPurify.sanitize(marked.parse(editor.content, { async:false }) as string))
+const avatarURL = computed(() => `/api/profile/avatar?v=${avatarVersion.value}`)
 
 async function api<T>(path:string, init:RequestInit = {}):Promise<T> {
   const headers = new Headers(init.headers)
@@ -59,18 +65,37 @@ async function api<T>(path:string, init:RequestInit = {}):Promise<T> {
 function notify(text:string, kind:'error'|'success'='error') { toast.text=text;toast.kind=kind;window.clearTimeout(toastTimer);toastTimer=window.setTimeout(()=>toast.text='',3600) }
 
 async function checkSession() {
-  try { const me=await api<{username:string}>('/api/auth/me');user.value=me.username;await openFolder(ROOT) }
-  catch { user.value=null }
+  try { const me=await api<ProfileResponse>('/api/auth/me');user.value=me.username;hasAvatar.value=me.has_avatar;await openFolder(ROOT) }
+  catch { user.value=null;hasAvatar.value=false }
   finally { checking.value=false }
 }
 async function submitLogin() {
   login.busy=true;login.error='';login.notice=''
-  try { const me=await api<{username:string}>('/api/auth/login',{method:'POST',body:JSON.stringify({username:login.username,password:login.password})});user.value=me.username;login.password='';await openFolder(ROOT) }
+  try { const me=await api<ProfileResponse>('/api/auth/login',{method:'POST',body:JSON.stringify({username:login.username,password:login.password})});user.value=me.username;hasAvatar.value=me.has_avatar;login.password='';await openFolder(ROOT) }
   catch(e){login.error=(e as Error).message}
   finally{login.busy=false}
 }
-async function logout(){await api('/api/auth/logout',{method:'POST'});user.value=null;items.value=[];tasks.splice(0)}
-function showAccount(){account.username=user.value||'';account.currentPassword='';account.password='';account.confirmPassword='';account.error='';modal.value='account'}
+async function logout(){await api('/api/auth/logout',{method:'POST'});user.value=null;hasAvatar.value=false;items.value=[];tasks.splice(0)}
+function showAccount(){account.username=user.value||'';account.currentPassword='';account.password='';account.confirmPassword='';account.error='';avatar.error='';modal.value='account'}
+function chooseAvatar(){avatarInput.value?.click()}
+async function uploadAvatar(file:File){
+  avatar.error=''
+  if(!['image/jpeg','image/png','image/gif','image/webp'].includes(file.type)){avatar.error='请选择 JPG、PNG、GIF 或 WebP 图片';return}
+  if(file.size>2*1024*1024){avatar.error='头像不能超过 2 MiB';return}
+  avatar.busy=true
+  try{
+    const dataURL=await new Promise<string>((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result));reader.onerror=()=>reject(new Error('无法读取图片'));reader.readAsDataURL(file)})
+    await api('/api/profile/avatar',{method:'PUT',body:JSON.stringify({data_url:dataURL})})
+    hasAvatar.value=true;avatarVersion.value=Date.now();notify('头像已更新','success')
+  }catch(e){avatar.error=(e as Error).message}
+  finally{avatar.busy=false}
+}
+async function removeAvatar(){
+  avatar.error='';avatar.busy=true
+  try{await api('/api/profile/avatar',{method:'DELETE'});hasAvatar.value=false;avatarVersion.value=Date.now();notify('头像已移除','success')}
+  catch(e){avatar.error=(e as Error).message}
+  finally{avatar.busy=false}
+}
 async function saveAccount(){
   account.error=''
   if(account.password.length<12){account.error='新密码至少需要 12 个字符';return}
@@ -125,7 +150,8 @@ async function saveDocument(){
 function closeEditor(){if(editorDirty.value&&!window.confirm('还有未保存的修改，确定关闭吗？'))return;modal.value=null}
 function closeBackdrop(){if(modal.value==='editor')closeEditor();else modal.value=null}
 function hideBrokenImage(event:Event){(event.target as HTMLImageElement).hidden=true}
-function setViewMode(mode:'list'|'grid'){viewMode.value=mode;localStorage.setItem('cloud-view-mode',mode)}
+function setViewMode(mode:'list'|'grid'){viewMode.value=mode;selected.value=null;localStorage.setItem('cloud-view-mode',mode)}
+function toggleSelection(item:DriveFile){selected.value=selected.value?.id===item.id?null:item}
 function download(item:DriveFile){window.location.assign(`/api/files/${item.id}/download`)}
 
 function chooseFiles(){fileInput.value?.click()}
@@ -154,10 +180,21 @@ onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='l
   </main>
 
   <div v-else class="app-shell" @dragover.prevent="dragActive=true" @dragleave.self="dragActive=false" @drop.prevent="onDrop">
-    <header class="topbar"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div class="top-actions"><span class="connection"><i></i>S3 直连</span><button class="account-button" title="打开账户设置" @click="showAccount"><span class="avatar-badge">{{ user.slice(0,1).toUpperCase() }}</span><span class="account-copy"><b>{{ user }}</b><small>账户设置</small></span></button><button class="top-logout" @click="logout">退出</button></div></header>
+    <header class="topbar"><div class="logo"><span class="brand-mark small">C</span><span>Cloud</span></div><div class="top-actions"><span class="connection"><i></i>S3 直连</span><button class="account-button" title="打开账户设置" @click="showAccount"><span class="avatar-badge"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像" @error="hasAvatar=false"><template v-else>{{ user.slice(0,1).toUpperCase() }}</template></span><span class="account-copy"><b>{{ user }}</b><small>账户设置</small></span></button><button class="top-logout" @click="logout">退出</button></div></header>
     <aside class="sidebar"><button class="nav active"><span>▰</span>我的文件</button><div class="sidebar-note"><span>私密空间</span><p>元数据保存在 SQLite，文件内容保存在 S3。</p></div></aside>
     <section class="content">
       <div class="content-head"><div><nav class="breadcrumbs" aria-label="路径"><button v-for="crumb in breadcrumbs" :key="crumb.id" @click="openFolder(crumb.id)">{{ crumb.name || '我的文件' }}<span>/</span></button></nav><h1>{{ current?.name || '我的文件' }}</h1><p>{{ items.length }} 个项目 · {{ pathTitle }}</p></div><div class="actions"><div class="view-switch" role="group" aria-label="文件显示方式"><button :class="{active:viewMode==='list'}" title="列表视图" aria-label="列表视图" @click="setViewMode('list')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg></button><button :class="{active:viewMode==='grid'}" title="大图标视图" aria-label="大图标视图" @click="setViewMode('grid')"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg></button></div><button class="secondary" @click="newDocument">＋ 新建文档</button><button class="secondary" @click="createFolder">＋ 新建文件夹</button><button class="primary" @click="chooseFiles">↑ 上传文件</button><input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}"></div></div>
+      <div v-if="viewMode==='grid'&&selected&&!modal" class="selection-toolbar" role="toolbar" aria-label="所选项目操作">
+        <button class="selection-close" title="取消选择" aria-label="取消选择" @click="selected=null">×</button><span class="selection-summary"><b>1 项</b><small>已选择 {{ formatSize(selected.size) }}</small></span>
+        <div class="selection-actions">
+          <button v-if="selected.kind==='directory'||isEditable(selected)||isImage(selected)" @click="openItem(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path v-if="selected.kind==='directory'" d="M3 7h7l2 2h9v9H3z"/><path v-else-if="isEditable(selected)" d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path v-else d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/></svg><span>{{ selected.kind==='directory'?'打开':isEditable(selected)?'编辑文本':'预览' }}</span></button>
+          <button v-if="selected.kind==='file'" @click="download(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg><span>下载</span></button>
+          <button v-if="selected.kind==='file'" @click="showShare(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.6-4.4M8.2 13.2l7.6 4.4"/></svg><span>分享</span></button>
+          <button @click="showRename(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 5v14M9 19h6"/></svg><span>重命名</span></button>
+          <button @click="showMove(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg><span>移动</span></button>
+          <button class="danger" @click="removeItem(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg><span>删除</span></button>
+        </div>
+      </div>
       <div v-if="loading" class="state"><div class="spinner"></div><p>正在读取文件…</p></div>
       <div v-else-if="!items.length" class="state empty"><div class="empty-icon">⌁</div><h3>这里还是空的</h3><p>拖放文件到这里，或新建一篇文档。</p><div class="empty-actions"><button class="secondary" @click="newDocument">新建文档</button><button class="primary" @click="chooseFiles">上传文件</button></div></div>
       <div v-else-if="viewMode==='list'" class="file-table">
@@ -170,25 +207,17 @@ onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='l
             <button v-if="isImage(item)" title="预览" aria-label="预览" @click="showPreview(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.6"/></svg></button>
             <button v-if="item.kind==='file'" title="下载" aria-label="下载" @click="download(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg></button>
             <button v-if="item.kind==='file'" title="分享" aria-label="分享" @click="showShare(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.6-4.4M8.2 13.2l7.6 4.4"/></svg></button>
-            <button title="重命名" aria-label="重命名" @click="showRename(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path d="m13.8 6.2 3.2 3.2"/></svg></button>
+            <button title="重命名" aria-label="重命名" @click="showRename(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 5v14M9 19h6"/></svg></button>
             <button title="移动" aria-label="移动" @click="showMove(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></button>
             <button title="删除" aria-label="删除" class="danger" @click="removeItem(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg></button>
           </div>
         </div>
       </div>
       <div v-else class="file-grid">
-        <article v-for="item in items" :key="item.id" class="file-card" :class="{mutedrow:item.status!=='ready'}" @dblclick="openItem(item)">
+        <article v-for="item in items" :key="item.id" class="file-card" :class="{mutedrow:item.status!=='ready',selected:selected?.id===item.id}" @dblclick="openItem(item)">
+          <button class="card-select" :class="{active:selected?.id===item.id}" :title="selected?.id===item.id?'取消选择':'选择项目'" :aria-label="selected?.id===item.id?'取消选择':'选择项目'" @click.stop="toggleSelection(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button>
           <button class="card-preview" :title="item.kind==='directory'?'打开文件夹':isEditable(item)?'编辑文档':isImage(item)?'预览图片':'文件'" @click="openItem(item)"><img v-if="isImage(item)" :src="previewURL(item)" :alt="item.name" loading="lazy" @error="hideBrokenImage"><span v-else-if="item.kind==='directory'" class="large-folder">▰</span><span v-else-if="isEditable(item)" class="large-document">▤</span><span v-else class="large-file">◇</span></button>
           <div class="card-info"><strong :title="item.name">{{ item.name }}</strong><small>{{ item.kind==='directory'?'文件夹':formatSize(item.size) }} · {{ formatDate(item.updated_at) }}</small></div>
-          <div class="card-actions">
-            <button v-if="isEditable(item)" title="编辑" aria-label="编辑" @click="openEditor(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path d="m13.8 6.2 3.2 3.2"/></svg></button>
-            <button v-if="isImage(item)" title="预览" aria-label="预览" @click="showPreview(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.6"/></svg></button>
-            <button v-if="item.kind==='file'" title="下载" aria-label="下载" @click="download(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg></button>
-            <button v-if="item.kind==='file'" title="分享" aria-label="分享" @click="showShare(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.6-4.4M8.2 13.2l7.6 4.4"/></svg></button>
-            <button title="重命名" aria-label="重命名" @click="showRename(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path d="m13.8 6.2 3.2 3.2"/></svg></button>
-            <button title="移动" aria-label="移动" @click="showMove(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></button>
-            <button title="删除" aria-label="删除" class="danger" @click="removeItem(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg></button>
-          </div>
         </article>
       </div>
     </section>
@@ -199,7 +228,7 @@ onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='l
     <div v-if="modal" class="modal-backdrop" :class="{previewing:modal==='preview',editing:modal==='editor'}" @click.self="closeBackdrop">
       <section v-if="modal==='rename'" class="modal"><header><div><p class="eyebrow dark">EDIT</p><h2>重命名</h2></div><button @click="modal=null">×</button></header><label>新名称<input v-model="renameValue" maxlength="1024" @keyup.enter="saveRename"></label><footer><button class="secondary" @click="modal=null">取消</button><button class="primary" :disabled="modalBusy" @click="saveRename">保存</button></footer></section>
       <section v-else-if="modal==='move'" class="modal folder-modal"><header><div><p class="eyebrow dark">MOVE</p><h2>移动「{{ selected?.name }}」</h2></div><button @click="modal=null">×</button></header><div v-if="modalBusy" class="state small"><div class="spinner"></div></div><div v-else class="folder-list"><button v-for="folder in folders" :key="folder.id" :style="{paddingLeft:`${18+folder.depth*22}px`}" @click="moveTo(folder.id)"><span>▰</span>{{ folder.name }}</button></div></section>
-      <section v-else-if="modal==='account'" class="modal account-modal"><header><div><p class="eyebrow dark">SECURITY</p><h2>账户设置</h2></div><button @click="modal=null">×</button></header><form @submit.prevent="saveAccount"><p class="modal-hint">修改后会退出所有已登录设备，请使用新凭据重新登录。</p><label>管理员用户名<input v-model="account.username" autocomplete="username" maxlength="128" required></label><label>当前密码<input v-model="account.currentPassword" type="password" autocomplete="current-password" maxlength="1024" required></label><label>新密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><label>确认新密码<input v-model="account.confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><p v-if="account.error" class="form-error">{{ account.error }}</p><footer><button type="button" class="secondary" @click="modal=null">取消</button><button class="primary" :disabled="modalBusy">{{ modalBusy?'正在保存…':'更新并退出' }}</button></footer></form></section>
+      <section v-else-if="modal==='account'" class="modal account-modal"><header><div><p class="eyebrow dark">PROFILE & SECURITY</p><h2>账户设置</h2></div><button @click="modal=null">×</button></header><div class="account-layout"><section class="avatar-settings"><div class="avatar-large"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像"><span v-else>{{ user.slice(0,1).toUpperCase() }}</span></div><h3>个人头像</h3><p>支持 JPG、PNG、GIF 和 WebP，最大 2 MiB。</p><div class="avatar-actions"><button type="button" class="secondary" :disabled="avatar.busy" @click="chooseAvatar">{{ avatar.busy?'处理中…':hasAvatar?'更换头像':'上传头像' }}</button><button v-if="hasAvatar" type="button" class="danger-text" :disabled="avatar.busy" @click="removeAvatar">移除</button></div><input ref="avatarInput" hidden type="file" accept="image/jpeg,image/png,image/gif,image/webp" @change="e=>{const el=e.target as HTMLInputElement;if(el.files?.[0])uploadAvatar(el.files[0]);el.value=''}"><p v-if="avatar.error" class="form-error">{{ avatar.error }}</p></section><form @submit.prevent="saveAccount"><div><h3>登录凭据</h3><p class="modal-hint">修改后会退出所有已登录设备，请使用新凭据重新登录。</p></div><label>管理员用户名<input v-model="account.username" autocomplete="username" maxlength="128" required></label><label>当前密码<input v-model="account.currentPassword" type="password" autocomplete="current-password" maxlength="1024" required></label><div class="account-passwords"><label>新密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><label>确认新密码<input v-model="account.confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label></div><p v-if="account.error" class="form-error">{{ account.error }}</p><footer><button type="button" class="secondary" @click="modal=null">取消</button><button class="primary" :disabled="modalBusy">{{ modalBusy?'正在保存…':'更新并退出' }}</button></footer></form></div></section>
       <section v-else-if="modal==='editor'" class="document-editor">
         <header class="editor-header">
           <div class="editor-title"><span>▤</span><div><input v-if="editor.isNew" v-model="editor.name" aria-label="文档文件名" maxlength="1024"><strong v-else :title="editor.name">{{ editor.name }}</strong><small>{{ editor.isNew?'保存在当前文件夹':'文本编辑器' }}</small></div></div>

@@ -33,6 +33,8 @@ import (
 const RootID = "00000000-0000-0000-0000-000000000000"
 const maxJSONBody = 7 << 20
 const maxDocumentBytes = 1 << 20
+const maxAvatarBytes = 2 << 20
+const avatarObjectKey = "profile/avatar"
 
 type Server struct {
 	db      *sql.DB
@@ -79,6 +81,9 @@ func (s *Server) Handler() http.Handler {
 			r.Post("/auth/logout", s.logout)
 			r.Get("/auth/me", s.me)
 			r.Patch("/auth/credentials", s.changeCredentials)
+			r.Get("/profile/avatar", s.getAvatar)
+			r.Put("/profile/avatar", s.updateAvatar)
+			r.Delete("/profile/avatar", s.deleteAvatar)
 			r.Get("/files/{id}", s.getFile)
 			r.Get("/files/{id}/children", s.children)
 			r.Get("/files/{id}/download", s.download)
@@ -167,7 +172,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	s.limiter.success(ip)
 	http.SetCookie(w, &http.Cookie{Name: "cloud_session", Value: token, Path: "/", HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode, Expires: expires, MaxAge: int(time.Until(expires).Seconds())})
 	s.log.Info("user logged in", "user", in.Username)
-	writeJSON(w, http.StatusOK, map[string]string{"username": in.Username})
+	writeJSON(w, http.StatusOK, map[string]any{"username": in.Username, "has_avatar": s.hasAvatar(r.Context())})
 }
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie("cloud_session"); err == nil {
@@ -177,7 +182,90 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"username": r.Context().Value(userKey{}).(string)})
+	writeJSON(w, http.StatusOK, map[string]any{"username": r.Context().Value(userKey{}).(string), "has_avatar": s.hasAvatar(r.Context())})
+}
+
+func (s *Server) hasAvatar(ctx context.Context) bool {
+	var value string
+	return s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='avatar_mime'`).Scan(&value) == nil && value != ""
+}
+
+func (s *Server) getAvatar(w http.ResponseWriter, r *http.Request) {
+	var contentType string
+	if err := s.db.QueryRowContext(r.Context(), `SELECT value FROM settings WHERE key='avatar_mime'`).Scan(&contentType); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			problem(w, http.StatusNotFound, "avatar not found")
+		} else {
+			problem(w, http.StatusInternalServerError, "database error")
+		}
+		return
+	}
+	data, err := s.storage.Read(r.Context(), avatarObjectKey, maxAvatarBytes)
+	if err != nil {
+		s.log.Error("avatar read failed", "error", err)
+		problem(w, http.StatusBadGateway, "could not read avatar")
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Content-Disposition", "inline")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func (s *Server) updateAvatar(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		DataURL string `json:"data_url"`
+	}
+	if err := decodeJSON(w, r, &in); err != nil {
+		return
+	}
+	comma := strings.IndexByte(in.DataURL, ',')
+	if comma < 0 || !strings.HasPrefix(in.DataURL, "data:image/") {
+		problem(w, http.StatusBadRequest, "avatar must be a data URL")
+		return
+	}
+	data, err := base64.StdEncoding.DecodeString(in.DataURL[comma+1:])
+	if err != nil || len(data) == 0 {
+		problem(w, http.StatusBadRequest, "avatar data is invalid")
+		return
+	}
+	if len(data) > maxAvatarBytes {
+		problem(w, http.StatusRequestEntityTooLarge, "avatar must not exceed 2 MiB")
+		return
+	}
+	contentType := http.DetectContentType(data)
+	switch contentType {
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
+	default:
+		problem(w, http.StatusUnsupportedMediaType, "avatar must be JPEG, PNG, GIF, or WebP")
+		return
+	}
+	if _, err := s.storage.Write(r.Context(), avatarObjectKey, contentType, data); err != nil {
+		s.log.Error("avatar write failed", "error", err)
+		problem(w, http.StatusBadGateway, "could not save avatar")
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.db.ExecContext(r.Context(), `INSERT INTO settings(key,value,updated_at) VALUES('avatar_mime',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`, contentType, now); err != nil {
+		s.log.Error("avatar metadata write failed", "error", err)
+		problem(w, http.StatusInternalServerError, "could not save avatar")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) deleteAvatar(w http.ResponseWriter, r *http.Request) {
+	if err := s.storage.Delete(r.Context(), avatarObjectKey); err != nil {
+		s.log.Error("avatar delete failed", "error", err)
+		problem(w, http.StatusBadGateway, "could not delete avatar")
+		return
+	}
+	if _, err := s.db.ExecContext(r.Context(), `DELETE FROM settings WHERE key='avatar_mime'`); err != nil {
+		problem(w, http.StatusInternalServerError, "could not delete avatar")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) changeCredentials(w http.ResponseWriter, r *http.Request) {
