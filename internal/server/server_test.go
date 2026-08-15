@@ -1,0 +1,195 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/VesperGlow/cloud/internal/auth"
+	"github.com/VesperGlow/cloud/internal/config"
+	"github.com/VesperGlow/cloud/internal/database"
+	"github.com/VesperGlow/cloud/internal/storage"
+)
+
+type mockStorage struct {
+	objects   map[string]storage.ObjectInfo
+	deleteErr error
+}
+
+func (m *mockStorage) Ping(context.Context) error { return nil }
+func (m *mockStorage) PresignPut(_ context.Context, key, _ string, _ time.Duration) (string, error) {
+	m.objects[key] = storage.ObjectInfo{}
+	return "https://s3.example/put", nil
+}
+func (m *mockStorage) PresignGet(context.Context, string, string, bool, time.Duration) (string, error) {
+	return "https://s3.example/get", nil
+}
+func (m *mockStorage) Head(_ context.Context, key string) (storage.ObjectInfo, error) {
+	v, ok := m.objects[key]
+	if !ok {
+		return storage.ObjectInfo{}, errors.New("not found")
+	}
+	return v, nil
+}
+func (m *mockStorage) Delete(_ context.Context, key string) error {
+	if m.deleteErr != nil {
+		return m.deleteErr
+	}
+	delete(m.objects, key)
+	return nil
+}
+func (m *mockStorage) CreateMultipart(context.Context, string, string) (string, error) {
+	return "s3-upload", nil
+}
+func (m *mockStorage) PresignPart(context.Context, string, string, int32, time.Duration) (string, error) {
+	return "https://s3.example/part", nil
+}
+func (m *mockStorage) CompleteMultipart(context.Context, string, string, []storage.CompletedPart) error {
+	return nil
+}
+func (m *mockStorage) AbortMultipart(context.Context, string, string) error { return nil }
+
+type testApp struct {
+	t       *testing.T
+	db      *sql.DB
+	store   *mockStorage
+	handler http.Handler
+	cookie  *http.Cookie
+}
+
+func newTestApp(t *testing.T) *testApp {
+	t.Helper()
+	db, err := database.Open(t.TempDir() + "/cloud.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &auth.Service{DB: db, Params: auth.Params{Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32}}
+	if err := a.Initialize(context.Background(), "admin", "a-secure-test-password"); err != nil {
+		t.Fatal(err)
+	}
+	store := &mockStorage{objects: map[string]storage.ObjectInfo{}}
+	cfg := config.Config{BaseURL: "http://example.test", MultipartThreshold: 100, PartSize: 5 * 1024 * 1024, PresignExpires: time.Minute, UploadExpires: time.Hour}
+	app := &testApp{t: t, db: db, store: store, handler: New(db, store, a, cfg, nil).Handler()}
+	resp := app.request("POST", "/api/auth/login", map[string]any{"username": "admin", "password": "a-secure-test-password"}, false)
+	if resp.Code != 200 {
+		t.Fatalf("login status %d: %s", resp.Code, resp.Body.String())
+	}
+	app.cookie = resp.Result().Cookies()[0]
+	t.Cleanup(func() { db.Close() })
+	return app
+}
+func (a *testApp) request(method, path string, body any, authenticated bool) *httptest.ResponseRecorder {
+	a.t.Helper()
+	var data []byte
+	if body != nil {
+		data, _ = json.Marshal(body)
+	}
+	req := httptest.NewRequest(method, path, bytes.NewReader(data))
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if authenticated && a.cookie != nil {
+		req.AddCookie(a.cookie)
+	}
+	rr := httptest.NewRecorder()
+	a.handler.ServeHTTP(rr, req)
+	return rr
+}
+func decode[T any](t *testing.T, rr *httptest.ResponseRecorder) T {
+	t.Helper()
+	var v T
+	if err := json.Unmarshal(rr.Body.Bytes(), &v); err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+func TestRootProtectionAndNameConflict(t *testing.T) {
+	a := newTestApp(t)
+	rr := a.request("PATCH", "/api/files/"+RootID, map[string]any{"name": "changed"}, true)
+	if rr.Code != 400 {
+		t.Fatalf("root rename status=%d", rr.Code)
+	}
+	first := a.request("POST", "/api/directories", map[string]any{"parent_id": RootID, "name": "Photos"}, true)
+	if first.Code != 201 {
+		t.Fatalf("create status=%d: %s", first.Code, first.Body.String())
+	}
+	second := a.request("POST", "/api/directories", map[string]any{"parent_id": RootID, "name": "Photos"}, true)
+	if second.Code != 409 {
+		t.Fatalf("duplicate status=%d", second.Code)
+	}
+}
+
+func TestDirectoryCannotMoveIntoDescendant(t *testing.T) {
+	a := newTestApp(t)
+	parentRR := a.request("POST", "/api/directories", map[string]any{"parent_id": RootID, "name": "Parent"}, true)
+	parent := decode[File](t, parentRR)
+	childRR := a.request("POST", "/api/directories", map[string]any{"parent_id": parent.ID, "name": "Child"}, true)
+	child := decode[File](t, childRR)
+	rr := a.request("PATCH", "/api/files/"+parent.ID, map[string]any{"parent_id": child.ID}, true)
+	if rr.Code != 400 {
+		t.Fatalf("cycle status=%d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSingleUploadRequiresHeadVerification(t *testing.T) {
+	a := newTestApp(t)
+	createdRR := a.request("POST", "/api/uploads", map[string]any{"parent_id": RootID, "name": "hello.txt", "size": 12, "mime_type": "text/plain"}, true)
+	if createdRR.Code != 201 {
+		t.Fatalf("create upload=%d: %s", createdRR.Code, createdRR.Body.String())
+	}
+	created := decode[map[string]any](t, createdRR)
+	uploadID := created["upload_id"].(string)
+	var objectKey string
+	if err := a.db.QueryRow(`SELECT f.object_key FROM files f JOIN uploads u ON u.file_id=f.id WHERE u.id=?`, uploadID).Scan(&objectKey); err != nil {
+		t.Fatal(err)
+	}
+	a.store.objects[objectKey] = storage.ObjectInfo{Size: 12, ETag: "etag"}
+	complete := a.request("POST", "/api/uploads/"+uploadID+"/complete", map[string]any{}, true)
+	if complete.Code != 200 {
+		t.Fatalf("complete=%d: %s", complete.Code, complete.Body.String())
+	}
+	var status string
+	if err := a.db.QueryRow(`SELECT status FROM files WHERE object_key=?`, objectKey).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "ready" {
+		t.Fatalf("status=%s", status)
+	}
+}
+
+func TestDeleteFailureRetainsDeletingMetadata(t *testing.T) {
+	a := newTestApp(t)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := a.db.Exec(`INSERT INTO files(id,parent_id,name,kind,object_key,size,status,created_at,updated_at) VALUES('file-id',?,'keep.txt','file','objects/key',1,'ready',?,?)`, RootID, now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.store.objects["objects/key"] = storage.ObjectInfo{Size: 1}
+	a.store.deleteErr = errors.New("S3 unavailable")
+	rr := a.request("DELETE", "/api/files/file-id", nil, true)
+	if rr.Code != 502 {
+		t.Fatalf("delete=%d", rr.Code)
+	}
+	var status string
+	if err := a.db.QueryRow(`SELECT status FROM files WHERE id='file-id'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "deleting" {
+		t.Fatalf("status=%s", status)
+	}
+	a.store.deleteErr = nil
+	retry := a.request("DELETE", "/api/files/file-id", nil, true)
+	if retry.Code != http.StatusNoContent {
+		t.Fatalf("delete retry=%d: %s", retry.Code, retry.Body.String())
+	}
+	if err := a.db.QueryRow(`SELECT status FROM files WHERE id='file-id'`).Scan(&status); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("metadata should be removed after retry, got %v", err)
+	}
+}
