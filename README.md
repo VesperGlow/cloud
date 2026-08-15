@@ -169,6 +169,7 @@ Bucket 必须保持私有。浏览器访问对象依赖 Presigned URL，而不�
 | `POST` | `/api/auth/login`、`/api/auth/logout` | 登录与注销 |
 | `GET` | `/api/auth/me` | 当前管理员 |
 | `GET` / `PUT` / `DELETE` | `/api/profile/avatar` | 读取、更新或移除个人头像 |
+| `GET` | `/api/storage/stats` | 所有 ready 文件的逻辑总大小与文件数 |
 | `GET` | `/api/files/{id}` | 文件/目录与面包屑 |
 | `GET` | `/api/files/{id}/children` | 目录内容 |
 | `POST` | `/api/directories` | 新建目录 |
@@ -198,6 +199,14 @@ Bucket 必须保持私有。浏览器访问对象依赖 Presigned URL，而不�
 点击 `.md`、`.markdown`、`.txt`、`.yaml`、`.yml`、`.json`、`.toml`、`.ini`、`.conf`、`.log` 或 `.csv` 文件即可打开编辑器；当前目录也可以直接新建文档。Markdown 支持编辑、分栏和安全过滤后的预览，`Ctrl/⌘ + S` 可保存。
 
 编辑器只接受 UTF-8 且不超过 1 MiB 的文件。保存会覆盖同一个 S3 对象并更新 SQLite 中的大小、MIME 和 ETag；若文件已被其他页面修改，旧编辑会收到 `409 Conflict`，不会静默覆盖新内容。已有公开分享链接无需重建，会读取保存后的最新内容。
+
+## 媒体预览
+
+当前目录中的图片、GIF 和视频会组成一个循环媒体序列，可使用左右按钮或键盘方向键切换。图片与 GIF 使用原始对象地址，GIF 会保留动画；视频使用浏览器原生播放器。音频文件会打开独立的原生播放器。底部下载按钮始终下载原始文件。
+
+应用识别 JPEG、PNG、WebP、GIF、AVIF，以及 MP4、WebM、OGV、MOV、M4V、MP3、WAV、OGG、M4A、AAC、FLAC 等常见扩展名。应用不执行转码，最终能否播放仍取决于文件内部编码和访问浏览器的解码能力；兼容性优先推荐 H.264/AAC 的 MP4、WebM，以及 MP3、WAV 或 OGG 音频。
+
+侧栏显示所有 `ready` 文件的逻辑总大小与文件数。它不代表对象存储供应商的计费占用，不计未完成 Multipart 分片、Bucket 版本历史或供应商额外开销。
 
 ## S3 对象与分片
 
@@ -245,7 +254,7 @@ docker compose start cloud
 
 - 单用户；不提供注册、WebDAV、OIDC、同步客户端或 Office 文档协作编辑。
 - 目录必须为空才能删除，避免递归 S3 删除产生部分成功的数据不一致。
-- 图片只支持 JPEG、PNG、WebP 和 GIF 原图预览；没有缩略图、转码、OCR 或 EXIF 索引。
+- 媒体直接读取 S3 原始对象；没有服务端缩略图、转码、波形、OCR 或 EXIF 索引，不受浏览器支持的编码无法播放。
 - 登录限速是单实例内存状态；这符合单实例 MVP 的部署模型。
 - Multipart 不做跨浏览器恢复；取消或过期会清理，网络失败可在当前页面重试。
 
@@ -259,4 +268,4 @@ go build ./...
 docker build -t cloud:test .
 ```
 
-测试覆盖登录、Session、Session 过期、密码盐、头像生命周期、文本编辑、公开分享、同目录名称冲突、root 保护、目录循环、上传 `pending → ready` 和删除失败保留 `deleting` 元数据。GitHub Actions 会对每次 push / PR 重复执行这些检查。
+测试覆盖登录、Session、Session 过期、密码盐、头像生命周期、媒体预览与空间统计、文本编辑、公开分享、同目录名称冲突、root 保护、目录循环、上传 `pending → ready` 和删除失败保留 `deleting` 元数据。GitHub Actions 会对每次 push / PR 重复执行这些检查。

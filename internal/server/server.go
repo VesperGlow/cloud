@@ -84,6 +84,7 @@ func (s *Server) Handler() http.Handler {
 			r.Get("/profile/avatar", s.getAvatar)
 			r.Put("/profile/avatar", s.updateAvatar)
 			r.Delete("/profile/avatar", s.deleteAvatar)
+			r.Get("/storage/stats", s.storageStats)
 			r.Get("/files/{id}", s.getFile)
 			r.Get("/files/{id}/children", s.children)
 			r.Get("/files/{id}/download", s.download)
@@ -119,7 +120,7 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "same-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob: https: http:; style-src 'self' 'unsafe-inline'; connect-src 'self' https: http:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob: https: http:; media-src 'self' blob: https: http:; style-src 'self' 'unsafe-inline'; connect-src 'self' https: http:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
@@ -391,6 +392,15 @@ func (s *Server) children(w http.ResponseWriter, r *http.Request) {
 		out = append(out, f)
 	}
 	writeJSON(w, 200, map[string]any{"items": out})
+}
+
+func (s *Server) storageStats(w http.ResponseWriter, r *http.Request) {
+	var totalBytes, fileCount int64
+	if err := s.db.QueryRowContext(r.Context(), `SELECT COALESCE(SUM(size),0),COUNT(*) FROM files WHERE kind='file' AND status='ready'`).Scan(&totalBytes, &fileCount); err != nil {
+		problem(w, http.StatusInternalServerError, "could not calculate storage usage")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"total_bytes": totalBytes, "file_count": fileCount})
 }
 
 func (s *Server) createDirectory(w http.ResponseWriter, r *http.Request) {
@@ -697,7 +707,7 @@ func (s *Server) redirectObject(w http.ResponseWriter, r *http.Request, inline b
 		problem(w, 404, "ready file not found")
 		return
 	}
-	if inline && !isPreviewable(f.MimeType) {
+	if inline && !isPreviewable(f) {
 		problem(w, 415, "preview is not available for this file type")
 		return
 	}
@@ -714,6 +724,38 @@ func responseMime(f File) string {
 		return f.MimeType
 	}
 	switch strings.ToLower(filepath.Ext(f.Name)) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".avif":
+		return "image/avif"
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".ogv":
+		return "video/ogg"
+	case ".mov":
+		return "video/quicktime"
+	case ".m4v":
+		return "video/x-m4v"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
+	case ".ogg", ".oga":
+		return "audio/ogg"
+	case ".m4a":
+		return "audio/mp4"
+	case ".aac":
+		return "audio/aac"
+	case ".flac":
+		return "audio/flac"
 	case ".md", ".markdown":
 		return "text/markdown; charset=utf-8"
 	case ".yaml", ".yml":
@@ -1165,8 +1207,17 @@ func validateName(name string) error {
 	}
 	return nil
 }
-func isPreviewable(mime string) bool {
-	return mime == "image/jpeg" || mime == "image/png" || mime == "image/webp" || mime == "image/gif"
+func isPreviewable(f File) bool {
+	mimeType := responseMime(f)
+	if strings.HasPrefix(mimeType, "video/") || strings.HasPrefix(mimeType, "audio/") {
+		return true
+	}
+	switch mimeType {
+	case "image/jpeg", "image/png", "image/webp", "image/gif", "image/avif":
+		return true
+	default:
+		return false
+	}
 }
 func isConflict(err error) bool {
 	return err != nil && (strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "constraint failed"))

@@ -267,6 +267,42 @@ func TestResponseMimeRecognizesYAML(t *testing.T) {
 	}
 }
 
+func TestMediaPreviewAndStorageStats(t *testing.T) {
+	a := newTestApp(t)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	files := []struct {
+		id, name, mime string
+		size           int64
+	}{
+		{"video-id", "clip.mp4", "application/octet-stream", 2048},
+		{"audio-id", "song.wav", "application/octet-stream", 4096},
+		{"image-id", "animated.gif", "image/gif", 1024},
+	}
+	for _, f := range files {
+		if _, err := a.db.Exec(`INSERT INTO files(id,parent_id,name,kind,object_key,size,mime_type,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, f.id, RootID, f.name, "file", "objects/"+f.id, f.size, f.mime, "ready", now, now); err != nil {
+			t.Fatal(err)
+		}
+		preview := a.request("GET", "/api/files/"+f.id+"/preview", nil, true)
+		if preview.Code != http.StatusFound {
+			t.Fatalf("preview %s=%d: %s", f.name, preview.Code, preview.Body.String())
+		}
+	}
+	if got := responseMime(File{Name: "song.mp3", MimeType: "application/octet-stream"}); got != "audio/mpeg" {
+		t.Fatalf("mp3 content type=%q", got)
+	}
+	statsRR := a.request("GET", "/api/storage/stats", nil, true)
+	if statsRR.Code != http.StatusOK {
+		t.Fatalf("storage stats=%d: %s", statsRR.Code, statsRR.Body.String())
+	}
+	stats := decode[struct {
+		TotalBytes int64 `json:"total_bytes"`
+		FileCount  int64 `json:"file_count"`
+	}](t, statsRR)
+	if stats.TotalBytes != 7168 || stats.FileCount != 3 {
+		t.Fatalf("storage stats=%+v", stats)
+	}
+}
+
 func TestCreateReadAndUpdateDocument(t *testing.T) {
 	a := newTestApp(t)
 	createdRR := a.request("POST", "/api/documents", map[string]any{"parent_id": RootID, "name": "notes.md", "content": "# First\n"}, true)
