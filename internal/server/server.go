@@ -680,12 +680,8 @@ func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(204)
 		return
 	}
-	if f.Status == "pending" {
-		problem(w, 409, "file is not deletable in its current state")
-		return
-	}
-	// Content objects are content-addressed and shared across files; they
-	// are reclaimed by the garbage collector once nothing references them.
+	// 任何状态的文件行都可以删除：pending 行是失败/中断的上传遗留，
+	// 级联清理 uploads 记录后，孤儿块由垃圾回收器兜底。
 	if _, err = s.db.ExecContext(r.Context(), `DELETE FROM files WHERE id=?`, id); err != nil {
 		problem(w, 500, "could not delete file")
 		return

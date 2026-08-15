@@ -314,7 +314,8 @@ async function completeWithRepair(task:UploadTask,uploadId:string,blocks:BlockSp
   for(let attempt=0;attempt<COMPLETE_RETRIES;attempt++){
     if(task.cancelled)throw new Error('上传已取消')
     try{
-      await api(`/api/uploads/${uploadId}/complete`,{method:'POST',body:JSON.stringify({blocks})})
+      // 服务端只认 {id,size}：offset 是前端本地字段，不能带上
+      await api(`/api/uploads/${uploadId}/complete`,{method:'POST',body:JSON.stringify({blocks:blocks.map(b=>({id:b.id,size:b.size}))})})
       return
     }catch(e){
       const err=e as Error & {status?:number;data?:unknown}
