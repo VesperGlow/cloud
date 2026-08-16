@@ -306,3 +306,8 @@ body.reader-open .storage-bar i{animation:none}
 /* 分段渲染：空闲段不提升合成层，翻页只栅格化当前章的小层 */
 .book-content{will-change:auto}
 .book-segments{position:absolute;left:0;top:0;width:100%}
+
+/* 视频/电子书缩略图 */
+.video-thumb{position:relative;width:100%;height:100%}
+.video-thumb img{width:100%;height:100%;object-fit:cover}
+.file-icon .video-thumb img{position:absolute;inset:0}

@@ -5,6 +5,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api } from './api'
 import type { DriveFile } from './api'
 import ReaderView from './Reader.vue'
+import VideoThumb from './VideoThumb.vue'
 
 const ROOT = '00000000-0000-0000-0000-000000000000'
 const FILE_CONCURRENCY = 3
@@ -64,6 +65,10 @@ const previewDownloadLabel = computed(() => selected.value ? isImage(selected.va
 function notify(text:string, kind:'error'|'success'='error') { toast.text=text;toast.kind=kind;window.clearTimeout(toastTimer);toastTimer=window.setTimeout(()=>toast.text='',3600) }
 
 function isBook(item:DriveFile){return item.kind==='file'&&item.status==='ready'&&/\.(epub|txt)$/i.test(item.name)}
+function isEpub(item:DriveFile){return item.kind==='file'&&/\.epub$/i.test(item.name)}
+function bookCoverURL(item:DriveFile){return `/api/files/${item.id}/book/cover`}
+const coverBroken=reactive<Record<string,boolean>>({})
+function markCoverBroken(item:DriveFile){coverBroken[item.id]=true}
 function openReader(item:DriveFile){readerFile.value=item;openModal('reader');history.replaceState({cloudNav:true},'','/read/'+item.id)}
 async function checkSession() {
   try { const me=await api<ProfileResponse>('/api/auth/me');user.value=me.username;hasAvatar.value=me.has_avatar;await openRoute() }
@@ -413,7 +418,7 @@ onBeforeUnmount(()=>{window.removeEventListener('keydown',handlePreviewKey);wind
       <div v-else-if="viewMode==='list'" class="file-table">
         <div class="table-head"><span>名称</span><span>大小</span><span>修改时间</span><span>操作</span></div>
         <div v-for="item in items" :key="item.id" class="file-row" :class="{mutedrow:item.status!=='ready'}" @dblclick="openItem(item)">
-          <div class="file-name"><button class="file-icon" :class="{directory:item.kind==='directory',image:isImage(item),document:isEditable(item),video:isVideo(item),audio:isAudio(item)}" :title="item.kind==='directory'?'打开文件夹':isEditable(item)?'编辑文档':isImage(item)?'预览图片':isVideo(item)?'播放视频':isAudio(item)?'播放音频':'文件'" @click="openItem(item)"><span v-if="item.kind==='directory'" class="folder-glyph">▰</span><img v-else-if="isImage(item)" :src="previewURL(item)" :alt="item.name" loading="lazy" @error="hideBrokenImage"><span v-else-if="isEditable(item)">▤</span><span v-else-if="isVideo(item)">▶</span><span v-else-if="isAudio(item)">♫</span><span v-else>◇</span></button><div><strong>{{ item.name }}</strong><small v-if="item.status!=='ready'">{{ item.status }}</small><small v-else>{{ item.kind==='directory'?'文件夹':item.mime_type||'文件' }}</small></div></div>
+          <div class="file-name"><button class="file-icon" :class="{directory:item.kind==='directory',image:isImage(item),document:isEditable(item),video:isVideo(item),audio:isAudio(item)}" :title="item.kind==='directory'?'打开文件夹':isEditable(item)?'编辑文档':isImage(item)?'预览图片':isVideo(item)?'播放视频':isAudio(item)?'播放音频':'文件'" @click="openItem(item)"><span v-if="item.kind==='directory'" class="folder-glyph">▰</span><img v-else-if="isImage(item)" :src="previewURL(item)" :alt="item.name" loading="lazy" @error="hideBrokenImage"><VideoThumb v-else-if="isVideo(item)" :file="item"><span>▶</span></VideoThumb><img v-else-if="isEpub(item)&&!coverBroken[item.id]" :src="bookCoverURL(item)" :alt="item.name" loading="lazy" @error="markCoverBroken(item)"><span v-else-if="isEpub(item)">▤</span><span v-else-if="isEditable(item)">▤</span><span v-else-if="isAudio(item)">♫</span><span v-else>◇</span></button><div><strong>{{ item.name }}</strong><small v-if="item.status!=='ready'">{{ item.status }}</small><small v-else>{{ item.kind==='directory'?'文件夹':item.mime_type||'文件' }}</small></div></div>
           <span>{{ item.kind==='directory'?'—':formatSize(item.size) }}</span><span>{{ formatDate(item.updated_at) }}</span>
           <div class="row-actions">
             <button v-if="isEditable(item)" title="编辑" aria-label="编辑" @click="openEditor(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path d="m13.8 6.2 3.2 3.2"/></svg></button>
@@ -430,7 +435,7 @@ onBeforeUnmount(()=>{window.removeEventListener('keydown',handlePreviewKey);wind
       <div v-else class="file-grid">
         <article v-for="item in items" :key="item.id" class="file-card" :class="{mutedrow:item.status!=='ready',selected:selected?.id===item.id}" @dblclick="openItem(item)">
           <button class="card-select" :class="{active:selected?.id===item.id}" :title="selected?.id===item.id?'取消选择':'选择项目'" :aria-label="selected?.id===item.id?'取消选择':'选择项目'" @click.stop="toggleSelection(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button>
-          <button class="card-preview" :title="item.kind==='directory'?'打开文件夹':isEditable(item)?'编辑文档':isImage(item)?'预览图片':isVideo(item)?'播放视频':isAudio(item)?'播放音频':'文件'" @click="openItem(item)"><img v-if="isImage(item)" :src="previewURL(item)" :alt="item.name" loading="lazy" @error="hideBrokenImage"><span v-else-if="item.kind==='directory'" class="large-folder">▰</span><span v-else-if="isEditable(item)" class="large-document">▤</span><span v-else-if="isVideo(item)" class="large-video">▶</span><span v-else-if="isAudio(item)" class="large-audio">♫</span><span v-else class="large-file">◇</span></button>
+          <button class="card-preview" :title="item.kind==='directory'?'打开文件夹':isEditable(item)?'编辑文档':isImage(item)?'预览图片':isVideo(item)?'播放视频':isAudio(item)?'播放音频':'文件'" @click="openItem(item)"><img v-if="isImage(item)" :src="previewURL(item)" :alt="item.name" loading="lazy" @error="hideBrokenImage"><VideoThumb v-else-if="isVideo(item)" :file="item"><span class="large-video">▶</span></VideoThumb><img v-else-if="isEpub(item)&&!coverBroken[item.id]" :src="bookCoverURL(item)" :alt="item.name" loading="lazy" @error="markCoverBroken(item)"><span v-else-if="isEpub(item)" class="large-document">▤</span><span v-else-if="item.kind==='directory'" class="large-folder">▰</span><span v-else-if="isEditable(item)" class="large-document">▤</span><span v-else-if="isAudio(item)" class="large-audio">♫</span><span v-else class="large-file">◇</span></button>
           <div class="card-info"><strong :title="item.name">{{ item.name }}</strong><small>{{ item.kind==='directory'?'文件夹':formatSize(item.size) }} · {{ formatDate(item.updated_at) }}</small></div>
         </article>
       </div>
