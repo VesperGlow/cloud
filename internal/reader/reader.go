@@ -30,7 +30,24 @@ const (
 	MaxTXT = 16 << 20
 	// MaxEPUB caps the source EPUB size.
 	MaxEPUB = 128 << 20
+	// maxDecompressedTotal caps the total bytes the EPUB parser will
+	// decompress across all zip entries. The source archive is limited to
+	// 128 MiB compressed, but a pathological archive (zip bomb) can expand
+	// to many times that; without this cap parsing would exhaust memory.
+	maxDecompressedTotal = 256 << 20
 )
+
+// budget tracks the total decompressed bytes consumed so far and rejects
+// archives that expand beyond maxDecompressedTotal.
+type budget struct{ used int64 }
+
+func (b *budget) take(n int64) error {
+	if n > maxDecompressedTotal-b.used {
+		return fmt.Errorf("EPUB 解压后内容超过 %d MiB 上限", maxDecompressedTotal>>20)
+	}
+	b.used += n
+	return nil
+}
 
 type TocEntry struct {
 	Label    string `json:"label"`
@@ -78,14 +95,16 @@ func (b *Book) bytes() int64 {
 	return n
 }
 
-// Parse 按扩展名解析一个文件流。assetBase 是内嵌图片 URL 的前缀。
-func Parse(name string, rs io.ReadSeeker, size int64, assetBase string) (*Book, error) {
+// Parse 按扩展名解析一个文件流。assetBase 是内嵌图片 URL 的前缀；
+// assetVersion 附加为查询参数（如内容哈希），使资产 URL 与内容一一对应，
+// 可安全地使用 immutable 长缓存。
+func Parse(name string, rs io.ReadSeeker, size int64, assetBase, assetVersion string) (*Book, error) {
 	switch strings.ToLower(path.Ext(name)) {
 	case ".epub":
 		if size > MaxEPUB {
 			return nil, fmt.Errorf("EPUB 超过 %d MiB 限制", MaxEPUB>>20)
 		}
-		return parseEPUB(rs, size, assetBase)
+		return parseEPUB(rs, size, assetBase, assetVersion)
 	default:
 		if size > MaxTXT {
 			return nil, fmt.Errorf("文本文件超过 %d MiB 限制，请下载后离线阅读", MaxTXT>>20)
@@ -149,23 +168,26 @@ type manifestItem struct {
 }
 
 type epubBuilder struct {
-	zip        *zip.Reader
-	manifest   map[string]manifestItem
-	spine      []string
-	assets     []Asset
-	assetIndex map[string]int
-	out        strings.Builder
-	pending    []string
-	chapter    string
-	assetBase  string
+	zip          *zip.Reader
+	manifest     map[string]manifestItem
+	spine        []string
+	assets       []Asset
+	assetIndex   map[string]int
+	out          strings.Builder
+	pending      []string
+	chapter      string
+	assetBase    string
+	assetVersion string
+	budget       *budget
 }
 
-func parseEPUB(rs io.ReadSeeker, size int64, assetBase string) (*Book, error) {
+func parseEPUB(rs io.ReadSeeker, size int64, assetBase, assetVersion string) (*Book, error) {
 	zr, err := zip.NewReader(&readSeekerAt{rs: rs}, size)
 	if err != nil {
 		return nil, fmt.Errorf("EPUB 不是有效的 zip: %w", err)
 	}
-	container, err := zipText(zr, "META-INF/container.xml")
+	budget := &budget{}
+	container, err := zipText(zr, "META-INF/container.xml", budget)
 	if err != nil {
 		return nil, fmt.Errorf("读取 EPUB 容器失败: %w", err)
 	}
@@ -173,7 +195,7 @@ func parseEPUB(rs io.ReadSeeker, size int64, assetBase string) (*Book, error) {
 	if err != nil {
 		return nil, err
 	}
-	opfXML, err := zipText(zr, opfPath)
+	opfXML, err := zipText(zr, opfPath, budget)
 	if err != nil {
 		return nil, fmt.Errorf("读取 OPF 失败: %w", err)
 	}
@@ -183,10 +205,12 @@ func parseEPUB(rs io.ReadSeeker, size int64, assetBase string) (*Book, error) {
 	}
 
 	b := &epubBuilder{
-		zip:        zr,
-		manifest:   map[string]manifestItem{},
-		assetIndex: map[string]int{},
-		assetBase:  strings.TrimRight(assetBase, "/"),
+		zip:          zr,
+		manifest:     map[string]manifestItem{},
+		assetIndex:   map[string]int{},
+		assetBase:    strings.TrimRight(assetBase, "/"),
+		assetVersion: assetVersion,
+		budget:       budget,
 	}
 	for _, it := range pkg.Manifest.Items {
 		b.manifest[it.ID] = manifestItem{path: resolvePath(opfPath, it.Href), mediaType: it.MediaType, properties: it.Properties}
@@ -199,15 +223,15 @@ func parseEPUB(rs io.ReadSeeker, size int64, assetBase string) (*Book, error) {
 	if book.Title == "" {
 		book.Title = "未命名书籍"
 	}
-	book.TOC = extractToc(zr, &pkg, b.manifest, opfPath)
-	book.Cover, book.CoverExt = extractCover(zr, &pkg, b.manifest)
+	book.TOC = extractToc(zr, &pkg, b.manifest, opfPath, budget)
+	book.Cover, book.CoverExt = extractCover(zr, &pkg, b.manifest, budget)
 
 	for _, idref := range b.spine {
 		item, ok := b.manifest[idref]
 		if !ok || !isHTMLMedia(item.mediaType) {
 			continue
 		}
-		chapter, err := zipText(zr, item.path)
+		chapter, err := zipText(zr, item.path, budget)
 		if err != nil {
 			continue
 		}
@@ -217,7 +241,7 @@ func parseEPUB(rs io.ReadSeeker, size int64, assetBase string) (*Book, error) {
 		book.Chapters = append(book.Chapters, Chapter{HTML: b.out.String()})
 		b.out.Reset()
 	}
-	if strings.TrimSpace(b.out.String()) == "" && len(book.Chapters) == 0 {
+	if len(book.Chapters) == 0 {
 		return nil, fmt.Errorf("EPUB 中没有可阅读内容")
 	}
 	parts := make([]string, len(book.Chapters))
@@ -229,7 +253,7 @@ func parseEPUB(rs io.ReadSeeker, size int64, assetBase string) (*Book, error) {
 	return book, nil
 }
 
-func zipText(zr *zip.Reader, name string) (string, error) {
+func zipText(zr *zip.Reader, name string, b *budget) (string, error) {
 	norm := normalizePath(name)
 	for _, f := range zr.File {
 		if normalizePath(f.Name) == norm {
@@ -238,7 +262,7 @@ func zipText(zr *zip.Reader, name string) (string, error) {
 				return "", err
 			}
 			defer rc.Close()
-			data, err := io.ReadAll(io.LimitReader(rc, MaxEPUB+1))
+			data, err := readZipEntry(rc, b)
 			if err != nil {
 				return "", err
 			}
@@ -248,7 +272,7 @@ func zipText(zr *zip.Reader, name string) (string, error) {
 	return "", fmt.Errorf("EPUB 缺少文件：%s", name)
 }
 
-func zipBytes(zr *zip.Reader, name string) ([]byte, error) {
+func zipBytes(zr *zip.Reader, name string, b *budget) ([]byte, error) {
 	norm := normalizePath(name)
 	for _, f := range zr.File {
 		if normalizePath(f.Name) != norm {
@@ -259,9 +283,26 @@ func zipBytes(zr *zip.Reader, name string) ([]byte, error) {
 			return nil, err
 		}
 		defer rc.Close()
-		return io.ReadAll(rc)
+		return readZipEntry(rc, b)
 	}
 	return nil, fmt.Errorf("EPUB 缺少文件：%s", name)
+}
+
+// readZipEntry reads one zip entry, enforcing both the per-entry and the
+// cumulative decompression budget. Exceeding either is an error rather than
+// a silent truncation.
+func readZipEntry(rc io.Reader, b *budget) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(rc, maxDecompressedTotal+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxDecompressedTotal {
+		return nil, fmt.Errorf("EPUB 条目超过 %d MiB 上限", maxDecompressedTotal>>20)
+	}
+	if err := b.take(int64(len(data))); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 func opfPathFromContainer(xmlText string) (string, error) {
@@ -283,13 +324,13 @@ func isHTMLMedia(mediaType string) bool {
 
 // ---- 目录 ----
 
-func extractToc(zr *zip.Reader, pkg *opfPackage, manifest map[string]manifestItem, opfPath string) []TocEntry {
+func extractToc(zr *zip.Reader, pkg *opfPackage, manifest map[string]manifestItem, opfPath string, b *budget) []TocEntry {
 	// EPUB3 nav 文档
 	for _, item := range manifest {
 		if !strings.Contains(" "+item.properties+" ", " nav ") {
 			continue
 		}
-		if navHTML, err := zipText(zr, item.path); err == nil {
+		if navHTML, err := zipText(zr, item.path, b); err == nil {
 			if entries := parseNav([]byte(navHTML), item.path); len(entries) > 0 {
 				return entries
 			}
@@ -308,7 +349,7 @@ func extractToc(zr *zip.Reader, pkg *opfPackage, manifest map[string]manifestIte
 	if !ok {
 		return []TocEntry{}
 	}
-	ncxXML, err := zipText(zr, ncxItem.path)
+	ncxXML, err := zipText(zr, ncxItem.path, b)
 	if err != nil {
 		return []TocEntry{}
 	}
@@ -672,7 +713,7 @@ func (b *epubBuilder) writeImg(src, alt string, withExtra bool) {
 	}
 	idx, ok := b.assetIndex[zipPath]
 	if !ok {
-		data, err := zipBytes(b.zip, zipPath)
+		data, err := zipBytes(b.zip, zipPath, b.budget)
 		if err != nil {
 			return
 		}
@@ -686,6 +727,10 @@ func (b *epubBuilder) writeImg(src, alt string, withExtra bool) {
 	b.out.WriteString(b.assetBase)
 	b.out.WriteByte('/')
 	b.out.WriteString(strconv.Itoa(idx))
+	if b.assetVersion != "" {
+		b.out.WriteString("?v=")
+		b.out.WriteString(url.QueryEscape(b.assetVersion))
+	}
 	b.out.WriteByte('"')
 	if a := b.assets[idx]; a.Width > 0 && a.Height > 0 {
 		fmt.Fprintf(&b.out, ` width="%d" height="%d"`, a.Width, a.Height)
@@ -755,12 +800,12 @@ func isExternalURL(value string) bool {
 
 // ---- 封面 ----
 
-func extractCover(zr *zip.Reader, pkg *opfPackage, manifest map[string]manifestItem) ([]byte, string) {
+func extractCover(zr *zip.Reader, pkg *opfPackage, manifest map[string]manifestItem, b *budget) ([]byte, string) {
 	cover := coverItem(pkg, manifest)
 	if cover == nil {
 		return nil, ""
 	}
-	data, err := zipBytes(zr, cover.path)
+	data, err := zipBytes(zr, cover.path, b)
 	if err != nil {
 		return nil, ""
 	}

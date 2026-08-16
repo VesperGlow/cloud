@@ -34,6 +34,12 @@ const maxThumbSource = 64 << 20 // 生成缩略图时允许读取的源文件上
 const maxThumbVideo = 2 << 30   // ffmpeg 抽帧的视频大小上限（2 GiB）
 const thumbMaxDim = 480         // 缩略图最长边
 
+// maxThumbPixels caps the pixel dimensions of sources we decode: a small
+// compressed file (bounded by maxThumbSource) can otherwise expand into
+// gigabytes of bitmap memory during decode (decompression bomb).
+const maxThumbPixels = 40_000_000 // 40 MP（约 160 MB RGBA）
+const maxThumbSide = 30_000       // 单边像素上限（极端长条图）
+
 var videoExts = map[string]bool{
 	".mp4": true, ".webm": true, ".mov": true, ".m4v": true, ".mkv": true,
 	".avi": true, ".ogv": true, ".mpg": true, ".mpeg": true, ".wmv": true, ".flv": true,
@@ -177,10 +183,17 @@ func (s *Server) generateVideoThumb(ctx context.Context, f File) ([]byte, bool) 
 		_ = cmd.Wait()
 		return nil, false
 	}
+	// 输出达到上限说明异常（正常缩略图远小于此）：立即终止 ffmpeg，
+	// 否则它会继续写满 stdout 管道并阻塞到 CommandContext 超时。
+	if len(data) > maxThumbBytes {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, false
+	}
 	if err := cmd.Wait(); err != nil {
 		return nil, false
 	}
-	if len(data) == 0 || len(data) > maxThumbBytes || data[0] != 0xFF || data[1] != 0xD8 {
+	if len(data) == 0 || data[0] != 0xFF || data[1] != 0xD8 {
 		return nil, false
 	}
 	return data, true
@@ -216,7 +229,17 @@ func (s *Server) saveThumbnail(w http.ResponseWriter, r *http.Request) {
 }
 
 // resizeToJPEG 解码任意受支持的图片并把最长边缩到 maxDim，输出 JPEG。
+// 解码前先用 DecodeConfig 检查像素尺寸，拒绝会撑爆内存的超大图。
 func resizeToJPEG(data []byte, maxDim int) ([]byte, error) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 ||
+		int64(cfg.Width)*int64(cfg.Height) > maxThumbPixels ||
+		cfg.Width > maxThumbSide || cfg.Height > maxThumbSide {
+		return nil, errImageTooLarge
+	}
 	src, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return nil, err
@@ -242,6 +265,7 @@ func resizeToJPEG(data []byte, maxDim int) ([]byte, error) {
 }
 
 var errEmptyImage = errors.New("empty image")
+var errImageTooLarge = errors.New("image exceeds pixel limit")
 
 func encodeJPEG(img image.Image) ([]byte, error) {
 	var buf bytes.Buffer

@@ -41,12 +41,13 @@ const maxBlocksPerRequest = 1000
 const maxCompleteBody = 256 << 20
 
 type Server struct {
-	db      *sql.DB
-	storage storage.Storage
-	auth    *auth.Service
-	cfg     config.Config
-	log     *slog.Logger
-	limiter *loginLimiter
+	db       *sql.DB
+	storage  storage.Storage
+	auth     *auth.Service
+	cfg      config.Config
+	log      *slog.Logger
+	limiter  *loginLimiter
+	s3Origin string // S3_PUBLIC_ENDPOINT 的 scheme://host，用于收窄 CSP
 }
 
 type File struct {
@@ -67,7 +68,11 @@ func New(db *sql.DB, store storage.Storage, a *auth.Service, cfg config.Config, 
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{db: db, storage: store, auth: a, cfg: cfg, log: logger, limiter: newLoginLimiter()}
+	s3Origin := ""
+	if u, err := url.Parse(cfg.S3PublicEndpoint); err == nil && u.Host != "" {
+		s3Origin = u.Scheme + "://" + u.Host
+	}
+	return &Server{db: db, storage: store, auth: a, cfg: cfg, log: logger, limiter: newLoginLimiter(), s3Origin: s3Origin}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -79,6 +84,9 @@ func (s *Server) Handler() http.Handler {
 	r.Get("/readyz", s.ready)
 	r.Get("/s/{token}", s.publicShare)
 	r.Route("/api", func(r chi.Router) {
+		r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
+			problem(w, http.StatusNotFound, "api endpoint not found")
+		})
 		r.Post("/auth/login", s.login)
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireAuth)
@@ -128,11 +136,26 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 func (s *Server) securityHeaders(next http.Handler) http.Handler {
+	// CSP 中 S3 直连来源按 S3_PUBLIC_ENDPOINT 收窄；未配置公网 endpoint
+	//（AWS 默认）时保持宽松 https/http，否则浏览器无法直连对象存储。
+	imgSrc, mediaSrc, connectSrc := "'self' data: blob:", "'self' blob:", "'self'"
+	if s.s3Origin != "" {
+		imgSrc += " " + s.s3Origin
+		mediaSrc += " " + s.s3Origin
+		connectSrc += " " + s.s3Origin
+	} else {
+		imgSrc += " https: http:"
+		mediaSrc += " https: http:"
+		connectSrc += " https: http:"
+	}
+	csp := "default-src 'self'; img-src " + imgSrc + "; media-src " + mediaSrc +
+		"; style-src 'self' 'unsafe-inline'; connect-src " + connectSrc +
+		"; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "same-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob: https: http:; media-src 'self' blob: https: http:; style-src 'self' 'unsafe-inline'; connect-src 'self' https: http:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", csp)
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
@@ -142,7 +165,13 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 func (s *Server) originGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
-			if origin := r.Header.Get("Origin"); origin != "" {
+			// 浏览器对所有跨站/同站写请求都会带 Origin；不带 Origin 的
+			// 写请求只可能来自非浏览器客户端，一律拒绝（CSRF 纵深防御，
+			// SameSite=Lax Cookie 之外的第二道闸）。
+			if origin := r.Header.Get("Origin"); origin == "" {
+				problem(w, http.StatusForbidden, "origin required")
+				return
+			} else {
 				base, _ := url.Parse(s.cfg.BaseURL)
 				got, err := url.Parse(origin)
 				if err != nil || !strings.EqualFold(base.Scheme, got.Scheme) || !strings.EqualFold(base.Host, got.Host) {
@@ -582,8 +611,16 @@ func (s *Server) updateDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err = s.db.ExecContext(r.Context(), `UPDATE files SET object_key=?,size=?,mime_type=?,etag=?,updated_at=? WHERE id=?`, key, manifest.Size, documentMime(f.Name), manifest.ID(), now, f.ID); err != nil {
+	// 原子乐观并发控制：etag 条件放进 UPDATE 的 WHERE 子句。两个并发
+	// 编辑者同时保存时，只有先提交者成功；后提交者命中 0 行并收到 409，
+	// 而不是在检查与写入之间被静默覆盖（TOCTOU）。
+	res, err := s.db.ExecContext(r.Context(), `UPDATE files SET object_key=?,size=?,mime_type=?,etag=?,updated_at=? WHERE id=? AND (etag=? OR ?='' OR etag='')`, key, manifest.Size, documentMime(f.Name), manifest.ID(), now, f.ID, in.ETag, in.ETag)
+	if err != nil {
 		problem(w, http.StatusInternalServerError, "document content changed but metadata update failed")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		problem(w, http.StatusConflict, "document changed elsewhere; reopen it before saving")
 		return
 	}
 	updated, _ := s.file(r.Context(), f.ID)
@@ -894,6 +931,9 @@ func (s *Server) publicShare(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Robots-Tag", "noindex, nofollow, noarchive")
+	// 分享 URL 等同于访问凭据，记录每次访问（token 只记前缀掩码），
+	// 便于发现泄露后定位访问来源。
+	s.log.Info("public share served", "file_id", f.ID, "file", f.Name, "token_prefix", token[:min(len(token), 8)])
 	s.serveFileContent(w, r, f, true)
 }
 
@@ -973,13 +1013,18 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 type uploadRecord struct {
-	ID, FileID, ObjectKey, Status string
-	BlockSize, ExpectedSize       int64
+	ID, FileID, ObjectKey, Status, ExpiresAt string
+	BlockSize, ExpectedSize                  int64
+}
+
+func (u uploadRecord) expired(now time.Time) bool {
+	t, err := time.Parse(time.RFC3339Nano, u.ExpiresAt)
+	return err != nil || !t.After(now)
 }
 
 func (s *Server) upload(ctx context.Context, id string) (uploadRecord, error) {
 	var u uploadRecord
-	err := s.db.QueryRowContext(ctx, `SELECT u.id,u.file_id,COALESCE(f.object_key,''),u.block_size,u.expected_size,u.status FROM uploads u JOIN files f ON f.id=u.file_id WHERE u.id=?`, id).Scan(&u.ID, &u.FileID, &u.ObjectKey, &u.BlockSize, &u.ExpectedSize, &u.Status)
+	err := s.db.QueryRowContext(ctx, `SELECT u.id,u.file_id,COALESCE(f.object_key,''),u.block_size,u.expected_size,u.status,u.expires_at FROM uploads u JOIN files f ON f.id=u.file_id WHERE u.id=?`, id).Scan(&u.ID, &u.FileID, &u.ObjectKey, &u.BlockSize, &u.ExpectedSize, &u.Status, &u.ExpiresAt)
 	return u, err
 }
 
@@ -999,7 +1044,7 @@ type uploadBlockResponse struct {
 // verifies every block, so registration is purely a client convenience.
 func (s *Server) uploadBlocks(w http.ResponseWriter, r *http.Request) {
 	u, err := s.upload(r.Context(), chi.URLParam(r, "id"))
-	if err != nil || u.Status != "pending" {
+	if err != nil || u.Status != "pending" || u.expired(time.Now().UTC()) {
 		problem(w, 404, "pending upload not found")
 		return
 	}
@@ -1051,7 +1096,7 @@ func (s *Server) uploadBlocks(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 	u, err := s.upload(r.Context(), chi.URLParam(r, "id"))
-	if err != nil || u.Status != "pending" {
+	if err != nil || u.Status != "pending" || u.expired(time.Now().UTC()) {
 		problem(w, 404, "pending upload not found")
 		return
 	}
@@ -1341,14 +1386,20 @@ func (s *Server) CollectGarbage(ctx context.Context) {
 	keepBlocks := map[string]bool{}
 	var doomedManifests []string
 	for _, ref := range manifests {
-		m, err := s.storage.GetManifest(ctx, ref.Key)
-		if err != nil {
-			s.log.Warn("GC skipped unreadable manifest", "key", ref.Key, "error", err)
+		// 未被任何元数据引用的清单无需解析内容：年龄超过宽限期即可回收。
+		if !referenced[ref.Key] {
+			if ref.LastModified.Before(cutoff) {
+				doomedManifests = append(doomedManifests, ref.Key)
+			}
 			continue
 		}
-		if !referenced[ref.Key] && ref.LastModified.Before(cutoff) {
-			doomedManifests = append(doomedManifests, ref.Key)
-			continue
+		// 被引用的清单必须解析出块列表才能安全回收孤儿块；读取失败时
+		// 中止本轮 GC——其块集合未知，绝不能按孤儿处理（否则瞬时 S3
+		// 错误会演变成被引用文件的内容块被误删）。
+		m, err := s.storage.GetManifest(ctx, ref.Key)
+		if err != nil {
+			s.log.Error("GC aborted: referenced manifest unreadable", "key", ref.Key, "error", err)
+			return
 		}
 		for _, b := range m.Blocks {
 			keepBlocks[b.ID] = true

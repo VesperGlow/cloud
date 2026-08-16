@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"image"
 	"image/jpeg"
 	"image/png"
@@ -43,6 +44,7 @@ type mockStorage struct {
 	blockSize      int64
 	presignErr     error
 	putManifestErr error
+	getManifestErr error
 }
 
 func newMockStorage(blockSize int64) *mockStorage {
@@ -96,6 +98,9 @@ func (m *mockStorage) PutManifest(_ context.Context, mm storage.Manifest) (strin
 	return key, nil
 }
 func (m *mockStorage) GetManifest(_ context.Context, key string) (storage.Manifest, error) {
+	if m.getManifestErr != nil {
+		return storage.Manifest{}, m.getManifestErr
+	}
 	mm, ok := m.manifests[key]
 	if !ok {
 		return storage.Manifest{}, notFoundError()
@@ -362,6 +367,13 @@ func (a *testApp) requestH(method, path string, body any, authenticated bool, he
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	// 浏览器对写请求总是携带 Origin；测试默认模拟同源浏览器（baseURL
+	// 为 http://example.test），需要验证跨源行为的用例显式覆盖该头。
+	if method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions {
+		if _, ok := req.Header["Origin"]; !ok {
+			req.Header.Set("Origin", "http://example.test")
+		}
+	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -394,6 +406,27 @@ func TestRootProtectionAndNameConflict(t *testing.T) {
 	second := a.request("POST", "/api/directories", map[string]any{"parent_id": RootID, "name": "Photos"}, true)
 	if second.Code != 409 {
 		t.Fatalf("duplicate status=%d", second.Code)
+	}
+}
+
+func TestWriteRequestsRequireMatchingOrigin(t *testing.T) {
+	a := newTestApp(t)
+	body := map[string]any{"parent_id": RootID, "name": "OriginTest"}
+	noOrigin := a.requestH("POST", "/api/directories", body, true, map[string]string{"Origin": ""})
+	if noOrigin.Code != http.StatusForbidden {
+		t.Fatalf("write without Origin status=%d", noOrigin.Code)
+	}
+	crossOrigin := a.requestH("POST", "/api/directories", body, true, map[string]string{"Origin": "http://evil.example"})
+	if crossOrigin.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin write status=%d", crossOrigin.Code)
+	}
+	sameOrigin := a.request("POST", "/api/directories", body, true)
+	if sameOrigin.Code != http.StatusCreated {
+		t.Fatalf("same-origin write status=%d: %s", sameOrigin.Code, sameOrigin.Body.String())
+	}
+	// 读请求不受 Origin 限制
+	if got := a.request("GET", "/api/storage/stats", nil, true); got.Code != http.StatusOK {
+		t.Fatalf("GET with no Origin status=%d", got.Code)
 	}
 }
 
@@ -849,6 +882,76 @@ func TestGarbageCollector(t *testing.T) {
 	}
 }
 
+func TestGarbageCollectorAbortsOnUnreadableReferencedManifest(t *testing.T) {
+	a := newTestAppWithBlockSize(t, 8)
+	fa := a.readyFile(t, "a.bin", []byte("AAAAAAAABBBBBBBB"))
+	blockA, blockB := sha256hex([]byte("AAAAAAAA")), sha256hex([]byte("BBBBBBBB"))
+	// 被引用清单读取失败（S3 瞬时错误）时，GC 必须中止而不是把它的
+	// 块当作孤儿回收——否则一次瞬时错误就会删除仍被引用的文件内容。
+	a.store.getManifestErr = errors.New("transient s3 failure")
+	a.srv.CollectGarbage(context.Background())
+	a.store.getManifestErr = nil
+	if _, ok := a.store.manifests[fa.objectKey]; !ok {
+		t.Fatal("referenced manifest must survive an aborted GC")
+	}
+	if _, ok := a.store.blocks[blockA]; !ok {
+		t.Fatal("block A of referenced file must survive an aborted GC")
+	}
+	if _, ok := a.store.blocks[blockB]; !ok {
+		t.Fatal("block B of referenced file must survive an aborted GC")
+	}
+}
+
+func TestDocumentSaveConflictOnStaleEtag(t *testing.T) {
+	a := newTestApp(t)
+	doc := a.readyFile(t, "note.md", []byte("v1"))
+	first := a.request("PUT", "/api/files/"+doc.ID+"/content", map[string]any{"content": "v2", "etag": doc.ETag}, true)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first save=%d: %s", first.Code, first.Body.String())
+	}
+	// 用过期 etag 再保存：必须 409，而不是静默覆盖
+	stale := a.request("PUT", "/api/files/"+doc.ID+"/content", map[string]any{"content": "v3", "etag": doc.ETag}, true)
+	if stale.Code != http.StatusConflict {
+		t.Fatalf("stale etag save=%d, want 409", stale.Code)
+	}
+	// 不带 etag 的保存仍然放行（旧客户端兼容）
+	noEtag := a.request("PUT", "/api/files/"+doc.ID+"/content", map[string]any{"content": "v4"}, true)
+	if noEtag.Code != http.StatusOK {
+		t.Fatalf("no-etag save=%d", noEtag.Code)
+	}
+}
+
+func TestExpiredUploadCannotComplete(t *testing.T) {
+	a := newTestApp(t)
+	u := a.createUpload(t, "expired.bin", 100)
+	// 把 expires_at 改为过去，模拟过期但尚未被定时清理的窗口期
+	if _, err := a.db.Exec(`UPDATE uploads SET expires_at=? WHERE id=?`, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), u.UploadID); err != nil {
+		t.Fatal(err)
+	}
+	body := map[string]any{"blocks": []map[string]any{{"id": strings.Repeat("0", 64), "size": 100}}}
+	if rr := a.request("POST", "/api/uploads/"+u.UploadID+"/complete", body, true); rr.Code != http.StatusNotFound {
+		t.Fatalf("expired complete=%d, want 404: %s", rr.Code, rr.Body.String())
+	}
+	if rr := a.request("POST", "/api/uploads/"+u.UploadID+"/blocks", map[string]any{"blocks": []any{}}, true); rr.Code != http.StatusNotFound {
+		t.Fatalf("expired blocks=%d, want 404", rr.Code)
+	}
+}
+
+func TestUnknownAPIEndpointReturnsJSON404(t *testing.T) {
+	a := newTestApp(t)
+	rr := a.request("GET", "/api/does-not-exist", nil, true)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("unknown api=%d, want 404", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("content-type=%q, want JSON", ct)
+	}
+	// 未知 /api 路径不能回退到 SPA index.html
+	if strings.Contains(rr.Body.String(), "<!doctype html") || strings.Contains(rr.Body.String(), "<html") {
+		t.Fatalf("api 404 must not return the SPA shell: %s", rr.Body.String())
+	}
+}
+
 func TestLegacyObjectsAreMigratedToBlocks(t *testing.T) {
 	a := newTestApp(t)
 	content := []byte("legacy whole object content")
@@ -956,6 +1059,10 @@ func (a *testApp) rawRequest(method, path string, body []byte, authenticated boo
 	req := httptest.NewRequest(method, path, bytes.NewReader(body))
 	if body != nil {
 		req.Header.Set("Content-Type", "application/octet-stream")
+	}
+	// 同源浏览器语义：写请求带 Origin
+	if method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions {
+		req.Header.Set("Origin", "http://example.test")
 	}
 	if authenticated && a.cookie != nil {
 		req.AddCookie(a.cookie)

@@ -21,6 +21,10 @@ func Handler() http.Handler {
 		if path != "" {
 			if f, err := dist.Open(path); err == nil {
 				f.Close()
+				// Vite 产物文件名带内容哈希，可安全地不可变缓存
+				if strings.HasPrefix(path, "assets/") {
+					w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+				}
 				files.ServeHTTP(w, r)
 				return
 			}

@@ -3,7 +3,11 @@ FROM node:24-alpine AS web
 WORKDIR /src
 COPY web/package.json web/package-lock.json ./web/
 RUN cd web && npm ci
-COPY web ./web
+# 精确复制源文件，绝不携带宿主 node_modules（平台相关原生绑定会覆盖
+# 上面 npm ci 安装的 Linux 版本，导致构建失败或产物损坏）
+COPY web/index.html web/vite.config.ts web/tsconfig.json ./web/
+COPY web/src ./web/src
+COPY web/public ./web/public
 COPY internal/webui ./internal/webui
 RUN cd web && npm run build
 

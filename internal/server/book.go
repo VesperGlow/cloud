@@ -55,7 +55,7 @@ func (s *Server) loadBook(ctx context.Context, f File) (*reader.Book, error) {
 		return nil, err
 	}
 	defer rc.Close()
-	book, err := reader.Parse(f.Name, rc, f.Size, fmt.Sprintf("/api/files/%s/book/assets", f.ID))
+	book, err := reader.Parse(f.Name, rc, f.Size, fmt.Sprintf("/api/files/%s/book/assets", f.ID), f.ETag)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +117,8 @@ func (s *Server) bookAsset(w http.ResponseWriter, r *http.Request) {
 	asset := book.Assets[idx]
 	w.Header().Set("Content-Type", asset.ContentType)
 	w.Header().Set("Content-Length", strconv.Itoa(len(asset.Data)))
-	w.Header().Set("Cache-Control", "private, max-age=3600")
+	// 资产内容由清单键（内容哈希）派生，天然不可变，可长期缓存
+	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(asset.Data)
 }
@@ -138,6 +139,7 @@ func (s *Server) bookCover(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", reader.AssetContentType(book.CoverExt))
 	w.Header().Set("Content-Length", strconv.Itoa(len(book.Cover)))
+	// 封面 URL 不带版本参数，不能 immutable；短缓存即可
 	w.Header().Set("Cache-Control", "private, max-age=3600")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(book.Cover)

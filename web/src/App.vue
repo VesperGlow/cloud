@@ -148,7 +148,20 @@ async function saveAccount(){
 }
 
 function folderURL(id:string){return id===ROOT?'/':'/f/'+id}
-async function openFolder(id:string){loading.value=true;try{const [meta,list,stats]=await Promise.all([api<{file:DriveFile;breadcrumbs:DriveFile[]}>(`/api/files/${id}`),api<{items:DriveFile[]}>(`/api/files/${id}/children`),api<StorageStats>('/api/storage/stats')]);if(!suppressHistory&&id!==currentId.value){navActions.value.push({kind:'folder',id:currentId.value});window.history.pushState({cloudNav:true},'')}currentId.value=id;current.value=meta.file;breadcrumbs.value=meta.breadcrumbs;items.value=list.items;storageStats.total_bytes=stats.total_bytes;storageStats.file_count=stats.file_count;selected.value=null;history.replaceState({cloudNav:true},'',folderURL(id))}catch(e){notify((e as Error).message)}finally{loading.value=false}}
+// 导航请求序号：快速连续切换目录时，只接受最后一次请求的响应，
+// 防止较慢的旧响应覆盖新目录的内容（竞态）。
+let folderSeq=0
+async function openFolder(id:string){
+  const seq=++folderSeq
+  loading.value=true
+  try{
+    const [meta,list,stats]=await Promise.all([api<{file:DriveFile;breadcrumbs:DriveFile[]}>(`/api/files/${id}`),api<{items:DriveFile[]}>(`/api/files/${id}/children`),api<StorageStats>('/api/storage/stats')])
+    if(seq!==folderSeq)return
+    if(!suppressHistory&&id!==currentId.value){navActions.value.push({kind:'folder',id:currentId.value});window.history.pushState({cloudNav:true},'')}
+    currentId.value=id;current.value=meta.file;breadcrumbs.value=meta.breadcrumbs;items.value=list.items;storageStats.total_bytes=stats.total_bytes;storageStats.file_count=stats.file_count;selected.value=null;history.replaceState({cloudNav:true},'',folderURL(id))
+  }catch(e){if(seq===folderSeq)notify((e as Error).message)}
+  finally{if(seq===folderSeq)loading.value=false}
+}
 
 // 应用内导航历史：每次进入文件夹/打开弹窗都 pushState，系统返回键先关
 // 弹窗、再逐级返回上一屏，而不是直接退出整个应用。
@@ -179,7 +192,21 @@ async function removeItem(item:DriveFile){const text=item.kind==='directory'?'�
 function showRename(item:DriveFile){selected.value=item;renameValue.value=item.name;openModal('rename')}
 async function saveRename(){if(!selected.value)return;modalBusy.value=true;try{await api(`/api/files/${selected.value.id}`,{method:'PATCH',body:JSON.stringify({name:renameValue.value})});closeModal();await openFolder(currentId.value);notify('已重命名','success')}catch(e){notify((e as Error).message)}finally{modalBusy.value=false}}
 async function showMove(item:DriveFile){selected.value=item;modalBusy.value=true;openModal('move');folders.value=[];try{folders.value=await loadFolderTree()}catch(e){notify((e as Error).message);closeModal()}finally{modalBusy.value=false}}
-async function loadFolderTree():Promise<FolderOption[]>{const result:FolderOption[]=[{id:ROOT,name:'我的文件',depth:0}];const queue=[{id:ROOT,depth:0}];while(queue.length){const node=queue.shift()!;const data=await api<{items:DriveFile[]}>(`/api/files/${node.id}/children`);for(const child of data.items.filter(x=>x.kind==='directory'&&x.id!==selected.value?.id)){result.push({id:child.id,name:child.name,depth:node.depth+1});queue.push({id:child.id,depth:node.depth+1})}}return result}
+async function loadFolderTree():Promise<FolderOption[]>{
+  const result:FolderOption[]=[{id:ROOT,name:'我的文件',depth:0}]
+  const queue=[{id:ROOT,depth:0}]
+  // 受限并发 BFS：同层目录并行拉取，避免大目录树逐目录串行请求
+  while(queue.length){
+    const batch=queue.splice(0,8)
+    const lists=await Promise.all(batch.map(async node=>({node,data:await api<{items:DriveFile[]}>(`/api/files/${node.id}/children`)})))
+    for(const {node,data} of lists){
+      for(const child of data.items.filter(x=>x.kind==='directory'&&x.id!==selected.value?.id)){
+        result.push({id:child.id,name:child.name,depth:node.depth+1});queue.push({id:child.id,depth:node.depth+1})
+      }
+    }
+  }
+  return result
+}
 async function moveTo(parentId:string){if(!selected.value)return;modalBusy.value=true;try{await api(`/api/files/${selected.value.id}`,{method:'PATCH',body:JSON.stringify({parent_id:parentId})});closeModal();await openFolder(currentId.value);notify('已移动','success')}catch(e){notify((e as Error).message)}finally{modalBusy.value=false}}
 function showPreview(item:DriveFile){selected.value=item;openModal('preview')}
 async function showShare(item:DriveFile){selected.value=item;openModal('share');share.active=false;share.url='';share.createdAt='';share.error='';share.copied=false;share.busy=true;try{const data=await api<ShareResponse>(`/api/files/${item.id}/share`);share.active=data.active;share.url=data.url||'';share.createdAt=data.created_at||''}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
@@ -258,7 +285,6 @@ async function saveDocument(){
 }
 function closeEditor(){if(editorDirty.value&&!window.confirm('还有未保存的修改，确定关闭吗？'))return;closeModal()}
 function closeBackdrop(){if(modal.value==='editor')closeEditor();else closeModal()}
-function hideBrokenImage(event:Event){(event.target as HTMLImageElement).hidden=true}
 function setViewMode(mode:'list'|'grid'){viewMode.value=mode;selected.value=null;localStorage.setItem('cloud-view-mode',mode)}
 function toggleSelection(item:DriveFile){selected.value=selected.value?.id===item.id?null:item}
 function clearSelectionFromBlank(event:MouseEvent){

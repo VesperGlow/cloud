@@ -664,7 +664,6 @@ export const ReaderApp = (function () {
 
   function setLoading(message) { els.loading.textContent = message; }
   function fail(message) { els.loading.classList.remove('hidden'); setLoading(message); }
-  function nextFrame() { return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))); }
   function escapeHtml(value) { const div = document.createElement('div'); div.textContent = value; return div.innerHTML; }
 
   function setReaderFontSize(size) {

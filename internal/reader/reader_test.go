@@ -50,7 +50,7 @@ func buildTestEPUB(t *testing.T) []byte {
 
 func TestParseEPUBPipeline(t *testing.T) {
 	fixture := buildTestEPUB(t)
-	book, err := Parse("book.epub", bytes.NewReader(fixture), int64(len(fixture)), "/api/files/f1/book/assets")
+	book, err := Parse("book.epub", bytes.NewReader(fixture), int64(len(fixture)), "/api/files/f1/book/assets", "test-etag")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,8 +78,8 @@ func TestParseEPUBPipeline(t *testing.T) {
 			t.Fatalf("html must not contain %q:\n%s", forbidden, htmlOut)
 		}
 	}
-	if !strings.Contains(htmlOut, `/api/files/f1/book/assets/0" width="10" height="20"`) {
-		t.Fatalf("img not rewritten with dims:\n%s", htmlOut)
+	if !strings.Contains(htmlOut, `/api/files/f1/book/assets/0?v=test-etag" width="10" height="20"`) {
+		t.Fatalf("img not rewritten with dims and version:\n%s", htmlOut)
 	}
 	if len(book.Assets) != 1 || book.Assets[0].Width != 10 || book.Assets[0].Height != 20 {
 		t.Fatalf("assets=%+v", book.Assets)
@@ -91,7 +91,7 @@ func TestParseEPUBPipeline(t *testing.T) {
 
 func TestParseTXTTocAndOffsets(t *testing.T) {
 	text := "第一章 开始\n正文一行\n第二章 继续\n"
-	book, err := Parse("book.txt", bytes.NewReader([]byte(text)), int64(len(text)), "")
+	book, err := Parse("book.txt", bytes.NewReader([]byte(text)), int64(len(text)), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestParseTXTGBKDecode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	book, err := Parse("book.txt", bytes.NewReader(encoded), int64(len(encoded)), "")
+	book, err := Parse("book.txt", bytes.NewReader(encoded), int64(len(encoded)), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,6 +134,45 @@ func TestParseTXTGBKDecode(t *testing.T) {
 	}
 	if len(book.TOC) != 1 || book.TOC[0].Label != "第一章 测试" {
 		t.Fatalf("toc=%+v", book.TOC)
+	}
+}
+
+func TestBudgetEnforcesTotalLimit(t *testing.T) {
+	b := &budget{}
+	if err := b.take(maxDecompressedTotal); err != nil {
+		t.Fatalf("exact-limit take rejected: %v", err)
+	}
+	if err := b.take(1); err == nil {
+		t.Fatal("over-limit take must be rejected")
+	}
+	if err := b.take(0); err != nil {
+		t.Fatalf("zero take rejected: %v", err)
+	}
+}
+
+func TestEPUBRejectsDecompressionBomb(t *testing.T) {
+	// 单个高压缩比条目（重复字节）解压后超过总预算：解析必须报错，
+	// 而不是静默截断或耗尽内存。
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	write := func(name, content string) {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("mimetype", "application/epub+zip")
+	write("META-INF/container.xml", `<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`)
+	write("OEBPS/content.opf", `<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>炸弹</dc:title></metadata><manifest><item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="ch1"/></spine></package>`)
+	write("OEBPS/ch1.xhtml", strings.Repeat("A", maxDecompressedTotal+1))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse("book.epub", bytes.NewReader(buf.Bytes()), int64(buf.Len()), "/api/files/f1/book/assets", "etag"); err == nil {
+		t.Fatal("decompression bomb must be rejected")
 	}
 }
 
