@@ -2,31 +2,26 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { DriveFile } from './api'
 
-// 视频缩略图：先请求持久化缩略图（服务端已存则浏览器长期缓存）；没有就
-// 懒加载抽帧（进入视口附近才生成），抽到后上传持久化，之后刷新/重进目录
-// 都直接命中缓存。失败回退到图标。
+// 视频缩略图：像图片一样直接渲染持久化 URL（内容哈希版本化、浏览器长期
+// 缓存，命中时零闪烁）；首次 404 才懒加载抽帧并上传持久化，抽帧结果当场
+// 显示。失败回退到图标。
 const props = defineProps<{ file: DriveFile }>()
 const emit = defineEmits<{ (e:'failed'):void }>()
 const rootEl = ref<HTMLElement|null>(null)
-const thumb = ref('')
+const captured = ref('') // 本次会话抽到的 dataURL
+const failed = ref(false)
 
 const sessionCache = new Map<string,string>()
 const thumbURL = computed(() => `/api/files/${props.file.id}/thumbnail?v=${encodeURIComponent(props.file.etag || '')}`)
 
 let disposed = false
 let io: IntersectionObserver|null = null
+let started = false
 
 onMounted(() => {
   const cached = sessionCache.get(cacheKey())
-  if (cached) { thumb.value = cached; return }
+  if (cached) { captured.value = cached; return }
   if (disposed) return
-  fetch(thumbURL.value, { credentials: 'same-origin' })
-    .then(r => {
-      if (disposed) return
-      if (r.ok) { thumb.value = thumbURL.value; return }
-      scheduleCapture()
-    })
-    .catch(() => scheduleCapture())
 })
 onBeforeUnmount(() => {
   disposed = true
@@ -36,7 +31,9 @@ onBeforeUnmount(() => {
 
 function cacheKey(){ return props.file.id + ':' + (props.file.etag || '') }
 
-function scheduleCapture(){
+function beginCapture(){
+  if (started || failed.value) return
+  started = true
   if (disposed) return
   if (!('IntersectionObserver' in window)) { capture(); return }
   io = new IntersectionObserver(entries => {
@@ -51,9 +48,9 @@ async function capture(){
   if (disposed) return
   const url = await captureFrame()
   if (disposed) return
-  if (!url) { emit('failed'); return }
+  if (!url) { failed.value = true; emit('failed'); return }
   sessionCache.set(cacheKey(), url)
-  thumb.value = url
+  captured.value = url
   persist(url)
 }
 
@@ -103,19 +100,23 @@ function captureFrame(): Promise<string|null> {
 async function persist(dataURL: string){
   try {
     const blob = await (await fetch(dataURL)).blob()
-    await fetch(`/api/files/${props.file.id}/thumbnail`, {
+    const response = await fetch(`/api/files/${props.file.id}/thumbnail`, {
       method: 'PUT',
       headers: { 'Content-Type': 'image/jpeg' },
       body: blob,
       credentials: 'same-origin',
     })
-  } catch { /* 持久化失败不影响本次展示，下次进入再试 */ }
+    if (!response.ok) console.warn('视频缩略图持久化失败', response.status)
+  } catch (error) {
+    console.warn('视频缩略图持久化失败', error)
+  }
 }
 </script>
 
 <template>
   <div ref="rootEl" class="video-thumb">
-    <img v-if="thumb" :src="thumb" alt="" loading="lazy">
-    <slot v-else />
+    <img v-if="!captured && !failed" :src="thumbURL" alt="" loading="lazy" @error="beginCapture">
+    <img v-if="captured" :src="captured" alt="" loading="lazy">
+    <slot v-if="failed && !captured" />
   </div>
 </template>
