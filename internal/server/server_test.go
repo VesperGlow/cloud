@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -1123,5 +1125,35 @@ func TestThumbnails(t *testing.T) {
 	txt := a.readyFile(t, "notes.txt", []byte("hello"))
 	if rr := a.request("GET", "/api/files/"+txt.ID+"/thumbnail", nil, true); rr.Code != http.StatusNotFound {
 		t.Fatalf("txt thumb=%d", rr.Code)
+	}
+}
+
+func TestVideoThumbnailWithFFmpeg(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not available")
+	}
+	a := newTestApp(t)
+	// 用 ffmpeg 现场生成一段 1 秒测试视频
+	tmp := t.TempDir() + "/test.mp4"
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "testsrc=size=160x90:rate=10", "-t", "1", "-pix_fmt", "yuv420p", tmp)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("ffmpeg fixture failed: %v %s", err, out)
+	}
+	data, err := os.ReadFile(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := a.readyFile(t, "clip.mp4", data)
+	rr := a.request("GET", "/api/files/"+f.ID+"/thumbnail", nil, true)
+	if rr.Code != http.StatusOK || rr.Header().Get("Content-Type") != "image/jpeg" {
+		t.Fatalf("video thumb=%d type=%q", rr.Code, rr.Header().Get("Content-Type"))
+	}
+	if !bytes.HasPrefix(rr.Body.Bytes(), []byte{0xFF, 0xD8}) {
+		t.Fatalf("video thumb is not a JPEG: % x", rr.Body.Bytes()[:4])
+	}
+	// 第二次应直接命中持久化对象
+	if again := a.request("GET", "/api/files/"+f.ID+"/thumbnail", nil, true); again.Code != http.StatusOK || !bytes.Equal(again.Body.Bytes(), rr.Body.Bytes()) {
+		t.Fatal("persisted video thumbnail not served consistently")
 	}
 }

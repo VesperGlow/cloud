@@ -16,7 +16,7 @@ COPY --from=web /src/internal/webui/dist ./internal/webui/dist
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/cloud ./cmd/server
 
 FROM alpine:3.22
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache ca-certificates tzdata ffmpeg \
     && addgroup -S -g 10001 cloud \
     && adduser -S -D -H -u 10001 -G cloud cloud \
     && mkdir -p /data \

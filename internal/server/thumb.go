@@ -6,13 +6,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"image"
 	"image/jpeg"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/VesperGlow/cloud/internal/storage"
 	"github.com/go-chi/chi/v5"
@@ -21,13 +25,22 @@ import (
 	_ "golang.org/x/image/webp"
 )
 
-// 持久化缩略图：图片与 EPUB 封面由服务端按需生成、视频由前端抽帧后上传，
+// 持久化缩略图：图片与 EPUB 封面由 Go 重采样、视频由 ffmpeg 抽帧，
 // 统一存入 S3 的 thumbs/ 前缀（内容寻址、条件写入），前端用带 etag 的
 // 不可变 URL 请求，浏览器可长期缓存，刷新/重进目录不再重新加载。
 
 const maxThumbBytes = 512 << 10 // 缩略图对象上限
 const maxThumbSource = 64 << 20 // 生成缩略图时允许读取的源文件上限
+const maxThumbVideo = 2 << 30   // ffmpeg 抽帧的视频大小上限（2 GiB）
 const thumbMaxDim = 480         // 缩略图最长边
+
+var videoExts = map[string]bool{
+	".mp4": true, ".webm": true, ".mov": true, ".m4v": true, ".mkv": true,
+	".avi": true, ".ogv": true, ".mpg": true, ".mpeg": true, ".wmv": true, ".flv": true,
+}
+
+// ffmpeg 抽帧全局并发上限：目录里多个视频首次生成时不至于打满 CPU/磁盘。
+var videoThumbSlots = make(chan struct{}, 2)
 
 // thumbKey 由清单键（内容哈希）派生，内容不变则缩略图键不变。
 func (s *Server) thumbKey(f File) string {
@@ -76,8 +89,9 @@ func (s *Server) thumbnail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) generateThumb(ctx context.Context, f File) ([]byte, bool) {
-	switch strings.ToLower(filepath.Ext(f.Name)) {
-	case ".epub":
+	ext := strings.ToLower(filepath.Ext(f.Name))
+	switch {
+	case ext == ".epub":
 		book, err := s.loadBook(ctx, f)
 		if err != nil || len(book.Cover) == 0 {
 			return nil, false
@@ -87,7 +101,7 @@ func (s *Server) generateThumb(ctx context.Context, f File) ([]byte, bool) {
 		}
 		// 封面解码不了（如 SVG）就直接用原始字节，至少是可缓存的稳定 URL
 		return book.Cover, true
-	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp":
+	case ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif" || ext == ".webp" || ext == ".bmp":
 		var raw []byte
 		var err error
 		if storage.IsManifestKey(f.objectKey) {
@@ -103,8 +117,73 @@ func (s *Server) generateThumb(ctx context.Context, f File) ([]byte, bool) {
 			return nil, false
 		}
 		return resized, true
+	case videoExts[ext]:
+		return s.generateVideoThumb(ctx, f)
 	}
 	return nil, false
+}
+
+// generateVideoThumb 用 ffmpeg 在视频第 1 秒处抽一帧缩略 JPEG。视频会
+// 先流式落到临时文件（保证 moov 在文件尾的 MP4 也能正常 seek），抽帧后
+// 立即删除；生成结果持久化到 thumbs/，每个内容只付一次下载成本。
+func (s *Server) generateVideoThumb(ctx context.Context, f File) ([]byte, bool) {
+	if f.Size <= 0 || f.Size > maxThumbVideo {
+		return nil, false
+	}
+	if _, err := exec.LookPath(s.cfg.FFmpegPath); err != nil {
+		return nil, false // 无 ffmpeg：回退前端抽帧上传
+	}
+	select {
+	case videoThumbSlots <- struct{}{}:
+		defer func() { <-videoThumbSlots }()
+	case <-ctx.Done():
+		return nil, false
+	}
+	rc, err := s.storage.Open(ctx, f.objectKey)
+	if err != nil {
+		return nil, false
+	}
+	defer rc.Close()
+	tmp, err := os.CreateTemp("", "cloud-thumb-*"+filepath.Ext(f.Name))
+	if err != nil {
+		return nil, false
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	if _, err := io.Copy(tmp, rc); err != nil {
+		return nil, false
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, false
+	}
+	genCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(genCtx, s.cfg.FFmpegPath,
+		"-hide_banner", "-loglevel", "error",
+		"-ss", "1", "-i", tmp.Name(),
+		"-frames:v", "1",
+		"-vf", fmt.Sprintf("scale='min(%d,iw)':-2", thumbMaxDim),
+		"-f", "image2", "-")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, false
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, false
+	}
+	data, err := io.ReadAll(io.LimitReader(stdout, maxThumbBytes+1))
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, false
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, false
+	}
+	if len(data) == 0 || len(data) > maxThumbBytes || data[0] != 0xFF || data[1] != 0xD8 {
+		return nil, false
+	}
+	return data, true
 }
 
 // saveThumbnail PUT：接收前端抽帧生成的视频缩略图（小 JPEG），落盘到

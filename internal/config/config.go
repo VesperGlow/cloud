@@ -29,6 +29,7 @@ type Config struct {
 	BlockSize        int64
 	UploadExpires    time.Duration
 	GCInterval       time.Duration
+	FFmpegPath       string
 }
 
 func Load() (Config, error) {
@@ -44,6 +45,10 @@ func Load() (Config, error) {
 		S3Bucket:         os.Getenv("S3_BUCKET"),
 		S3AccessKey:      os.Getenv("S3_ACCESS_KEY"),
 		S3SecretKey:      os.Getenv("S3_SECRET_KEY"),
+		FFmpegPath:       os.Getenv("FFMPEG_PATH"),
+	}
+	if c.FFmpegPath == "" {
+		c.FFmpegPath = "ffmpeg"
 	}
 	var err error
 	if c.CookieSecure, err = boolEnv("COOKIE_SECURE", strings.HasPrefix(c.BaseURL, "https://")); err != nil {

@@ -2,17 +2,20 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { DriveFile } from './api'
 
-// 视频缩略图：像图片一样直接渲染持久化 URL（内容哈希版本化、浏览器长期
-// 缓存，命中时零闪烁）；首次 404 才懒加载抽帧并上传持久化，抽帧结果当场
-// 显示。失败回退到图标。
+// 视频缩略图：直接渲染持久化 URL（服务端 ffmpeg 生成/前端上传过，浏览器
+// 长期缓存，命中时秒出）；加载期间显示占位符号、成功后盖住，不再出现
+// "裂图"。404 才走前端抽帧兜底并上传持久化。
 const props = defineProps<{ file: DriveFile }>()
 const emit = defineEmits<{ (e:'failed'):void }>()
 const rootEl = ref<HTMLElement|null>(null)
 const captured = ref('') // 本次会话抽到的 dataURL
 const failed = ref(false)
+const erroring = ref(false)
+const loaded = ref(false)
 
 const sessionCache = new Map<string,string>()
 const thumbURL = computed(() => `/api/files/${props.file.id}/thumbnail?v=${encodeURIComponent(props.file.etag || '')}`)
+const src = computed(() => captured.value || thumbURL.value)
 
 let disposed = false
 let io: IntersectionObserver|null = null
@@ -31,6 +34,12 @@ onBeforeUnmount(() => {
 
 function cacheKey(){ return props.file.id + ':' + (props.file.etag || '') }
 
+function onError(){
+  if (captured.value || failed.value) return
+  erroring.value = true
+  beginCapture()
+}
+
 function beginCapture(){
   if (started || failed.value) return
   started = true
@@ -48,9 +57,10 @@ async function capture(){
   if (disposed) return
   const url = await captureFrame()
   if (disposed) return
-  if (!url) { failed.value = true; emit('failed'); return }
+  if (!url) { failed.value = true; erroring.value = false; emit('failed'); return }
   sessionCache.set(cacheKey(), url)
   captured.value = url
+  erroring.value = false
   persist(url)
 }
 
@@ -115,8 +125,7 @@ async function persist(dataURL: string){
 
 <template>
   <div ref="rootEl" class="video-thumb">
-    <img v-if="!captured && !failed" :src="thumbURL" alt="" loading="lazy" @error="beginCapture">
-    <img v-if="captured" :src="captured" alt="" loading="lazy">
-    <slot v-if="failed && !captured" />
+    <span class="thumb-fallback" :class="{ hidden: loaded && !failed }"><slot /></span>
+    <img v-if="!failed && !erroring" :src="src" alt="" loading="lazy" @load="loaded = true" @error="onError">
   </div>
 </template>
