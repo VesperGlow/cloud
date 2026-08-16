@@ -395,6 +395,31 @@ export const ReaderApp = (function () {
       state.restoreRatio = null;
     }
     goToPage(state, state.currentPage);
+    watchImages(state.segments);
+  }
+
+  // 图片是异步加载的：measure() 测列数时未加载的图没有内在尺寸，
+  // 列数可能偏少；图片加载完成后内容会溢出段底（残影）。监听所有
+  // 未完成图片，加载完毕防抖重排一次。
+  let imageRelayoutTimer = 0;
+  function watchImages(segments) {
+    const imgs = Array.from(segments.querySelectorAll('img'));
+    let pending = 0;
+    const scheduleRelayout = () => {
+      window.clearTimeout(imageRelayoutTimer);
+      imageRelayoutTimer = window.setTimeout(() => { if (active) relayoutActive(); }, 200);
+    };
+    for (const img of imgs) {
+      if (img.complete && img.naturalWidth > 0) continue;
+      pending++;
+      const done = () => {
+        pending--;
+        if (pending <= 0) scheduleRelayout();
+      };
+      img.addEventListener('load', done, { once: true });
+      img.addEventListener('error', done, { once: true });
+    }
+    if (pending > 0) scheduleRelayout(); // 兜底：个别事件丢失也重排一次
   }
 
   function measure(state) {
@@ -413,7 +438,10 @@ export const ReaderApp = (function () {
       node.style.boxSizing = 'border-box';
       node.style.width = `${width}px`;
       node.style.height = `${height}px`;
-      node.style.padding = `60px ${sidePad}px 24px`;
+      const padTop = 60, padBottom = 24;
+      node.style.padding = `${padTop}px ${sidePad}px ${padBottom}px`;
+      // 供 CSS 计算图片高度上限（= 栏高 = 内容盒高），与 padding 严格同步
+      node.style.setProperty('--reader-pad-y', `${padTop + padBottom}px`);
       node.style.columnWidth = `${Math.max(1, width - 2 * sidePad)}px`;
       node.style.columnGap = `${2 * sidePad}px`;
       node.style.columnFill = 'auto';
