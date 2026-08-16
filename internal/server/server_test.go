@@ -8,6 +8,9 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"image"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -163,6 +166,13 @@ func (m *mockStorage) ReadFile(ctx context.Context, key string, limit int64) ([]
 func (m *mockStorage) PutObject(_ context.Context, key, _ string, data []byte) (storage.ObjectInfo, error) {
 	m.raw[key] = append([]byte(nil), data...)
 	return storage.ObjectInfo{Size: int64(len(data)), ETag: `"etag"`}, nil
+}
+func (m *mockStorage) PutImmutable(_ context.Context, key, _ string, data []byte) error {
+	if _, ok := m.raw[key]; ok {
+		return nil // 内容寻址对象已存在：视为成功
+	}
+	m.raw[key] = append([]byte(nil), data...)
+	return nil
 }
 func (m *mockStorage) OpenRaw(_ context.Context, key string) (io.ReadCloser, error) {
 	data, ok := m.raw[key]
@@ -916,6 +926,43 @@ func fakePNG(w, h int) []byte {
 	return data
 }
 
+func realPNG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for i := range img.Pix {
+		img.Pix[i] = 0x88
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func realJPEG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 80}); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func (a *testApp) rawRequest(method, path string, body []byte, authenticated bool) *httptest.ResponseRecorder {
+	a.t.Helper()
+	req := httptest.NewRequest(method, path, bytes.NewReader(body))
+	if body != nil {
+		req.Header.Set("Content-Type", "application/octet-stream")
+	}
+	if authenticated && a.cookie != nil {
+		req.AddCookie(a.cookie)
+	}
+	rr := httptest.NewRecorder()
+	a.handler.ServeHTTP(rr, req)
+	return rr
+}
+
 func buildEPUB(t *testing.T) []byte {
 	t.Helper()
 	buf := &bytes.Buffer{}
@@ -932,7 +979,7 @@ func buildEPUB(t *testing.T) []byte {
 	write("OEBPS/content.opf", `<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>测试书</dc:title><meta name="cover" content="cover-img"/></metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/><item id="cover-img" href="img/cover.png" media-type="image/png"/><item id="fig" href="img/fig.png" media-type="image/png"/></manifest><spine><itemref idref="ch1"/></spine></package>`)
 	write("OEBPS/nav.xhtml", `<html xmlns="http://www.w3.org/1999/xhtml"><body><nav epub:type="toc"><ol><li><a href="ch1.xhtml#sec1">第一章</a></li></ol></nav></body></html>`)
 	write("OEBPS/ch1.xhtml", `<html xmlns="http://www.w3.org/1999/xhtml"><body><h1 id="sec1">第一章 开始</h1><p>你好世界</p><script>alert(1)</script><p><img src="img/fig.png" alt="插图"/></p></body></html>`)
-	write("OEBPS/img/cover.png", string(fakePNG(300, 400)))
+	write("OEBPS/img/cover.png", string(realPNG(t, 300, 400)))
 	write("OEBPS/img/fig.png", string(fakePNG(10, 20)))
 	if err := zw.Close(); err != nil {
 		t.Fatal(err)
@@ -1021,10 +1068,60 @@ func TestBookEndpointsEPUB(t *testing.T) {
 		t.Fatalf("asset=%d type=%q bytes=%d", asset.Code, asset.Header().Get("Content-Type"), asset.Body.Len())
 	}
 	cover := a.request("GET", "/api/files/"+f.ID+"/book/cover", nil, true)
-	if cover.Code != http.StatusOK || cover.Header().Get("Content-Type") != "image/png" || cover.Body.Len() != 33 {
+	if cover.Code != http.StatusOK || cover.Header().Get("Content-Type") != "image/png" || cover.Body.Len() == 0 {
 		t.Fatalf("cover=%d type=%q bytes=%d", cover.Code, cover.Header().Get("Content-Type"), cover.Body.Len())
 	}
 	if missing := a.request("GET", "/api/files/"+f.ID+"/book/assets/9", nil, true); missing.Code != http.StatusNotFound {
 		t.Fatalf("missing asset=%d", missing.Code)
+	}
+}
+
+func TestThumbnails(t *testing.T) {
+	a := newTestApp(t)
+
+	// 图片：服务端生成 JPEG 缩略图并持久化到 S3（内容寻址），缓存头可长期缓存。
+	photo := a.readyFile(t, "photo.png", realPNG(t, 640, 320))
+	rr := a.request("GET", "/api/files/"+photo.ID+"/thumbnail", nil, true)
+	if rr.Code != http.StatusOK || rr.Header().Get("Content-Type") != "image/jpeg" {
+		t.Fatalf("thumb=%d type=%q", rr.Code, rr.Header().Get("Content-Type"))
+	}
+	if !bytes.HasPrefix(rr.Body.Bytes(), []byte{0xFF, 0xD8}) {
+		t.Fatalf("thumb is not a JPEG: % x", rr.Body.Bytes()[:4])
+	}
+	if cc := rr.Header().Get("Cache-Control"); !strings.Contains(cc, "immutable") {
+		t.Fatalf("cache-control=%q", cc)
+	}
+	// 第二次请求应直接命中已落盘的缩略图对象
+	if again := a.request("GET", "/api/files/"+photo.ID+"/thumbnail", nil, true); again.Code != http.StatusOK || !bytes.Equal(again.Body.Bytes(), rr.Body.Bytes()) {
+		t.Fatal("cached thumbnail not served consistently")
+	}
+
+	// 视频：前端抽帧后 PUT 上传，之后 GET 命中；非 JPEG 拒绝。
+	video := a.readyFile(t, "clip.mp4", []byte("video-bytes"))
+	if missing := a.request("GET", "/api/files/"+video.ID+"/thumbnail", nil, true); missing.Code != http.StatusNotFound {
+		t.Fatalf("missing video thumb=%d", missing.Code)
+	}
+	thumb := realJPEG(t, 48, 27)
+	if put := a.rawRequest("PUT", "/api/files/"+video.ID+"/thumbnail", thumb, true); put.Code != http.StatusNoContent {
+		t.Fatalf("put thumb=%d: %s", put.Code, put.Body.String())
+	}
+	if got := a.request("GET", "/api/files/"+video.ID+"/thumbnail", nil, true); got.Code != http.StatusOK || !bytes.Equal(got.Body.Bytes(), thumb) {
+		t.Fatalf("stored video thumb=%d", got.Code)
+	}
+	if bad := a.rawRequest("PUT", "/api/files/"+video.ID+"/thumbnail", []byte("not-a-jpeg"), true); bad.Code != http.StatusBadRequest {
+		t.Fatalf("bad thumb accepted: %d", bad.Code)
+	}
+
+	// EPUB：缩略图 = 缩小后的内嵌封面。
+	epub := a.readyFile(t, "book.epub", buildEPUB(t))
+	et := a.request("GET", "/api/files/"+epub.ID+"/thumbnail", nil, true)
+	if et.Code != http.StatusOK || !bytes.HasPrefix(et.Body.Bytes(), []byte{0xFF, 0xD8}) {
+		t.Fatalf("epub thumb=%d", et.Code)
+	}
+
+	// 无封面/不支持的类型返回 404，前端回退原图或图标。
+	txt := a.readyFile(t, "notes.txt", []byte("hello"))
+	if rr := a.request("GET", "/api/files/"+txt.ID+"/thumbnail", nil, true); rr.Code != http.StatusNotFound {
+		t.Fatalf("txt thumb=%d", rr.Code)
 	}
 }

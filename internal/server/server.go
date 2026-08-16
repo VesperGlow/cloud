@@ -101,6 +101,8 @@ func (s *Server) Handler() http.Handler {
 			r.Get("/files/{id}/book/cover", s.bookCover)
 			r.Get("/files/{id}/book/progress", s.bookProgress)
 			r.Put("/files/{id}/book/progress", s.saveBookProgress)
+			r.Get("/files/{id}/thumbnail", s.thumbnail)
+			r.Put("/files/{id}/thumbnail", s.saveThumbnail)
 			r.Get("/files/{id}/share", s.getShare)
 			r.Post("/files/{id}/share", s.createShare)
 			r.Delete("/files/{id}/share", s.revokeShare)

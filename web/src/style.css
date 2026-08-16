@@ -311,3 +311,7 @@ body.reader-open .storage-bar i{animation:none}
 .video-thumb{position:relative;width:100%;height:100%}
 .video-thumb img{width:100%;height:100%;object-fit:cover}
 .file-icon .video-thumb img{position:absolute;inset:0}
+
+/* 视频缩略图占位居中：wrapper 用 grid 居中占位符号，img 绝对定位铺满 */
+.video-thumb{position:relative;display:grid;place-items:center;width:100%;height:100%}
+.video-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}

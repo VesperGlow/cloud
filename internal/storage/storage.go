@@ -63,6 +63,9 @@ type Storage interface {
 	DeleteObject(context.Context, string) error
 	PresignGetObject(context.Context, string, string, string, bool, time.Duration) (string, error)
 	ListPrefix(context.Context, string) ([]ObjectRef, error)
+	// PutImmutable stores a content-addressed derived object (thumbnail
+	// cache); an existing object is never overwritten.
+	PutImmutable(context.Context, string, string, []byte) error
 }
 
 type S3 struct {
@@ -265,6 +268,13 @@ func IsNotFound(err error) bool {
 		}
 	}
 	return false
+}
+
+// PutImmutable stores a content-addressed derived object (thumbnail cache);
+// concurrent identical uploads race harmlessly and existing objects are
+// never overwritten.
+func (s *S3) PutImmutable(ctx context.Context, key, mime string, data []byte) error {
+	return s.putConditional(ctx, key, mime, data)
 }
 
 // DeleteObject is idempotent: deleting an already-absent key is not an error.
