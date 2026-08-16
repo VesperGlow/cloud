@@ -440,8 +440,10 @@ export const ReaderApp = (function () {
       node.style.height = `${height}px`;
       const padTop = 60, padBottom = 24;
       node.style.padding = `${padTop}px ${sidePad}px ${padBottom}px`;
-      // 供 CSS 计算图片高度上限（= 栏高 = 内容盒高），与 padding 严格同步
+      // 供 CSS 计算图片高度上限：栏高的精确像素值（图片常被包在 <p> 里，
+      // 包含块高度为 auto，百分比 max-height 会被忽略，必须用像素值）
       node.style.setProperty('--reader-pad-y', `${padTop + padBottom}px`);
+      node.style.setProperty('--reader-col-height', `${height - padTop - padBottom}px`);
       node.style.columnWidth = `${Math.max(1, width - 2 * sidePad)}px`;
       node.style.columnGap = `${2 * sidePad}px`;
       node.style.columnFill = 'auto';

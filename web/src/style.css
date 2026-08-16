@@ -260,13 +260,14 @@ body.reader-open{overflow:hidden}
 .book-content h1,.book-content h2,.book-content h3,.book-content h4{font-family:Georgia,"Noto Serif SC",serif;line-height:1.35;margin:.4em 0 .7em;break-inside:avoid}
 .book-content p{margin:0;text-indent:2em}
 .book-content blockquote,.book-content pre,.book-content figure,.book-content table,.book-content li{margin:.2em 0 .3em}
-/* 图片/插画：高度上限 = 栏高（内容盒高，JS 通过 --reader-pad-y 同步
-   padding），绝不超过一栏，否则会溢出栏底覆盖到下一栏（翻页后残影）；
-   独立成块避免 inline 行盒的跨栏怪行为；figure 内的图再为题注让出空间，
-   保证 figure 整体也不超过一栏 */
-.book-content img,.book-content svg,.book-content video{max-width:100%;max-height:calc(100% - var(--reader-pad-y,84px));object-fit:contain;break-inside:avoid;display:block;margin:0 auto}
-.book-content figure img,.book-content figure svg,.book-content figure video{max-height:calc(100% - var(--reader-pad-y,84px) - 2em)}
-.book-content figure{max-height:calc(100% - var(--reader-pad-y,84px));margin:0 auto;text-align:center}
+/* 图片/插画：高度上限 = 栏高。img 常被清洗器包在 <p> 里（包含块高度
+   auto，百分比 max-height 会被忽略），因此用 JS 直接注入栏高像素值
+   （--reader-col-height），任何浏览器语义下都精确不超过一栏；height:auto
+   让 width/height 属性只提供宽高比，避免超高变形。独立成块避免 inline
+   行盒的跨栏怪行为；figure 内的图再为题注让出空间。 */
+.book-content img,.book-content svg,.book-content video{max-width:100%;max-height:var(--reader-col-height,calc(100% - var(--reader-pad-y,84px)));height:auto;object-fit:contain;break-inside:avoid;display:block;margin:0 auto}
+.book-content figure img,.book-content figure svg,.book-content figure video{max-height:calc(var(--reader-col-height,calc(100% - var(--reader-pad-y,84px))) - 2em)}
+.book-content figure{max-height:var(--reader-col-height,calc(100% - var(--reader-pad-y,84px)));margin:0 auto;text-align:center}
 .book-content figcaption{font-size:.85em;color:var(--muted,#827a6f);margin:.4em 0 0}
 .book-content figure,.book-content table,.book-content pre{break-inside:avoid}
 .book-content table{max-width:100%;border-collapse:collapse}
