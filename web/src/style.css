@@ -317,3 +317,66 @@ body.reader-open .storage-bar i{animation:none}
 .thumb-fallback{position:relative;z-index:0;transition:opacity .18s}
 .thumb-fallback.hidden{opacity:0}
 .video-thumb img{z-index:1}
+
+/* ===== File browser layout: no single-item sidebar, compact responsive header ===== */
+.app-shell{grid-template-columns:1fr;grid-template-rows:66px 1fr}
+.content{width:min(100%,1600px);margin:0 auto;padding:34px clamp(20px,3vw,48px) 80px}
+.drop-zone{inset:66px 0 0}
+.content-head{align-items:flex-end;margin-bottom:26px}
+.folder-heading{min-width:0}
+.title-row{margin:7px 0 7px}
+.title-row h1{font-size:32px}
+.title-row .view-switch{margin-left:8px}
+.folder-meta{display:flex;align-items:center;gap:9px;color:#8492a6!important}
+.folder-meta i{width:3px;height:3px;border-radius:50%;background:#cbd5e1}
+.desktop-create-actions{display:flex;gap:10px}
+.create-menu{display:none;position:relative}
+.create-menu summary{display:flex;align-items:center;justify-content:center;min-height:42px;list-style:none;user-select:none}
+.create-menu summary::-webkit-details-marker{display:none}
+.create-menu-popover{position:absolute;z-index:12;top:calc(100% + 8px);left:0;width:218px;padding:7px;border:1px solid #dbe3ee;border-radius:13px;background:#fff;box-shadow:0 18px 45px #1e293b22}
+.create-menu-popover button{display:flex!important;align-items:center;gap:11px;width:100%;padding:10px;border:0;border-radius:9px;background:transparent;color:#334155;text-align:left}
+.create-menu-popover button:hover{background:#eef4fb;color:#1d4ed8}
+.create-menu-popover button>span{display:grid;place-items:center;flex:0 0 auto;width:34px;height:34px;border-radius:9px;background:#eef4fb;color:#5278bd;font-size:18px}
+.create-menu-popover button>div{display:flex;flex-direction:column;gap:2px}
+.create-menu-popover b{font-size:12px}.create-menu-popover small{color:#94a3b8;font-size:10px}
+.row-menu{display:none}
+
+@media(max-width:850px){
+  .app-shell{grid-template-rows:60px 1fr}
+  .content{padding:18px 14px 80px}
+  .content-head{gap:14px;margin-bottom:16px}
+  .folder-heading{width:100%}
+  .breadcrumbs{margin-bottom:7px}
+  .title-row{width:100%;margin:0 0 7px}
+  .title-row h1{font-size:27px}
+  .title-row .view-switch{margin-left:auto}
+  .folder-meta{gap:7px;font-size:12px!important}
+  .actions{display:grid;grid-template-columns:1fr 1fr;width:100%;gap:8px}
+  .desktop-create-actions{display:none}
+  .create-menu{display:block}
+  .create-menu summary,.upload-action{width:100%;min-height:42px}
+  .create-menu-popover{top:calc(100% + 7px);width:min(250px,calc(100vw - 28px))}
+
+  .file-table{overflow:visible;border:0;background:transparent;box-shadow:none}
+  .table-head{display:none}
+  .file-row{position:relative;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;min-width:0;min-height:70px;margin-bottom:8px;padding:9px 8px 9px 10px;border:1px solid var(--line)!important;border-radius:13px;background:#fff;box-shadow:0 5px 18px #33415508}
+  .file-row>span,.row-actions{display:none}
+  .file-name{min-width:0}
+  .file-name strong{font-size:13px}
+  .row-menu{display:block;position:relative;align-self:center}
+  .row-menu summary{display:grid;place-items:center;width:42px;height:42px;list-style:none;border-radius:10px;color:#64748b;font-weight:800;letter-spacing:.08em}
+  .row-menu summary::-webkit-details-marker{display:none}
+  .row-menu[open] summary{background:#eef4fb;color:#2563eb}
+  .row-menu-popover{position:absolute;z-index:11;top:calc(100% + 5px);right:0;display:grid;grid-template-columns:1fr 1fr;width:190px;padding:7px;border:1px solid #dbe3ee;border-radius:12px;background:#fff;box-shadow:0 18px 45px #1e293b25}
+  .row-menu-popover button{min-height:38px;border:0;border-radius:8px;background:transparent;color:#405169;font-size:11px;font-weight:700}
+  .row-menu-popover button:hover{background:#eef4fb;color:#2563eb}
+  .row-menu-popover button.danger{color:#dc2626}
+}
+
+@media(max-width:520px){
+  .topbar .logo>span:last-child{display:none}
+  .folder-meta span:nth-of-type(2),.folder-meta i:nth-of-type(2){display:none}
+  .file-grid{gap:10px}
+  .card-preview{height:104px}
+  .card-info{padding:11px 11px 12px}
+}

@@ -4,20 +4,22 @@ import { marked } from 'marked'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api } from './api'
 import type { DriveFile } from './api'
+import AppTopbar from './components/AppTopbar.vue'
+import FileBrowserHeader from './components/FileBrowserHeader.vue'
+import FileGrid from './components/FileGrid.vue'
+import FileTable from './components/FileTable.vue'
+import MediaPreview from './components/MediaPreview.vue'
+import UploadPanel from './components/UploadPanel.vue'
+import { isBook, isEditable, isImage, isMedia } from './fileTypes'
+import { formatDate, formatSize } from './format'
 import ReaderView from './Reader.vue'
-import VideoThumb from './VideoThumb.vue'
+import type { FolderOption, ProfileResponse, ShareResponse, StorageStats, UploadTask } from './types'
 
 const ROOT = '00000000-0000-0000-0000-000000000000'
 const FILE_CONCURRENCY = 3
 const BLOCK_PUT_CONCURRENCY = 4
 const BLOCK_REGISTER_BATCH = 1000
 const COMPLETE_RETRIES = 3
-
-interface UploadTask { id:string; file:File; progress:number; status:'queued'|'uploading'|'done'|'failed'|'cancelled'; error:string; cancelled:boolean; uploadId?:string; requests:XMLHttpRequest[] }
-interface FolderOption { id:string; name:string; depth:number }
-interface ShareResponse { active:boolean; url?:string; created_at?:string }
-interface ProfileResponse { username:string; has_avatar:boolean }
-interface StorageStats { total_bytes:number; file_count:number }
 
 const user = ref<string|null>(null)
 const hasAvatar = ref(false)
@@ -50,33 +52,15 @@ const viewMode = ref<'list'|'grid'>('list')
 let activeUploads = 0
 let toastTimer = 0
 
-const pathTitle = computed(() => breadcrumbs.value.map(x => x.name || '我的文件').join(' / '))
 const unfinished = computed(() => tasks.filter(t => t.status !== 'done' && t.status !== 'cancelled'))
 const editorDirty = computed(() => editor.content !== editor.original || editor.name !== editor.originalName)
 const editorBytes = computed(() => new Blob([editor.content]).size)
 const editorIsMarkdown = computed(() => /\.(md|markdown)$/i.test(editor.name))
 const renderedMarkdown = computed(() => DOMPurify.sanitize(marked.parse(editor.content, { async:false }) as string))
 const avatarURL = computed(() => `/api/profile/avatar?v=${avatarVersion.value}`)
-const galleryItems = computed(() => items.value.filter(item => isImage(item)||isVideo(item)))
-const galleryIndex = computed(() => selected.value ? galleryItems.value.findIndex(item => item.id===selected.value?.id) : -1)
-const hasGalleryNavigation = computed(() => galleryIndex.value>=0&&galleryItems.value.length>1)
-const previewDownloadLabel = computed(() => selected.value ? isImage(selected.value)?'下载原图':isVideo(selected.value)?'下载视频':isAudio(selected.value)?'下载音频':'下载文件' : '下载文件')
 
 function notify(text:string, kind:'error'|'success'='error') { toast.text=text;toast.kind=kind;window.clearTimeout(toastTimer);toastTimer=window.setTimeout(()=>toast.text='',3600) }
 
-function isBook(item:DriveFile){return item.kind==='file'&&item.status==='ready'&&/\.(epub|txt)$/i.test(item.name)}
-function isEpub(item:DriveFile){return item.kind==='file'&&/\.epub$/i.test(item.name)}
-// 持久化缩略图：URL 带内容哈希（etag），服务端生成/前端上传后浏览器可长期缓存
-function thumbSRC(item:DriveFile){return `/api/files/${item.id}/thumbnail?v=${encodeURIComponent(item.etag||'')}`}
-const thumbFallbackTried=reactive<Record<string,boolean>>({})
-function thumbFallback(e:Event,item:DriveFile){
-  const img=e.target as HTMLImageElement
-  if(thumbFallbackTried[item.id]){img.hidden=true;return}
-  thumbFallbackTried[item.id]=true
-  img.src=previewURL(item) // 服务端生成不了的格式（如 avif）回退原图直连
-}
-const coverBroken=reactive<Record<string,boolean>>({})
-function markCoverBroken(item:DriveFile){coverBroken[item.id]=true}
 function openReader(item:DriveFile){readerFile.value=item;openModal('reader');history.replaceState({cloudNav:true},'','/read/'+item.id)}
 async function checkSession() {
   try { const me=await api<ProfileResponse>('/api/auth/me');user.value=me.username;hasAvatar.value=me.has_avatar;await openRoute() }
@@ -213,54 +197,7 @@ async function showShare(item:DriveFile){selected.value=item;openModal('share');
 async function createShare(replace=false){if(!selected.value)return;if(replace&&!window.confirm('重新生成后，旧分享链接会立即失效。继续吗？'))return;share.busy=true;share.error='';share.copied=false;try{const data=await api<ShareResponse>(`/api/files/${selected.value.id}/share`,{method:'POST'});share.active=data.active;share.url=data.url||'';share.createdAt=data.created_at||''}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
 async function revokeShare(){if(!selected.value||!window.confirm('停止分享后，现有订阅链接会立即失效。继续吗？'))return;share.busy=true;share.error='';try{await api(`/api/files/${selected.value.id}/share`,{method:'DELETE'});share.active=false;share.url='';share.createdAt='';share.copied=false;notify('分享已停止','success')}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
 async function copyShare(){if(!share.url)return;try{await navigator.clipboard.writeText(share.url);share.copied=true;window.setTimeout(()=>share.copied=false,2200)}catch{share.error='复制失败，请手动选择链接复制'}}
-function isImage(item:DriveFile){return item.kind==='file'&&item.status==='ready'&&(['image/jpeg','image/png','image/webp','image/gif','image/avif'].includes(item.mime_type||'')||/\.(jpe?g|png|gif|webp|avif)$/i.test(item.name))}
-function isVideo(item:DriveFile){return item.kind==='file'&&item.status==='ready'&&((item.mime_type||'').startsWith('video/')||/\.(mp4|webm|ogv|mov|m4v)$/i.test(item.name))}
-function isAudio(item:DriveFile){return item.kind==='file'&&item.status==='ready'&&((item.mime_type||'').startsWith('audio/')||/\.(mp3|wav|ogg|oga|m4a|aac|flac)$/i.test(item.name))}
-function isMedia(item:DriveFile){return isImage(item)||isVideo(item)||isAudio(item)}
-function isEditable(item:DriveFile){return item.kind==='file'&&item.status==='ready'&&item.size<=1024*1024&&/\.(md|markdown|txt|ya?ml|json|toml|ini|conf|log|csv)$/i.test(item.name)}
-function previewURL(item:DriveFile){return `/api/files/${item.id}/preview`}
 function openItem(item:DriveFile){if(item.kind==='directory')openFolder(item.id);else if(isBook(item)&&(!isEditable(item)||/\.epub$/i.test(item.name)))openReader(item);else if(isEditable(item))openEditor(item);else if(isMedia(item))showPreview(item)}
-function changePreview(direction:-1|1){if(!hasGalleryNavigation.value)return;const next=(galleryIndex.value+direction+galleryItems.value.length)%galleryItems.value.length;selected.value=galleryItems.value[next]}
-function handlePreviewKey(event:KeyboardEvent){if(modal.value!=='preview')return;if(event.key==='ArrowLeft'||event.key==='ArrowRight'){event.preventDefault();changePreview(event.key==='ArrowLeft'?-1:1)}}
-
-// 手机端左右滑动切换上一张/下一张（参考 suzuka 的灯箱手势）：水平位移
-// 超过阈值且横轴占优时切图，跟手拖拽带过渡回弹。
-const swipe=reactive({active:false,pointerId:0,startX:0,startY:0,dx:0,dy:0})
-const stageEl=ref<HTMLElement|null>(null)
-let swipeStartedOnStage=false
-const stageSwipeable=computed(()=>{const item=selected.value;return !!item&&isImage(item)&&hasGalleryNavigation.value})
-const swipeStyle=computed(()=>({
-  transform:`translateX(${swipe.active?swipe.dx:0}px)${swipe.active?' scale(.985)':''}`,
-  transition:swipe.active?'none':'transform .24s cubic-bezier(.22,.8,.3,1)',
-}))
-function onStagePointerDown(e:PointerEvent){
-  if(modal.value!=='preview')return
-  // 上/下一张按钮自己处理点击，不要被滑动手势的 pointer capture 劫持
-  if(e.target instanceof Element&&e.target.closest('.preview-nav'))return
-  if(e.pointerType==='mouse'&&e.button!==0)return
-  // 所有媒体类型都记录"按下起点是否在舞台空白处"，用于点击空白关闭预览
-  swipeStartedOnStage=e.target===stageEl.value
-  if(!stageSwipeable.value)return // 视频/音频/单图：不接管指针，交给点击判定
-  if(swipe.active)return // 多点触控时放弃滑动手势
-  swipe.active=true;swipe.pointerId=e.pointerId;swipe.startX=e.clientX;swipe.startY=e.clientY;swipe.dx=0;swipe.dy=0
-  stageEl.value?.setPointerCapture(e.pointerId)
-}
-function onStagePointerMove(e:PointerEvent){
-  if(!swipe.active||e.pointerId!==swipe.pointerId)return
-  swipe.dx=e.clientX-swipe.startX;swipe.dy=e.clientY-swipe.startY
-}
-function onStagePointerEnd(e:PointerEvent){
-  if(!swipe.active||e.pointerId!==swipe.pointerId)return
-  const dx=swipe.dx,dy=swipe.dy
-  swipe.active=false;swipe.dx=0;swipe.dy=0
-  if(Math.abs(dx)>60&&Math.abs(dx)>Math.abs(dy)*1.25)changePreview(dx<0?1:-1)
-}
-// 点击舞台空白处关闭预览：图片（pointer capture 会把点击重定向到舞台）、
-// 视频、音频、单张图片通用；点媒体本体或按钮都不会误触发退出。
-function onStageClick(e:MouseEvent){
-  if(swipeStartedOnStage&&e.target===stageEl.value)closeModal()
-  swipeStartedOnStage=false
-}
 function newDocument(){selected.value=null;editor.isNew=true;editor.fileId='';editor.name='未命名文档.md';editor.originalName=editor.name;editor.content='';editor.original='';editor.etag='';editor.mode='edit';editor.busy=false;editor.error='';openModal('editor')}
 async function openEditor(item:DriveFile){
   selected.value=item;editor.isNew=false;editor.fileId=item.id;editor.name=item.name;editor.originalName=item.name;editor.content='';editor.original='';editor.etag='';editor.mode='edit';editor.error='';editor.busy=true;openModal('editor')
@@ -417,11 +354,8 @@ function clearFinished(){for(let i=tasks.length-1;i>=0;i--)if(['done','cancelled
 // 全部上传结束后自动收起上传面板（失败项保留，供重试）。
 let autoClearTimer=0
 function scheduleAutoClear(){window.clearTimeout(autoClearTimer);if(unfinished.value.length)return;autoClearTimer=window.setTimeout(clearFinished,4000)}
-function formatSize(bytes:number){if(bytes===0)return'0 B';const units=['B','KB','MB','GB','TB'];const i=Math.min(Math.floor(Math.log(bytes)/Math.log(1024)),4);return`${(bytes/1024**i).toFixed(i?1:0)} ${units[i]}`}
-function formatDate(value:string){const d=new Date(value);return Number.isNaN(d.valueOf())?'—':new Intl.DateTimeFormat('zh-CN',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}).format(d)}
-
-onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='list'||saved==='grid')viewMode.value=saved;window.addEventListener('keydown',handlePreviewKey);window.addEventListener('popstate',handlePopState);checkSession()})
-onBeforeUnmount(()=>{window.removeEventListener('keydown',handlePreviewKey);window.removeEventListener('popstate',handlePopState)})
+onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='list'||saved==='grid')viewMode.value=saved;window.addEventListener('popstate',handlePopState);checkSession()})
+onBeforeUnmount(()=>window.removeEventListener('popstate',handlePopState))
 </script>
 
 <template>
@@ -432,10 +366,10 @@ onBeforeUnmount(()=>{window.removeEventListener('keydown',handlePreviewKey);wind
   </main>
 
   <div v-else class="app-shell" @dragover.prevent="dragActive=true" @dragleave.self="dragActive=false" @drop.prevent="onDrop">
-    <header class="topbar"><button class="logo brand-button" title="回到我的文件" @click="openFolder(ROOT)"><span class="brand-mark small"><img src="/logo.png" alt=""></span><span>Cloud</span></button><div class="top-actions"><span class="connection"><i></i>S3 块直传</span><button class="account-button" title="打开账户设置" @click="showAccount"><span class="avatar-badge"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像" @error="hasAvatar=false"><template v-else>{{ user.slice(0,1).toUpperCase() }}</template></span><span class="account-copy"><b>{{ user }}</b><small>账户设置</small></span></button><button class="top-logout" @click="logout">退出</button></div></header>
-    <aside class="sidebar"><button class="nav active" title="回到我的文件" @click="openFolder(ROOT)"><span>▰</span>我的文件</button><div class="sidebar-note"><span class="sidebar-label">存储空间</span><div class="storage-total"><strong>{{ formatSize(storageStats.total_bytes) }}</strong><small>逻辑占用</small></div><div class="storage-bar"><i></i></div><div class="storage-meta"><span class="storage-stat"><b>{{ storageStats.file_count }}</b><small>个文件</small></span><span class="storage-stat"><b>去重</b><small>SHA-256 块</small></span></div><p>内容以内容寻址块保存在 S3，重复内容只存一份。</p></div></aside>
+    <AppTopbar :user="user" :has-avatar="hasAvatar" :avatar-url="avatarURL" @home="openFolder(ROOT)" @account="showAccount" @logout="logout" @avatar-error="hasAvatar=false" />
     <section class="content" @click="clearSelectionFromBlank">
-      <div class="content-head"><div><nav class="breadcrumbs" aria-label="路径"><button v-for="crumb in breadcrumbs" :key="crumb.id" @click="openFolder(crumb.id)">{{ crumb.name || '我的文件' }}<span>/</span></button></nav><div class="title-row"><h1>{{ current?.name || '我的文件' }}</h1><button v-if="currentId!==ROOT&&current?.parent_id" class="up-button" title="返回上一级" aria-label="返回上一级" @click="goUp"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V6m0 0-5 5m5-5 5 5"/></svg></button></div><p>{{ items.length }} 个项目 · {{ pathTitle }}</p><div class="mobile-stats"><span>总占用 <b>{{ formatSize(storageStats.total_bytes) }}</b></span><span>{{ storageStats.file_count }} 个文件</span></div></div><div class="actions"><div class="view-switch" role="group" aria-label="文件显示方式"><button :class="{active:viewMode==='list'}" title="列表视图" aria-label="列表视图" @click="setViewMode('list')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg></button><button :class="{active:viewMode==='grid'}" title="大图标视图" aria-label="大图标视图" @click="setViewMode('grid')"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg></button></div><button class="secondary" @click="newDocument">＋ 新建文档</button><button class="secondary" @click="createFolder">＋ 新建文件夹</button><button class="primary" @click="chooseFiles">↑ 上传文件</button><input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}"></div></div>
+      <FileBrowserHeader :breadcrumbs="breadcrumbs" :current="current" :can-go-up="currentId!==ROOT&&!!current?.parent_id" :item-count="items.length" :total-bytes="storageStats.total_bytes" :file-count="storageStats.file_count" :view-mode="viewMode" @open-folder="openFolder" @up="goUp" @set-view="setViewMode" @new-document="newDocument" @create-folder="createFolder" @upload="chooseFiles" />
+      <input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}">
       <div v-if="viewMode==='grid'&&selected&&!modal" class="selection-toolbar" role="toolbar" aria-label="所选项目操作">
         <button class="selection-close" title="取消选择" aria-label="取消选择" @click="selected=null">×</button><span class="selection-summary"><b>1 项</b><small>已选择 {{ formatSize(selected.size) }}</small></span>
         <div class="selection-actions">
@@ -449,34 +383,12 @@ onBeforeUnmount(()=>{window.removeEventListener('keydown',handlePreviewKey);wind
       </div>
       <div v-if="loading" class="state"><div class="spinner"></div><p>正在读取文件…</p></div>
       <div v-else-if="!items.length" class="state empty"><div class="empty-icon">⌁</div><h3>这里还是空的</h3><p>拖放文件到这里，或新建一篇文档。</p><div class="empty-actions"><button class="secondary" @click="newDocument">新建文档</button><button class="primary" @click="chooseFiles">上传文件</button></div></div>
-      <div v-else-if="viewMode==='list'" class="file-table">
-        <div class="table-head"><span>名称</span><span>大小</span><span>修改时间</span><span>操作</span></div>
-        <div v-for="item in items" :key="item.id" class="file-row" :class="{mutedrow:item.status!=='ready'}" @dblclick="openItem(item)">
-          <div class="file-name"><button class="file-icon" :class="{directory:item.kind==='directory',image:isImage(item),document:isEditable(item),video:isVideo(item),audio:isAudio(item)}" :title="item.kind==='directory'?'打开文件夹':isEditable(item)?'编辑文档':isImage(item)?'预览图片':isVideo(item)?'播放视频':isAudio(item)?'播放音频':'文件'" @click="openItem(item)"><span v-if="item.kind==='directory'" class="folder-glyph">▰</span><img v-else-if="isImage(item)" :src="thumbSRC(item)" :alt="item.name" loading="lazy" @error="thumbFallback($event,item)"><VideoThumb v-else-if="isVideo(item)" :file="item"><span>▶</span></VideoThumb><img v-else-if="isEpub(item)&&!coverBroken[item.id]" :src="thumbSRC(item)" :alt="item.name" loading="lazy" @error="markCoverBroken(item)"><span v-else-if="isEpub(item)">▤</span><span v-else-if="isEditable(item)">▤</span><span v-else-if="isAudio(item)">♫</span><span v-else>◇</span></button><div><strong>{{ item.name }}</strong><small v-if="item.status!=='ready'">{{ item.status }}</small><small v-else>{{ item.kind==='directory'?'文件夹':item.mime_type||'文件' }}</small></div></div>
-          <span>{{ item.kind==='directory'?'—':formatSize(item.size) }}</span><span>{{ formatDate(item.updated_at) }}</span>
-          <div class="row-actions">
-            <button v-if="isEditable(item)" title="编辑" aria-label="编辑" @click="openEditor(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path d="m13.8 6.2 3.2 3.2"/></svg></button>
-            <button v-if="isMedia(item)" :title="isImage(item)?'预览':'播放'" :aria-label="isImage(item)?'预览':'播放'" @click="showPreview(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><template v-if="isImage(item)"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.6"/></template><path v-else d="M8 5v14l11-7Z"/></svg></button>
-            <button v-if="isBook(item)" title="阅读" aria-label="阅读" @click="openReader(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5c-1.7-1.4-4.2-2-8-2v14c3.8 0 6.3.6 8 2 1.7-1.4 4.2-2 8-2V3c-3.8 0-6.3.6-8 2Zm0 0v14"/></svg></button>
-            <button v-if="item.kind==='file'" title="下载" aria-label="下载" @click="download(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg></button>
-            <button v-if="item.kind==='file'" title="分享" aria-label="分享" @click="showShare(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.6-4.4M8.2 13.2l7.6 4.4"/></svg></button>
-            <button title="重命名" aria-label="重命名" @click="showRename(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 5v14M9 19h6"/></svg></button>
-            <button title="移动" aria-label="移动" @click="showMove(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg></button>
-            <button title="删除" aria-label="删除" class="danger" @click="removeItem(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg></button>
-          </div>
-        </div>
-      </div>
-      <div v-else class="file-grid">
-        <article v-for="item in items" :key="item.id" class="file-card" :class="{mutedrow:item.status!=='ready',selected:selected?.id===item.id}" @dblclick="openItem(item)">
-          <button class="card-select" :class="{active:selected?.id===item.id}" :title="selected?.id===item.id?'取消选择':'选择项目'" :aria-label="selected?.id===item.id?'取消选择':'选择项目'" @click.stop="toggleSelection(item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button>
-          <button class="card-preview" :title="item.kind==='directory'?'打开文件夹':isEditable(item)?'编辑文档':isImage(item)?'预览图片':isVideo(item)?'播放视频':isAudio(item)?'播放音频':'文件'" @click="openItem(item)"><img v-if="isImage(item)" :src="thumbSRC(item)" :alt="item.name" loading="lazy" @error="thumbFallback($event,item)"><VideoThumb v-else-if="isVideo(item)" :file="item"><span class="large-video">▶</span></VideoThumb><img v-else-if="isEpub(item)&&!coverBroken[item.id]" :src="thumbSRC(item)" :alt="item.name" loading="lazy" @error="markCoverBroken(item)"><span v-else-if="isEpub(item)" class="large-document">▤</span><span v-else-if="item.kind==='directory'" class="large-folder">▰</span><span v-else-if="isEditable(item)" class="large-document">▤</span><span v-else-if="isAudio(item)" class="large-audio">♫</span><span v-else class="large-file">◇</span></button>
-          <div class="card-info"><strong :title="item.name">{{ item.name }}</strong><small>{{ item.kind==='directory'?'文件夹':formatSize(item.size) }} · {{ formatDate(item.updated_at) }}</small></div>
-        </article>
-      </div>
+      <FileTable v-else-if="viewMode==='list'" :items="items" @open="openItem" @edit="openEditor" @preview="showPreview" @read="openReader" @download="download" @share="showShare" @rename="showRename" @move="showMove" @remove="removeItem" />
+      <FileGrid v-else :items="items" :selected="selected" @open="openItem" @select="toggleSelection" />
     </section>
 
     <div v-if="dragActive" class="drop-zone"><div><span>↓</span><h2>释放以上传到 {{ current?.name || '我的文件' }}</h2><p>文件将按内容块直传 S3，重复内容自动去重</p></div></div>
-    <section v-if="tasks.length" class="upload-panel"><header><div><strong>上传</strong><span v-if="unfinished.length">{{ unfinished.length }} 项进行中</span></div><button @click="clearFinished">清除已完成</button></header><div class="task-list"><article v-for="task in tasks" :key="task.id"><div class="task-top"><span class="task-icon">↑</span><div><strong>{{ task.file.name }}</strong><small>{{ formatSize(task.file.size) }} · {{ task.status==='queued'?'等待中':task.status==='uploading'?'正在上传':task.status==='done'?'已完成':task.status==='cancelled'?'已取消':task.error }}</small></div><b>{{ task.progress }}%</b><button v-if="task.status==='queued'||task.status==='uploading'" @click="cancelUpload(task)">×</button><button v-else-if="task.status==='failed'" @click="retry(task)">重试</button></div><div class="progress"><i :class="task.status" :style="{width:`${task.progress}%`}"></i></div></article></div></section>
+    <UploadPanel :tasks="tasks" @clear="clearFinished" @cancel="cancelUpload" @retry="retry" />
 
     <div v-if="modal" class="modal-backdrop" :class="{previewing:modal==='preview',editing:modal==='editor',reading:modal==='reader'}" @click.self="closeBackdrop">
       <section v-if="modal==='rename'" class="modal"><header><div><p class="eyebrow dark">EDIT</p><h2>重命名</h2></div><button @click="closeModal">×</button></header><label>新名称<input v-model="renameValue" maxlength="1024" @keyup.enter="saveRename"></label><footer><button class="secondary" @click="closeModal">取消</button><button class="primary" :disabled="modalBusy" @click="saveRename">保存</button></footer></section>
@@ -507,17 +419,7 @@ onBeforeUnmount(()=>{window.removeEventListener('keydown',handlePreviewKey);wind
         </template>
         <template v-else><p class="share-description">创建后，无需登录即可通过链接读取这个文件。你可以随时重新生成或停止分享。</p><button class="primary share-create" :disabled="share.busy" @click="createShare(false)">创建公开链接</button><p v-if="share.error" class="form-error">{{ share.error }}</p></template>
       </section>
-      <section v-else class="preview-modal" @click.self="closeModal">
-        <header class="preview-bar"><div><strong>{{ selected?.name }}</strong><small v-if="selected">{{ formatSize(selected.size) }} · {{ selected.mime_type||'媒体文件' }}</small></div><span v-if="galleryIndex>=0" class="preview-count">{{ galleryIndex+1 }} / {{ galleryItems.length }}</span><button aria-label="关闭预览" @click="closeModal">×</button></header>
-        <div ref="stageEl" class="preview-stage" :class="{swipeable:stageSwipeable}" @click="onStageClick" @pointerdown="onStagePointerDown" @pointermove="onStagePointerMove" @pointerup="onStagePointerEnd" @pointercancel="onStagePointerEnd">
-          <button v-if="hasGalleryNavigation" class="preview-nav preview-prev" aria-label="上一项" @click.stop="changePreview(-1)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14.5 6-6 6 6 6"/></svg></button>
-          <img v-if="selected&&isImage(selected)" :key="selected.id" :src="previewURL(selected)" :alt="selected.name" :style="swipeStyle">
-          <video v-else-if="selected&&isVideo(selected)" :key="selected.id" :src="previewURL(selected)" controls autoplay playsinline preload="metadata">你的浏览器不支持这个视频格式。</video>
-          <div v-else-if="selected&&isAudio(selected)" class="audio-player-card"><span>♫</span><strong>{{ selected.name }}</strong><small>{{ formatSize(selected.size) }}</small><audio :key="selected.id" :src="previewURL(selected)" controls autoplay preload="metadata">你的浏览器不支持这个音频格式。</audio></div>
-          <button v-if="hasGalleryNavigation" class="preview-nav preview-next" aria-label="下一项" @click.stop="changePreview(1)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.5 6 6 6-6 6"/></svg></button>
-        </div>
-        <footer class="preview-toolbar"><button class="preview-download" @click="selected&&download(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg>{{ previewDownloadLabel }}</button></footer>
-      </section>
+      <MediaPreview v-else-if="modal==='preview'&&selected" :selected="selected" :items="items" @close="closeModal" @change="selected=$event" @download="download" />
     </div>
     <ReaderView v-if="modal==='reader'&&readerFile" :file="readerFile" @close="closeModal" />
     <div v-if="toast.text" class="toast" :class="toast.kind">{{ toast.text }}</div>
