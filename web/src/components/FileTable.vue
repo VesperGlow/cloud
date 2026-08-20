@@ -5,9 +5,11 @@ import { isAudio, isBook, isEditable, isEpub, isImage, isMedia, isVideo, preview
 import { formatDate, formatSize } from '../format'
 import VideoThumb from '../VideoThumb.vue'
 
-defineProps<{items:DriveFile[]}>()
+defineProps<{items:DriveFile[];selectedIds:Set<string>}>()
 defineEmits<{
   open:[item:DriveFile]
+  select:[item:DriveFile]
+  selectAll:[]
   edit:[item:DriveFile]
   preview:[item:DriveFile]
   read:[item:DriveFile]
@@ -31,9 +33,10 @@ function thumbFallback(event:Event,item:DriveFile){
 
 <template>
   <div class="file-table">
-    <div class="table-head"><span>名称</span><span>大小</span><span>修改时间</span><span>操作</span></div>
-    <div v-for="item in items" :key="item.id" class="file-row" :class="{mutedrow:item.status!=='ready'}" @dblclick="$emit('open',item)">
+    <div class="table-head"><span class="table-name-heading"><button class="table-select-all" :class="{active:selectedIds.size===items.length}" :title="selectedIds.size===items.length?'取消全选':'全选'" :aria-label="selectedIds.size===items.length?'取消全选':'全选'" :aria-pressed="selectedIds.size===items.length" @click="$emit('selectAll')"><svg viewBox="0 0 24 24" aria-hidden="true"><path v-if="selectedIds.size===items.length" d="m5 12 4 4L19 6"/><path v-else-if="selectedIds.size" d="M6 12h12"/></svg></button>名称</span><span>大小</span><span>修改时间</span><span>操作</span></div>
+    <div v-for="item in items" :key="item.id" class="file-row" :class="{mutedrow:item.status!=='ready',selected:selectedIds.has(item.id)}" @dblclick="$emit('open',item)">
       <div class="file-name">
+        <button class="row-select" :class="{active:selectedIds.has(item.id)}" :title="selectedIds.has(item.id)?'取消选择':'选择项目'" :aria-label="selectedIds.has(item.id)?'取消选择':'选择项目'" :aria-pressed="selectedIds.has(item.id)" @click.stop="$emit('select',item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button>
         <button class="file-icon" :class="{directory:item.kind==='directory',image:isImage(item),document:isEditable(item),video:isVideo(item),audio:isAudio(item)}" :title="item.kind==='directory'?'打开文件夹':isEditable(item)?'编辑文档':isImage(item)?'预览图片':isVideo(item)?'播放视频':isAudio(item)?'播放音频':'文件'" @click="$emit('open',item)">
           <span v-if="item.kind==='directory'" class="folder-glyph">▰</span>
           <img v-else-if="isImage(item)" :src="thumbSRC(item)" :alt="item.name" loading="lazy" @error="thumbFallback($event,item)">

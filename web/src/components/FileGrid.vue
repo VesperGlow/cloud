@@ -5,7 +5,7 @@ import { isAudio, isEditable, isEpub, isImage, isVideo, previewURL, thumbSRC } f
 import { formatDate, formatSize } from '../format'
 import VideoThumb from '../VideoThumb.vue'
 
-defineProps<{items:DriveFile[];selected:DriveFile|null}>()
+defineProps<{items:DriveFile[];selectedIds:Set<string>}>()
 defineEmits<{open:[item:DriveFile];select:[item:DriveFile]}>()
 
 const thumbFallbackTried=reactive<Record<string,boolean>>({})
@@ -21,8 +21,8 @@ function thumbFallback(event:Event,item:DriveFile){
 
 <template>
   <div class="file-grid">
-    <article v-for="item in items" :key="item.id" class="file-card" :class="{mutedrow:item.status!=='ready',selected:selected?.id===item.id}" @dblclick="$emit('open',item)">
-      <button class="card-select" :class="{active:selected?.id===item.id}" :title="selected?.id===item.id?'取消选择':'选择项目'" :aria-label="selected?.id===item.id?'取消选择':'选择项目'" @click.stop="$emit('select',item)">
+    <article v-for="item in items" :key="item.id" class="file-card" :class="{mutedrow:item.status!=='ready',selected:selectedIds.has(item.id)}" @dblclick="$emit('open',item)">
+      <button class="card-select" :class="{active:selectedIds.has(item.id)}" :title="selectedIds.has(item.id)?'取消选择':'选择项目'" :aria-label="selectedIds.has(item.id)?'取消选择':'选择项目'" :aria-pressed="selectedIds.has(item.id)" @click.stop="$emit('select',item)">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>
       </button>
       <button class="card-preview" :title="item.kind==='directory'?'打开文件夹':isEditable(item)?'编辑文档':isImage(item)?'预览图片':isVideo(item)?'播放视频':isAudio(item)?'播放音频':'文件'" @click="$emit('open',item)">

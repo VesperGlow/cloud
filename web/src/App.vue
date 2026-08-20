@@ -35,6 +35,8 @@ const dragActive = ref(false)
 const toast = reactive({ text:'', kind:'error' as 'error'|'success' })
 const tasks = reactive<UploadTask[]>([])
 const selected = ref<DriveFile|null>(null)
+const selectedIds = ref<Set<string>>(new Set())
+const moveTargets = ref<DriveFile[]>([])
 type ModalName = 'rename'|'move'|'preview'|'share'|'account'|'editor'|'reader'
 const modal = ref<ModalName|null>(null)
 const readerFile = ref<DriveFile|null>(null)
@@ -58,6 +60,10 @@ const editorBytes = computed(() => new Blob([editor.content]).size)
 const editorIsMarkdown = computed(() => /\.(md|markdown)$/i.test(editor.name))
 const renderedMarkdown = computed(() => DOMPurify.sanitize(marked.parse(editor.content, { async:false }) as string))
 const avatarURL = computed(() => `/api/profile/avatar?v=${avatarVersion.value}`)
+const selectedItems = computed(() => items.value.filter(item => selectedIds.value.has(item.id)))
+const selectedBytes = computed(() => selectedItems.value.reduce((total,item) => total+(item.kind==='file'?item.size:0),0))
+const selectedFiles = computed(() => selectedItems.value.filter(item => item.kind==='file'))
+const singleSelected = computed(() => selectedItems.value.length===1?selectedItems.value[0]:null)
 
 function notify(text:string, kind:'error'|'success'='error') { toast.text=text;toast.kind=kind;window.clearTimeout(toastTimer);toastTimer=window.setTimeout(()=>toast.text='',3600) }
 
@@ -142,7 +148,7 @@ async function openFolder(id:string){
     const [meta,list,stats]=await Promise.all([api<{file:DriveFile;breadcrumbs:DriveFile[]}>(`/api/files/${id}`),api<{items:DriveFile[]}>(`/api/files/${id}/children`),api<StorageStats>('/api/storage/stats')])
     if(seq!==folderSeq)return
     if(!suppressHistory&&id!==currentId.value){navActions.value.push({kind:'folder',id:currentId.value});window.history.pushState({cloudNav:true},'')}
-    currentId.value=id;current.value=meta.file;breadcrumbs.value=meta.breadcrumbs;items.value=list.items;storageStats.total_bytes=stats.total_bytes;storageStats.file_count=stats.file_count;selected.value=null;history.replaceState({cloudNav:true},'',folderURL(id))
+    currentId.value=id;current.value=meta.file;breadcrumbs.value=meta.breadcrumbs;items.value=list.items;storageStats.total_bytes=stats.total_bytes;storageStats.file_count=stats.file_count;selected.value=null;clearSelection();history.replaceState({cloudNav:true},'',folderURL(id))
   }catch(e){if(seq===folderSeq)notify((e as Error).message)}
   finally{if(seq===folderSeq)loading.value=false}
 }
@@ -173,10 +179,32 @@ function closeModal(){if(modal.value)window.history.back()}
 function goUp(){const parent=current.value?.parent_id;if(parent)openFolder(parent)}
 async function createFolder(){const name=window.prompt('新文件夹名称');if(!name)return;try{await api('/api/directories',{method:'POST',body:JSON.stringify({parent_id:currentId.value,name})});await openFolder(currentId.value);notify('文件夹已创建','success')}catch(e){notify((e as Error).message)}}
 async function removeItem(item:DriveFile){const text=item.kind==='directory'?'仅空文件夹可删除。确定删除吗？':'确定永久删除这个文件吗？';if(!window.confirm(`${text}\n\n${item.name}`))return;try{await api(`/api/files/${item.id}`,{method:'DELETE'});await openFolder(currentId.value);notify('已删除','success')}catch(e){notify((e as Error).message)}}
+async function removeSelected(){
+  const targets=[...selectedItems.value]
+  if(!targets.length)return
+  const directories=targets.filter(item=>item.kind==='directory').length
+  const hint=directories?`\n其中有 ${directories} 个文件夹；只有空文件夹可以删除。`:''
+  if(!window.confirm(`确定永久删除选中的 ${targets.length} 项吗？${hint}`))return
+  let removed=0
+  const errors:string[]=[]
+  for(const item of targets){
+    try{await api(`/api/files/${item.id}`,{method:'DELETE'});removed++}
+    catch(e){errors.push(`${item.name}：${(e as Error).message}`)}
+  }
+  await openFolder(currentId.value)
+  if(errors.length)notify(`已删除 ${removed} 项，${errors.length} 项失败：${errors[0]}`)
+  else notify(`已删除 ${removed} 项`,'success')
+}
 function showRename(item:DriveFile){selected.value=item;renameValue.value=item.name;openModal('rename')}
 async function saveRename(){if(!selected.value)return;modalBusy.value=true;try{await api(`/api/files/${selected.value.id}`,{method:'PATCH',body:JSON.stringify({name:renameValue.value})});closeModal();await openFolder(currentId.value);notify('已重命名','success')}catch(e){notify((e as Error).message)}finally{modalBusy.value=false}}
-async function showMove(item:DriveFile){selected.value=item;modalBusy.value=true;openModal('move');folders.value=[];try{folders.value=await loadFolderTree()}catch(e){notify((e as Error).message);closeModal()}finally{modalBusy.value=false}}
-async function loadFolderTree():Promise<FolderOption[]>{
+async function showMove(item:DriveFile){await showMoveTargets([item])}
+async function showMoveSelected(){await showMoveTargets([...selectedItems.value])}
+async function showMoveTargets(targets:DriveFile[]){
+  if(!targets.length)return
+  moveTargets.value=targets;selected.value=targets[0];modalBusy.value=true;openModal('move');folders.value=[]
+  try{folders.value=await loadFolderTree(new Set(targets.map(item=>item.id)))}catch(e){notify((e as Error).message);closeModal()}finally{modalBusy.value=false}
+}
+async function loadFolderTree(excludedIds=new Set<string>()):Promise<FolderOption[]>{
   const result:FolderOption[]=[{id:ROOT,name:'我的文件',depth:0}]
   const queue=[{id:ROOT,depth:0}]
   // 受限并发 BFS：同层目录并行拉取，避免大目录树逐目录串行请求
@@ -184,14 +212,28 @@ async function loadFolderTree():Promise<FolderOption[]>{
     const batch=queue.splice(0,8)
     const lists=await Promise.all(batch.map(async node=>({node,data:await api<{items:DriveFile[]}>(`/api/files/${node.id}/children`)})))
     for(const {node,data} of lists){
-      for(const child of data.items.filter(x=>x.kind==='directory'&&x.id!==selected.value?.id)){
+      for(const child of data.items.filter(x=>x.kind==='directory'&&!excludedIds.has(x.id))){
         result.push({id:child.id,name:child.name,depth:node.depth+1});queue.push({id:child.id,depth:node.depth+1})
       }
     }
   }
   return result
 }
-async function moveTo(parentId:string){if(!selected.value)return;modalBusy.value=true;try{await api(`/api/files/${selected.value.id}`,{method:'PATCH',body:JSON.stringify({parent_id:parentId})});closeModal();await openFolder(currentId.value);notify('已移动','success')}catch(e){notify((e as Error).message)}finally{modalBusy.value=false}}
+async function moveTo(parentId:string){
+  const targets=[...moveTargets.value]
+  if(!targets.length)return
+  modalBusy.value=true
+  let moved=0
+  const errors:string[]=[]
+  for(const item of targets){
+    try{await api(`/api/files/${item.id}`,{method:'PATCH',body:JSON.stringify({parent_id:parentId})});moved++}
+    catch(e){errors.push(`${item.name}：${(e as Error).message}`)}
+  }
+  closeModal();await openFolder(currentId.value);moveTargets.value=[]
+  if(errors.length)notify(`已移动 ${moved} 项，${errors.length} 项失败：${errors[0]}`)
+  else notify(`已移动 ${moved} 项`,'success')
+  modalBusy.value=false
+}
 function showPreview(item:DriveFile){selected.value=item;openModal('preview')}
 async function showShare(item:DriveFile){selected.value=item;openModal('share');share.active=false;share.url='';share.createdAt='';share.error='';share.copied=false;share.busy=true;try{const data=await api<ShareResponse>(`/api/files/${item.id}/share`);share.active=data.active;share.url=data.url||'';share.createdAt=data.created_at||''}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
 async function createShare(replace=false){if(!selected.value)return;if(replace&&!window.confirm('重新生成后，旧分享链接会立即失效。继续吗？'))return;share.busy=true;share.error='';share.copied=false;try{const data=await api<ShareResponse>(`/api/files/${selected.value.id}/share`,{method:'POST'});share.active=data.active;share.url=data.url||'';share.createdAt=data.created_at||''}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
@@ -222,15 +264,27 @@ async function saveDocument(){
 }
 function closeEditor(){if(editorDirty.value&&!window.confirm('还有未保存的修改，确定关闭吗？'))return;closeModal()}
 function closeBackdrop(){if(modal.value==='editor')closeEditor();else closeModal()}
-function setViewMode(mode:'list'|'grid'){viewMode.value=mode;selected.value=null;localStorage.setItem('cloud-view-mode',mode)}
-function toggleSelection(item:DriveFile){selected.value=selected.value?.id===item.id?null:item}
+function setViewMode(mode:'list'|'grid'){viewMode.value=mode;localStorage.setItem('cloud-view-mode',mode)}
+function toggleSelection(item:DriveFile){
+  const next=new Set(selectedIds.value)
+  if(next.has(item.id))next.delete(item.id);else next.add(item.id)
+  selectedIds.value=next
+}
+function clearSelection(){selectedIds.value=new Set()}
+function selectAll(){selectedIds.value=selectedItems.value.length===items.value.length?new Set():new Set(items.value.map(item=>item.id))}
 function clearSelectionFromBlank(event:MouseEvent){
-  if(!selected.value||modal.value)return
+  if(!selectedItems.value.length||modal.value)return
   const target=event.target
   if(!(target instanceof Element)||target.closest('button,a,input,textarea,select,[role="toolbar"],.file-card,.file-row'))return
-  selected.value=null
+  clearSelection()
 }
 function download(item:DriveFile){window.location.assign(`/api/files/${item.id}/download`)}
+function downloadSelected(){
+  const files=[...selectedFiles.value]
+  files.forEach((item,index)=>window.setTimeout(()=>{
+    const link=document.createElement('a');link.href=`/api/files/${item.id}/download`;link.download=item.name;link.hidden=true;document.body.appendChild(link);link.click();link.remove()
+  },index*180))
+}
 
 function chooseFiles(){fileInput.value?.click()}
 function acceptFiles(list:FileList|File[]){for(const file of Array.from(list)){tasks.push({id:crypto.randomUUID(),file,progress:0,status:'queued',error:'',cancelled:false,requests:[]})}pumpQueue()}
@@ -370,21 +424,22 @@ onBeforeUnmount(()=>window.removeEventListener('popstate',handlePopState))
     <section class="content" @click="clearSelectionFromBlank">
       <FileBrowserHeader :breadcrumbs="breadcrumbs" :current="current" :can-go-up="currentId!==ROOT&&!!current?.parent_id" :item-count="items.length" :total-bytes="storageStats.total_bytes" :file-count="storageStats.file_count" :view-mode="viewMode" @open-folder="openFolder" @up="goUp" @set-view="setViewMode" @new-document="newDocument" @create-folder="createFolder" @upload="chooseFiles" />
       <input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}">
-      <div v-if="viewMode==='grid'&&selected&&!modal" class="selection-toolbar" role="toolbar" aria-label="所选项目操作">
-        <button class="selection-close" title="取消选择" aria-label="取消选择" @click="selected=null">×</button><span class="selection-summary"><b>1 项</b><small>已选择 {{ formatSize(selected.size) }}</small></span>
+      <div v-if="selectedItems.length&&!modal" class="selection-toolbar" role="toolbar" aria-label="所选项目操作">
+        <button class="selection-close" title="取消选择" aria-label="取消选择" @click="clearSelection">×</button><span class="selection-summary"><b>{{ selectedItems.length }} 项</b><small>已选择 {{ formatSize(selectedBytes) }}</small></span>
         <div class="selection-actions">
-          <button v-if="selected.kind==='directory'||isEditable(selected)||isMedia(selected)||isBook(selected)" @click="openItem(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path v-if="selected.kind==='directory'" d="M3 7h7l2 2h9v9H3z"/><path v-else-if="isEditable(selected)&&!isBook(selected)" d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path v-else-if="isBook(selected)" d="M12 5c-1.7-1.4-4.2-2-8-2v14c3.8 0 6.3.6 8 2 1.7-1.4 4.2-2 8-2V3c-3.8 0-6.3.6-8 2Zm0 0v14"/><path v-else-if="isImage(selected)" d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><path v-else d="M8 5v14l11-7Z"/></svg><span>{{ selected.kind==='directory'?'打开':isBook(selected)?'阅读':isEditable(selected)?'编辑文本':isImage(selected)?'预览':'播放' }}</span></button>
-          <button v-if="selected.kind==='file'" @click="download(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg><span>下载</span></button>
-          <button v-if="selected.kind==='file'" @click="showShare(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.6-4.4M8.2 13.2l7.6 4.4"/></svg><span>分享</span></button>
-          <button @click="showRename(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 5v14M9 19h6"/></svg><span>重命名</span></button>
-          <button @click="showMove(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg><span>移动</span></button>
-          <button class="danger" @click="removeItem(selected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg><span>删除</span></button>
+          <button @click="selectAll"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z"/><path d="m8 12 3 3 5-6"/></svg><span>{{ selectedItems.length===items.length?'取消全选':'全选' }}</span></button>
+          <button v-if="singleSelected&&(singleSelected.kind==='directory'||isEditable(singleSelected)||isMedia(singleSelected)||isBook(singleSelected))" @click="openItem(singleSelected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path v-if="singleSelected.kind==='directory'" d="M3 7h7l2 2h9v9H3z"/><path v-else-if="isEditable(singleSelected)&&!isBook(singleSelected)" d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path v-else-if="isBook(singleSelected)" d="M12 5c-1.7-1.4-4.2-2-8-2v14c3.8 0 6.3.6 8 2 1.7-1.4 4.2-2 8-2V3c-3.8 0-6.3.6-8 2Zm0 0v14"/><path v-else-if="isImage(singleSelected)" d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><path v-else d="M8 5v14l11-7Z"/></svg><span>{{ singleSelected.kind==='directory'?'打开':isBook(singleSelected)?'阅读':isEditable(singleSelected)?'编辑文本':isImage(singleSelected)?'预览':'播放' }}</span></button>
+          <button v-if="selectedFiles.length" @click="downloadSelected"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg><span>下载{{ selectedFiles.length>1?` (${selectedFiles.length})`:'' }}</span></button>
+          <button v-if="singleSelected?.kind==='file'" @click="showShare(singleSelected)"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.5"/><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="19" r="2.5"/><path d="m8.2 10.8 7.6-4.4M8.2 13.2l7.6 4.4"/></svg><span>分享</span></button>
+          <button v-if="singleSelected" @click="showRename(singleSelected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 5v14M9 19h6"/></svg><span>重命名</span></button>
+          <button @click="showMoveSelected"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg><span>移动</span></button>
+          <button class="danger" @click="removeSelected"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg><span>删除</span></button>
         </div>
       </div>
       <div v-if="loading" class="state"><div class="spinner"></div><p>正在读取文件…</p></div>
       <div v-else-if="!items.length" class="state empty"><div class="empty-icon">⌁</div><h3>这里还是空的</h3><p>拖放文件到这里，或新建一篇文档。</p><div class="empty-actions"><button class="secondary" @click="newDocument">新建文档</button><button class="primary" @click="chooseFiles">上传文件</button></div></div>
-      <FileTable v-else-if="viewMode==='list'" :items="items" @open="openItem" @edit="openEditor" @preview="showPreview" @read="openReader" @download="download" @share="showShare" @rename="showRename" @move="showMove" @remove="removeItem" />
-      <FileGrid v-else :items="items" :selected="selected" @open="openItem" @select="toggleSelection" />
+      <FileTable v-else-if="viewMode==='list'" :items="items" :selected-ids="selectedIds" @open="openItem" @select="toggleSelection" @select-all="selectAll" @edit="openEditor" @preview="showPreview" @read="openReader" @download="download" @share="showShare" @rename="showRename" @move="showMove" @remove="removeItem" />
+      <FileGrid v-else :items="items" :selected-ids="selectedIds" @open="openItem" @select="toggleSelection" />
     </section>
 
     <div v-if="dragActive" class="drop-zone"><div><span>↓</span><h2>释放以上传到 {{ current?.name || '我的文件' }}</h2><p>文件将按内容块直传 S3，重复内容自动去重</p></div></div>
@@ -392,7 +447,7 @@ onBeforeUnmount(()=>window.removeEventListener('popstate',handlePopState))
 
     <div v-if="modal" class="modal-backdrop" :class="{previewing:modal==='preview',editing:modal==='editor',reading:modal==='reader'}" @click.self="closeBackdrop">
       <section v-if="modal==='rename'" class="modal"><header><div><p class="eyebrow dark">EDIT</p><h2>重命名</h2></div><button @click="closeModal">×</button></header><label>新名称<input v-model="renameValue" maxlength="1024" @keyup.enter="saveRename"></label><footer><button class="secondary" @click="closeModal">取消</button><button class="primary" :disabled="modalBusy" @click="saveRename">保存</button></footer></section>
-      <section v-else-if="modal==='move'" class="modal folder-modal"><header><div><p class="eyebrow dark">MOVE</p><h2>移动「{{ selected?.name }}」</h2></div><button @click="closeModal">×</button></header><div v-if="modalBusy" class="state small"><div class="spinner"></div></div><div v-else class="folder-list"><button v-for="folder in folders" :key="folder.id" :style="{paddingLeft:`${18+folder.depth*22}px`}" @click="moveTo(folder.id)"><span>▰</span>{{ folder.name }}</button></div></section>
+      <section v-else-if="modal==='move'" class="modal folder-modal"><header><div><p class="eyebrow dark">MOVE</p><h2>{{ moveTargets.length===1?`移动「${moveTargets[0]?.name}」`:`移动 ${moveTargets.length} 项` }}</h2></div><button @click="closeModal">×</button></header><div v-if="modalBusy" class="state small"><div class="spinner"></div></div><div v-else class="folder-list"><button v-for="folder in folders" :key="folder.id" :style="{paddingLeft:`${18+folder.depth*22}px`}" @click="moveTo(folder.id)"><span>▰</span>{{ folder.name }}</button></div></section>
       <section v-else-if="modal==='account'" class="modal account-modal"><header><div><p class="eyebrow dark">PROFILE & SECURITY</p><h2>账户设置</h2></div><button @click="closeModal">×</button></header><div class="account-layout"><section class="avatar-settings"><div class="avatar-large"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像"><span v-else>{{ user.slice(0,1).toUpperCase() }}</span></div><h3>个人头像</h3><p>支持 JPG、PNG、GIF 和 WebP，最大 2 MiB。</p><div class="avatar-actions"><button type="button" class="secondary" :disabled="avatar.busy" @click="chooseAvatar">{{ avatar.busy?'处理中…':hasAvatar?'更换头像':'上传头像' }}</button><button v-if="hasAvatar" type="button" class="danger-text" :disabled="avatar.busy" @click="removeAvatar">移除</button></div><input ref="avatarInput" hidden type="file" accept="image/jpeg,image/png,image/gif,image/webp" @change="e=>{const el=e.target as HTMLInputElement;if(el.files?.[0])uploadAvatar(el.files[0]);el.value=''}"><p v-if="avatar.error" class="form-error">{{ avatar.error }}</p></section><form @submit.prevent="saveAccount"><div><h3>登录凭据</h3><p class="modal-hint">修改后会退出所有已登录设备，请使用新凭据重新登录。</p></div><label>管理员用户名<input v-model="account.username" autocomplete="username" maxlength="128" required></label><label>当前密码<input v-model="account.currentPassword" type="password" autocomplete="current-password" maxlength="1024" required></label><div class="account-passwords"><label>新密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><label>确认新密码<input v-model="account.confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label></div><p v-if="account.error" class="form-error">{{ account.error }}</p><footer><button type="button" class="secondary" @click="closeModal">取消</button><button class="primary" :disabled="modalBusy">{{ modalBusy?'正在保存…':'更新并退出' }}</button></footer></form></div></section>
       <section v-else-if="modal==='editor'" class="document-editor">
         <header class="editor-header">
