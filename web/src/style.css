@@ -319,6 +319,10 @@ body.reader-open .storage-bar i{animation:none}
 .thumb-fallback.hidden{opacity:0}
 .video-thumb img{z-index:1}
 
+/* 鸿蒙浏览器会把可点击卡片里的封面图劫持成“查看大图”。缩略图只是
+   外层按钮的装饰内容，关闭其指针/长按事件，让点击稳定落到按钮。 */
+.card-preview img,.file-icon img{pointer-events:none;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none;-webkit-user-drag:none}
+
 /* ===== File browser layout: no single-item sidebar, compact responsive header ===== */
 .app-shell{grid-template-columns:1fr;grid-template-rows:66px 1fr}
 .content{width:min(100%,1600px);margin:0 auto;padding:34px clamp(20px,3vw,48px) 80px}
@@ -375,7 +379,9 @@ body.reader-open .storage-bar i{animation:none}
 }
 
 @media(max-width:520px){
-  .topbar .logo>span:last-child{display:none}
+  .topbar .brand-button .brand-mark{display:none}
+  .topbar .logo>span:last-child{display:inline}
+  .topbar .brand-button{padding:6px 4px;font-size:18px}
   .folder-meta span:nth-of-type(2),.folder-meta i:nth-of-type(2){display:none}
   .file-grid{gap:10px}
   .card-preview{height:104px}
