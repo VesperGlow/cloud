@@ -212,8 +212,8 @@
 }
 
 /* ===== 阅读器布局修正：悬浮式工具栏（对齐原版 reader）=====
-   视口恒为整屏，顶栏/底栏只是悬浮叠层；隐藏工具不改变视口尺寸，
-   分栏与文字绝不挪动，也不触发整书重排（翻页卡顿的主因之一）。 */
+   视口恒为整屏，顶栏/底栏只是悬浮叠层；移动端隐藏工具时由 JS
+   收紧上下页边距并重排，充分利用浏览器实际留下的可视区域。 */
 body.reader-open{overflow:hidden}
 .modal-backdrop.reading{overflow:hidden}
 .reader-shell{display:block}
