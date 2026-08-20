@@ -39,8 +39,6 @@ export const ReaderApp = (function () {
       title: scope.querySelector('#reader-title'),
       kind: scope.querySelector('#reader-kind'),
       back: scope.querySelector('#reader-back'),
-      bar: scope.querySelector('.reader-bar'),
-      footer: scope.querySelector('.reader-footer'),
       tocButton: scope.querySelector('#toc-button'),
       viewport: scope.querySelector('#viewport'),
       loading: scope.querySelector('#loading'),
@@ -440,17 +438,14 @@ export const ReaderApp = (function () {
       node.style.boxSizing = 'border-box';
       node.style.width = `${width}px`;
       node.style.height = `${height}px`;
-      // 手机阅读时工具栏通常处于隐藏状态。原来始终保留 60px 顶距，
-      // 在鸿蒙等会占用较多浏览器栏空间的设备上会显得上下严重留白。
-      // 隐藏工具时按实际可视高度收紧；显示工具时按控件真实高度让位，
-      // 避免正文被悬浮顶栏/底栏遮住。
+      // 手机阅读时按实际可视高度收紧页边距。工具栏是悬浮叠层，
+      // 展开或收起都不改变正文尺寸与分页，避免阅读位置发生跳动。
       const mobile = width <= 850;
-      const toolsHidden = els.themeRoot.classList.contains('tools-hidden');
       const padTop = mobile
-        ? (toolsHidden ? Math.round(Math.min(28, Math.max(16, height * 0.025))) : Math.round((els.bar?.offsetHeight || 58) + 10))
+        ? Math.round(Math.min(28, Math.max(16, height * 0.025)))
         : 60;
       const padBottom = mobile
-        ? (toolsHidden ? Math.round(Math.min(22, Math.max(12, height * 0.018))) : Math.round((els.footer?.offsetHeight || 76) + 10))
+        ? Math.round(Math.min(22, Math.max(12, height * 0.018)))
         : 24;
       node.style.padding = `${padTop}px ${sidePad}px ${padBottom}px`;
       // 供 CSS 计算图片高度上限：栏高的精确像素值（图片常被包在 <p> 里，
@@ -591,8 +586,6 @@ export const ReaderApp = (function () {
   function toggleTools() {
     els.themeRoot.classList.toggle('tools-hidden');
     if (els.themeRoot.classList.contains('tools-hidden')) els.fontPopover?.classList.add('hidden');
-    // 页边距取决于工具栏是否可见；等样式生效后按当前位置比例重排。
-    window.requestAnimationFrame(() => relayoutActive());
   }
 
   function toggleTheme() {

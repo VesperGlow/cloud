@@ -212,8 +212,8 @@
 }
 
 /* ===== 阅读器布局修正：悬浮式工具栏（对齐原版 reader）=====
-   视口恒为整屏，顶栏/底栏只是悬浮叠层；移动端隐藏工具时由 JS
-   收紧上下页边距并重排，充分利用浏览器实际留下的可视区域。 */
+   视口恒为整屏，顶栏/底栏只是悬浮叠层；工具开关不改变正文尺寸，
+   不触发整书重排，正文与阅读位置保持不动。 */
 body.reader-open{overflow:hidden}
 .modal-backdrop.reading{overflow:hidden}
 .reader-shell{display:block}
