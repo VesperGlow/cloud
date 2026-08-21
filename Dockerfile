@@ -17,16 +17,16 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=web /src/internal/webui/dist ./internal/webui/dist
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/cloud ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/revaro ./cmd/server
 
 FROM alpine:3.22
 RUN apk add --no-cache ca-certificates tzdata ffmpeg \
-    && addgroup -S -g 10001 cloud \
-    && adduser -S -D -H -u 10001 -G cloud cloud \
+    && addgroup -S -g 10001 revaro \
+    && adduser -S -D -H -u 10001 -G revaro revaro \
     && mkdir -p /data \
-    && chown cloud:cloud /data
-COPY --from=backend /out/cloud /usr/local/bin/cloud
-USER cloud
+    && chown revaro:revaro /data
+COPY --from=backend /out/revaro /usr/local/bin/revaro
+USER revaro
 VOLUME ["/data"]
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/cloud"]
+ENTRYPOINT ["/usr/local/bin/revaro"]

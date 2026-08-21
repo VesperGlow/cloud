@@ -1,4 +1,4 @@
-module github.com/VesperGlow/cloud
+module github.com/VesperGlow/revaro
 
 go 1.25.0
 

@@ -120,7 +120,7 @@ func TestLoadValidations(t *testing.T) {
 
 func TestDatabasePath(t *testing.T) {
 	c := Config{DataDir: t.TempDir()}
-	want := filepath.Join(c.DataDir, "cloud.db")
+	want := filepath.Join(c.DataDir, "revaro.db")
 	if got := c.DatabasePath(); got != want {
 		t.Fatalf("database path=%q, want %q", got, want)
 	}

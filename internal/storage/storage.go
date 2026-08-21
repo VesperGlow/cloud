@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/VesperGlow/cloud/internal/config"
-	"github.com/VesperGlow/cloud/internal/fastcdc"
+	"github.com/VesperGlow/revaro/internal/config"
+	"github.com/VesperGlow/revaro/internal/fastcdc"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"

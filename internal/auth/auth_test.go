@@ -5,13 +5,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VesperGlow/cloud/internal/database"
+	"github.com/VesperGlow/revaro/internal/database"
 )
 
 var testParams = Params{Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32}
 
 func TestLoginSessionAndExpiry(t *testing.T) {
-	db, err := database.Open(t.TempDir() + "/cloud.db")
+	db, err := database.Open(t.TempDir() + "/revaro.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestLoginSessionAndExpiry(t *testing.T) {
 }
 
 func TestInitializeGeneratesOneTimeCredentials(t *testing.T) {
-	db, err := database.Open(t.TempDir() + "/cloud.db")
+	db, err := database.Open(t.TempDir() + "/revaro.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestInitializeGeneratesOneTimeCredentials(t *testing.T) {
 }
 
 func TestChangeCredentialsRevokesSessions(t *testing.T) {
-	db, err := database.Open(t.TempDir() + "/cloud.db")
+	db, err := database.Open(t.TempDir() + "/revaro.db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestChangeCredentialsRevokesSessions(t *testing.T) {
 }
 
 func TestResetCredentialsRecoversExistingDatabase(t *testing.T) {
-	db, err := database.Open(t.TempDir() + "/cloud.db")
+	db, err := database.Open(t.TempDir() + "/revaro.db")
 	if err != nil {
 		t.Fatal(err)
 	}

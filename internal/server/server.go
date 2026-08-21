@@ -23,11 +23,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/VesperGlow/cloud/internal/auth"
-	"github.com/VesperGlow/cloud/internal/config"
-	"github.com/VesperGlow/cloud/internal/ids"
-	"github.com/VesperGlow/cloud/internal/storage"
-	"github.com/VesperGlow/cloud/internal/webui"
+	"github.com/VesperGlow/revaro/internal/auth"
+	"github.com/VesperGlow/revaro/internal/config"
+	"github.com/VesperGlow/revaro/internal/ids"
+	"github.com/VesperGlow/revaro/internal/storage"
+	"github.com/VesperGlow/revaro/internal/webui"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -218,12 +218,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.limiter.success(ip)
-	http.SetCookie(w, &http.Cookie{Name: "cloud_session", Value: token, Path: "/", HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode, Expires: expires, MaxAge: int(time.Until(expires).Seconds())})
+	http.SetCookie(w, &http.Cookie{Name: "revaro_session", Value: token, Path: "/", HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode, Expires: expires, MaxAge: int(time.Until(expires).Seconds())})
 	s.log.Info("user logged in", "user", in.Username)
 	writeJSON(w, http.StatusOK, map[string]any{"username": in.Username, "has_avatar": s.hasAvatar(r.Context())})
 }
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie("cloud_session"); err == nil {
+	if c, err := r.Cookie("revaro_session"); err == nil {
 		s.auth.Logout(r.Context(), c.Value)
 	}
 	s.clearSessionCookie(w)
@@ -345,14 +345,14 @@ func (s *Server) changeCredentials(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) clearSessionCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{Name: "cloud_session", Value: "", Path: "/", HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode, MaxAge: -1, Expires: time.Unix(1, 0)})
+	http.SetCookie(w, &http.Cookie{Name: "revaro_session", Value: "", Path: "/", HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode, MaxAge: -1, Expires: time.Unix(1, 0)})
 }
 
 type userKey struct{}
 
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := r.Cookie("cloud_session")
+		c, err := r.Cookie("revaro_session")
 		if err != nil {
 			problem(w, http.StatusUnauthorized, "authentication required")
 			return

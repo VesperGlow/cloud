@@ -78,7 +78,7 @@ function finishDialog(confirmed:boolean){const resolve=dialogResolve;dialogResol
 
 function notify(text:string, kind:'error'|'success'='error') { toast.text=text;toast.kind=kind;window.clearTimeout(toastTimer);toastTimer=window.setTimeout(()=>toast.text='',3600) }
 
-function openReader(item:DriveFile){readerFile.value=item;openModal('reader');history.replaceState({cloudNav:true},'','/read/'+item.id)}
+function openReader(item:DriveFile){readerFile.value=item;openModal('reader');history.replaceState({revaroNav:true},'','/read/'+item.id)}
 async function checkSession() {
   try { const me=await api<ProfileResponse>('/api/auth/me');user.value=me.username;hasAvatar.value=me.has_avatar;await openRoute() }
   catch { user.value=null;hasAvatar.value=false }
@@ -92,7 +92,7 @@ async function openRoute(){
     if(fm){
       const id=decodeURIComponent(fm[1])
       await openFolder(id)
-      if(currentId.value!==id)history.replaceState({cloudNav:true},'','/')
+      if(currentId.value!==id)history.replaceState({revaroNav:true},'','/')
     }else{
       await openFolder(ROOT)
     }
@@ -103,7 +103,7 @@ async function openRoute(){
 async function openDeepLink(){
   const m=location.pathname.match(/^\/read\/([^/]+)\/?$/)
   if(!m)return
-  history.replaceState({cloudNav:true},'',folderURL(currentId.value))
+  history.replaceState({revaroNav:true},'',folderURL(currentId.value))
   try{
     const data=await api<{file:DriveFile}>(`/api/files/${decodeURIComponent(m[1])}`)
     if(data.file.kind==='file'&&isBook(data.file))openReader(data.file)
@@ -158,8 +158,8 @@ async function openFolder(id:string){
   try{
     const [meta,list,stats]=await Promise.all([api<{file:DriveFile;breadcrumbs:DriveFile[]}>(`/api/files/${id}`),api<{items:DriveFile[]}>(`/api/files/${id}/children`),api<StorageStats>('/api/storage/stats')])
     if(seq!==folderSeq)return
-    if(!suppressHistory&&id!==currentId.value){navActions.value.push({kind:'folder',id:currentId.value});window.history.pushState({cloudNav:true},'')}
-    trashMode.value=false;currentId.value=id;current.value=meta.file;breadcrumbs.value=meta.breadcrumbs;items.value=list.items;storageStats.total_bytes=stats.total_bytes;storageStats.file_count=stats.file_count;selected.value=null;clearSelection();history.replaceState({cloudNav:true},'',folderURL(id))
+    if(!suppressHistory&&id!==currentId.value){navActions.value.push({kind:'folder',id:currentId.value});window.history.pushState({revaroNav:true},'')}
+    trashMode.value=false;currentId.value=id;current.value=meta.file;breadcrumbs.value=meta.breadcrumbs;items.value=list.items;storageStats.total_bytes=stats.total_bytes;storageStats.file_count=stats.file_count;selected.value=null;clearSelection();history.replaceState({revaroNav:true},'',folderURL(id))
   }catch(e){if(seq===folderSeq)notify((e as Error).message)}
   finally{if(seq===folderSeq)loading.value=false}
 }
@@ -174,7 +174,7 @@ function handlePopState(){
   const action=navActions.value.pop()
   if(!action)return
   if(action.kind==='modal-close'){
-    if(modal.value==='reader')history.replaceState({cloudNav:true},'',folderURL(currentId.value))
+    if(modal.value==='reader')history.replaceState({revaroNav:true},'',folderURL(currentId.value))
     modal.value=null;return
   }
   popChain=popChain.then(async()=>{
@@ -183,7 +183,7 @@ function handlePopState(){
   })
 }
 function openModal(name:ModalName){
-  if(!modal.value){navActions.value.push({kind:'modal-close'});window.history.pushState({cloudNav:true},'')}
+  if(!modal.value){navActions.value.push({kind:'modal-close'});window.history.pushState({revaroNav:true},'')}
   modal.value=name
 }
 function closeModal(){if(modal.value)window.history.back()}
@@ -283,7 +283,7 @@ async function saveDocument(){
 }
 async function closeEditor(){if(editorDirty.value&&!await confirmDialog({title:'放弃未保存的修改？',message:'关闭后，本次修改将无法恢复。',confirmLabel:'放弃修改',tone:'danger'}))return;closeModal()}
 function closeBackdrop(){if(modal.value==='editor')void closeEditor();else closeModal()}
-function setViewMode(mode:'list'|'grid'){viewMode.value=mode;localStorage.setItem('cloud-view-mode',mode)}
+function setViewMode(mode:'list'|'grid'){viewMode.value=mode;localStorage.setItem('revaro-view-mode',mode)}
 function toggleSelection(item:DriveFile){
   const next=new Set(selectedIds.value)
   if(next.has(item.id))next.delete(item.id);else next.add(item.id)
@@ -439,14 +439,14 @@ async function retry(task:UploadTask){await abortRemote(task);task.status='queue
 function clearFinished(){for(let i=tasks.length-1;i>=0;i--)if(['done','cancelled'].includes(tasks[i].status))tasks.splice(i,1);for(let i=downloads.length-1;i>=0;i--)if(downloads[i].status!=='starting')downloads.splice(i,1)}
 // 完成记录保留在传输中心，等用户主动清除。
 function scheduleAutoClear(){}
-onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='list'||saved==='grid')viewMode.value=saved;window.addEventListener('popstate',handlePopState);checkSession()})
+onMounted(()=>{const saved=localStorage.getItem('revaro-view-mode');if(saved==='list'||saved==='grid')viewMode.value=saved;window.addEventListener('popstate',handlePopState);checkSession()})
 onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(const job of hashJobs.values())job.reject(new Error('页面已关闭'));hashJobs.clear()})
 </script>
 
 <template>
   <div v-if="checking" class="splash"><div class="brand-mark"><img src="/logo.png" alt=""></div><div class="spinner"></div></div>
   <main v-else-if="!user" class="login-page">
-    <section class="login-visual"><div class="glow glow-a"></div><div class="glow glow-b"></div><div class="visual-copy"><span class="eyebrow">PRIVATE · DIRECT · YOURS</span><h1>你的文件，<br>安静地待在云上。</h1><p>轻量、自托管，文件按内容块直传你的 S3。</p></div><div class="cloud-card"><span>☁</span><div><strong>Seafile 式块存储</strong><small>内容寻址 · 跨文件去重</small></div></div></section>
+    <section class="login-visual"><div class="glow glow-a"></div><div class="glow glow-b"></div><div class="visual-copy"><span class="eyebrow">PRIVATE · DIRECT · YOURS</span><h1>你的文件，<br>安静地待在云上。</h1><p>轻量、自托管，文件按内容块直传你的 S3。</p></div><div class="revaro-card"><span>☁</span><div><strong>Seafile 式块存储</strong><small>内容寻址 · 跨文件去重</small></div></div></section>
     <section class="login-panel"><form class="login-form" @submit.prevent="submitLogin"><div class="logo"><span class="brand-mark small"><img src="/logo.png" alt=""></span><span>revaro</span></div><div><p class="eyebrow dark">WELCOME BACK</p><h2>登录私人空间</h2><p class="muted">首次启动的随机凭据可在容器日志中查看</p></div><label>用户名<input v-model="login.username" autocomplete="username" maxlength="128" required></label><label>密码<input v-model="login.password" type="password" autocomplete="current-password" maxlength="1024" required></label><p v-if="login.notice" class="form-success">{{ login.notice }}</p><p v-if="login.error" class="form-error">{{ login.error }}</p><button class="primary wide" :disabled="login.busy">{{ login.busy ? '正在验证…' : '进入我的网盘' }}</button></form></section>
   </main>
 
