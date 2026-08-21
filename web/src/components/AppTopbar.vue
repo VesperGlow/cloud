@@ -25,7 +25,7 @@ defineEmits<{
 <template>
   <header class="topbar">
     <button class="logo brand-button" title="回到我的文件" @click="$emit('home')">
-      <span>Cloud</span>
+      <span>revaro</span>
     </button>
     <div class="top-actions">
       <TransferCenter :uploads="uploads" :downloads="downloads" @clear="$emit('clearTransfers')" @cancel="$emit('cancelUpload',$event)" @retry="$emit('retryUpload',$event)" />

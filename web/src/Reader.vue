@@ -22,7 +22,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   ReaderApp.saveProgress()
   ReaderApp.hide()
-  document.title = 'Cloud · 私人网盘'
+  document.title = 'revaro · 私人网盘'
 })
 </script>
 

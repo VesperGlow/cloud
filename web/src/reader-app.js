@@ -287,7 +287,7 @@ export const ReaderApp = (function () {
   function setHeader(info) {
     els.title.textContent = info.title;
     els.kind.textContent = (info.kind || '').toUpperCase();
-    document.title = `${info.title} · Cloud`;
+    document.title = `${info.title} · revaro`;
   }
 
   async function loadBookState(bookId, options) {

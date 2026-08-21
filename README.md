@@ -1,6 +1,6 @@
-# Cloud
+# revaro
 
-Cloud 是一个轻量、单用户、自托管的私人 S3 网盘，存储层采用 Seafile 式的**内容寻址块存储**：每个文件由 FastCDC 按内容切成可变大小的块，块以 SHA-256 内容寻址存入 S3，同一内容跨文件或跨版本只存一份；在文件中间插入内容也不会让后续所有块边界整体错位。块列表写入 JSON 清单（Seafile "fs object" 的等价物），SQLite 里的文件树只保存指向清单的键。Go 服务处理认证、SQLite 元数据和 S3 控制面；浏览器在 Worker 中分块、哈希并把块直传 S3，单块文件下载仍走短期 Presigned URL 直连，多块文件由服务端流式拼接（支持 Range）。内置**阅读器**：EPUB/TXT 在服务端解析清洗，前端按章分段、按视口分栏分页，支持目录、滑动翻页、进度与字号/明暗偏好。内置**缩略图管线**：图片与 EPUB 封面由服务端重采样、视频由 ffmpeg 抽帧，持久化缓存。内置编辑器读写不超过 1 MiB 的文本文件时会经过应用服务，以便校验 UTF-8、大小和并发修改。
+revaro 是一个轻量、单用户、自托管的私人 S3 网盘，存储层采用 Seafile 式的**内容寻址块存储**：每个文件由 FastCDC 按内容切成可变大小的块，块以 SHA-256 内容寻址存入 S3，同一内容跨文件或跨版本只存一份；在文件中间插入内容也不会让后续所有块边界整体错位。块列表写入 JSON 清单（Seafile "fs object" 的等价物），SQLite 里的文件树只保存指向清单的键。Go 服务处理认证、SQLite 元数据和 S3 控制面；浏览器在 Worker 中分块、哈希并把块直传 S3，单块文件下载仍走短期 Presigned URL 直连，多块文件由服务端流式拼接（支持 Range）。内置**阅读器**：EPUB/TXT 在服务端解析清洗，前端按章分段、按视口分栏分页，支持目录、滑动翻页、进度与字号/明暗偏好。内置**缩略图管线**：图片与 EPUB 封面由服务端重采样、视频由 ffmpeg 抽帧，持久化缓存。内置编辑器读写不超过 1 MiB 的文本文件时会经过应用服务，以便校验 UTF-8、大小和并发修改。
 
 ## 架构
 
@@ -21,7 +21,7 @@ flowchart LR
 
 ## 快速开始（Docker / Podman）
 
-仓库内的 Compose 配置默认拉取已发布的多架构镜像 `ghcr.io/vesperglow/cloud:latest`，同时启动 MinIO，并自动创建私有 Bucket 和开发用 CORS。
+仓库内的 Compose 配置默认拉取已发布的多架构镜像 `ghcr.io/vesperglow/revaro:latest`，同时启动 MinIO，并自动创建私有 Bucket 和开发用 CORS。
 
 ```bash
 cp .env.example .env
@@ -41,7 +41,7 @@ podman compose up -d
 也可以直接拉取镜像：
 
 ```bash
-docker pull ghcr.io/vesperglow/cloud:latest
+docker pull ghcr.io/vesperglow/revaro:latest
 ```
 
 每次 `main` 更新会发布 `latest` 和完整 commit SHA 标签；`v*` Git tag 还会发布对应版本标签。若 GHCR Package 尚未设为 Public，请先登录 GHCR，或在 GitHub Package 设置中将其改为公开。
@@ -58,21 +58,21 @@ npm ci
 npm run build
 cd ..
 go test ./...
-go build -o cloud ./cmd/server
+go build -o revaro ./cmd/server
 ```
 
 从当前源码构建容器并让 Compose 使用本地镜像：
 
 ```bash
-docker build -t cloud:local .
-CLOUD_IMAGE=cloud:local docker compose up -d
+docker build -t revaro:local .
+REVARO_IMAGE=revaro:local docker compose up -d
 ```
 
 运行：
 
 ```bash
 set -a; . ./.env; set +a
-./cloud
+./revaro
 ```
 
 ## 配置
@@ -112,7 +112,7 @@ docker compose run --rm --no-deps cloud reset-admin
 docker compose start cloud
 ```
 
-可在命令末尾指定新用户名，例如 `cloud reset-admin owner`。恢复密码同样只显示一次，登录后请立即从右上角账户设置中修改。账户设置也支持上传、更换和移除个人头像；头像文件保存在同一个私有 S3 Bucket 中，大小限制为 2 MiB。
+可在命令末尾指定新用户名，例如 `revaro reset-admin owner`。恢复密码同样只显示一次，登录后请立即从右上角账户设置中修改。账户设置也支持上传、更换和移除个人头像；头像文件保存在同一个私有 S3 Bucket 中，大小限制为 2 MiB。
 
 ## S3 权限
 
@@ -268,7 +268,7 @@ docker run --rm -v cloud_cloud-data:/data -v "$PWD/backups:/backup" alpine \
 docker compose start cloud
 ```
 
-不停机备份应使用 SQLite Online Backup API 或 `sqlite3 /data/cloud.db ".backup '/backup/cloud.db'"`，不要只复制运行中的 WAL 主文件。恢复时先停止 Cloud，用备份替换 `/data/cloud.db`，确认文件属主可由容器 UID `10001` 读取，再启动服务。S3 对象也必须来自相互匹配的备份时间点。
+不停机备份应使用 SQLite Online Backup API 或 `sqlite3 /data/cloud.db ".backup '/backup/cloud.db'"`，不要只复制运行中的 WAL 主文件。恢复时先停止 revaro，用备份替换 `/data/cloud.db`，确认文件属主可由容器 UID `10001` 读取，再启动服务。S3 对象也必须来自相互匹配的备份时间点。
 
 ## 安全设计
 
@@ -298,7 +298,7 @@ cd web && npm ci && npm run build && npm run lint && cd ..
 go test ./...
 go vet ./...
 go build ./...
-docker build -t cloud:test .
+docker build -t revaro:test .
 ```
 
 前端有 ESLint（`npm run lint`）与 `vue-tsc` 类型检查（构建时自动执行）。测试覆盖登录、Session、Session 过期、密码盐、头像生命周期、媒体预览与空间统计、文本编辑（含过期 ETag 保存冲突 409）、公开分享（单块跳转与多块流式 Range）、回收站（目录树软删除、分享隔离、恢复、重名冲突、永久删除、清空与 GC 引用保护）、同目录名称冲突、root 保护、目录循环、写请求 Origin 校验（无 Origin / 跨源拒绝）、未知 API 路径返回 JSON 404、过期上传无法完成、块上传 `pending → ready`、块登记、缺失块修复响应、布局校验、多块下载 Range、去重共享、空文件、垃圾回收（含被引用清单读取失败时中止回收）、遗留对象迁移、缩略图（图片重采样与缓存头、EPUB 封面、视频上传/命中/非法拒绝、ffmpeg 抽帧）、阅读器（EPUB 解包/目录/白名单清洗/图片重写/解压炸弹拒绝、TXT 编码与章节偏移、进度存取、接口鉴权），以及 config（默认值/覆盖/校验）、ids（UUID 格式）、database（迁移幂等、WAL、外键）、webui（SPA 回退、路径穿越）单元测试。GitHub Actions 会对每次 push / PR 重复执行这些检查。
