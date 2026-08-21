@@ -9,6 +9,14 @@ export interface UploadTask {
   requests:XMLHttpRequest[]
 }
 
+export interface DownloadTask {
+  id:string
+  name:string
+  size:number
+  status:'starting'|'handed-off'|'failed'
+  error:string
+}
+
 export interface FolderOption { id:string; name:string; depth:number }
 export interface ShareResponse { active:boolean; url?:string; created_at?:string }
 export interface ProfileResponse { username:string; has_avatar:boolean }

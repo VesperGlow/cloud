@@ -448,6 +448,87 @@ func TestDirectoryCannotMoveIntoDescendant(t *testing.T) {
 	}
 }
 
+func TestTrashRestoresTreeAndProtectsContentFromGC(t *testing.T) {
+	a := newTestApp(t)
+	parentRR := a.request("POST", "/api/directories", map[string]any{"parent_id": RootID, "name": "Archive"}, true)
+	parent := decode[File](t, parentRR)
+	childRR := a.request("POST", "/api/directories", map[string]any{"parent_id": parent.ID, "name": "Nested"}, true)
+	child := decode[File](t, childRR)
+	f := a.readyFile(t, "kept.txt", []byte("recover me"))
+	if rr := a.request("PATCH", "/api/files/"+f.ID, map[string]any{"parent_id": child.ID}, true); rr.Code != http.StatusOK {
+		t.Fatalf("move file=%d: %s", rr.Code, rr.Body.String())
+	}
+	shareRR := a.request("POST", "/api/files/"+f.ID+"/share", nil, true)
+	share := decode[struct {
+		URL string `json:"url"`
+	}](t, shareRR)
+	shareURL, _ := url.Parse(share.URL)
+
+	if rr := a.request("DELETE", "/api/files/"+parent.ID, nil, true); rr.Code != http.StatusNoContent {
+		t.Fatalf("trash tree=%d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := a.request("GET", "/api/files/"+f.ID, nil, true); rr.Code != http.StatusNotFound {
+		t.Fatalf("trashed descendant remains readable: %d", rr.Code)
+	}
+	if rr := a.request("GET", shareURL.Path, nil, false); rr.Code != http.StatusNotFound {
+		t.Fatalf("trashed share remains readable: %d", rr.Code)
+	}
+	trashRR := a.request("GET", "/api/trash", nil, true)
+	trash := decode[struct {
+		Items []File `json:"items"`
+	}](t, trashRR)
+	if len(trash.Items) != 1 || trash.Items[0].ID != parent.ID || trash.Items[0].DeletedAt == "" {
+		t.Fatalf("trash roots=%+v", trash.Items)
+	}
+	if rr := a.request("POST", "/api/trash/"+parent.ID+"/restore", nil, true); rr.Code != http.StatusNoContent {
+		t.Fatalf("restore=%d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := a.request("GET", "/api/files/"+f.ID, nil, true); rr.Code != http.StatusOK {
+		t.Fatalf("restored descendant unavailable: %d", rr.Code)
+	}
+	if rr := a.request("GET", shareURL.Path, nil, false); rr.Code != http.StatusFound {
+		t.Fatalf("restored share unavailable: %d", rr.Code)
+	}
+
+	if rr := a.request("DELETE", "/api/files/"+parent.ID, nil, true); rr.Code != http.StatusNoContent {
+		t.Fatalf("trash again=%d", rr.Code)
+	}
+	if rr := a.request("POST", "/api/directories", map[string]any{"parent_id": RootID, "name": "Archive"}, true); rr.Code != http.StatusCreated {
+		t.Fatalf("reuse trashed name=%d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := a.request("POST", "/api/trash/"+parent.ID+"/restore", nil, true); rr.Code != http.StatusConflict {
+		t.Fatalf("restore conflict=%d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := a.request("DELETE", "/api/trash/"+parent.ID, nil, true); rr.Code != http.StatusNoContent {
+		t.Fatalf("purge tree=%d: %s", rr.Code, rr.Body.String())
+	}
+	var remaining int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM files WHERE id IN (?,?,?)`, parent.ID, child.ID, f.ID).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("purged tree remains: count=%d err=%v", remaining, err)
+	}
+}
+
+func TestEmptyTrashRemovesEveryDeletedTree(t *testing.T) {
+	a := newTestApp(t)
+	first := a.readyFile(t, "first.txt", []byte("first"))
+	second := a.readyFile(t, "second.txt", []byte("second"))
+	for _, f := range []File{first, second} {
+		if rr := a.request("DELETE", "/api/files/"+f.ID, nil, true); rr.Code != http.StatusNoContent {
+			t.Fatalf("trash %s=%d", f.Name, rr.Code)
+		}
+	}
+	if rr := a.request("DELETE", "/api/trash", nil, true); rr.Code != http.StatusNoContent {
+		t.Fatalf("empty trash=%d: %s", rr.Code, rr.Body.String())
+	}
+	trash := a.request("GET", "/api/trash", nil, true)
+	items := decode[struct {
+		Items []File `json:"items"`
+	}](t, trash)
+	if len(items.Items) != 0 {
+		t.Fatalf("trash is not empty: %+v", items.Items)
+	}
+}
+
 func TestShareLinkCanBeReadRotatedAndRevoked(t *testing.T) {
 	a := newTestApp(t)
 	f := a.readyFile(t, "profile.yaml", []byte("name: value\n"))
@@ -857,17 +938,30 @@ func TestGarbageCollector(t *testing.T) {
 	if del := a.request("DELETE", "/api/files/"+fb.ID, nil, true); del.Code != http.StatusNoContent {
 		t.Fatalf("delete=%d: %s", del.Code, del.Body.String())
 	}
-	// Mock objects default to a zero LastModified, i.e. older than any
-	// grace period — everything unreferenced should be collected.
+	// 回收站里的清单和块仍是活引用，GC 不得提前清理。
+	a.srv.CollectGarbage(context.Background())
+	if _, ok := a.store.manifests[fb.objectKey]; !ok {
+		t.Fatal("trashed manifest was collected")
+	}
+	if _, ok := a.store.blocks[blockC]; !ok {
+		t.Fatal("trashed block C was collected")
+	}
+	if _, ok := a.store.blocks[blockD]; !ok {
+		t.Fatal("trashed block D was collected")
+	}
+	if purge := a.request("DELETE", "/api/trash/"+fb.ID, nil, true); purge.Code != http.StatusNoContent {
+		t.Fatalf("purge=%d: %s", purge.Code, purge.Body.String())
+	}
+	// 永久删除元数据后才会成为孤儿并被回收。
 	a.srv.CollectGarbage(context.Background())
 	if _, ok := a.store.manifests[fb.objectKey]; ok {
-		t.Fatal("orphan manifest was not collected")
+		t.Fatal("purged manifest was not collected")
 	}
 	if _, ok := a.store.blocks[blockC]; ok {
-		t.Fatal("orphan block C was not collected")
+		t.Fatal("purged block C was not collected")
 	}
 	if _, ok := a.store.blocks[blockD]; ok {
-		t.Fatal("orphan block D was not collected")
+		t.Fatal("purged block D was not collected")
 	}
 	if _, ok := a.store.manifests[fa.objectKey]; !ok {
 		t.Fatal("referenced manifest was collected")

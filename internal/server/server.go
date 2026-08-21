@@ -51,17 +51,19 @@ type Server struct {
 }
 
 type File struct {
-	ID        string  `json:"id"`
-	ParentID  *string `json:"parent_id"`
-	Name      string  `json:"name"`
-	Kind      string  `json:"kind"`
-	Size      int64   `json:"size"`
-	MimeType  string  `json:"mime_type,omitempty"`
-	ETag      string  `json:"etag,omitempty"`
-	Status    string  `json:"status"`
-	CreatedAt string  `json:"created_at"`
-	UpdatedAt string  `json:"updated_at"`
-	objectKey string
+	ID              string  `json:"id"`
+	ParentID        *string `json:"parent_id"`
+	Name            string  `json:"name"`
+	Kind            string  `json:"kind"`
+	Size            int64   `json:"size"`
+	MimeType        string  `json:"mime_type,omitempty"`
+	ETag            string  `json:"etag,omitempty"`
+	Status          string  `json:"status"`
+	CreatedAt       string  `json:"created_at"`
+	UpdatedAt       string  `json:"updated_at"`
+	DeletedAt       string  `json:"deleted_at,omitempty"`
+	RestoreParentID *string `json:"restore_parent_id,omitempty"`
+	objectKey       string
 }
 
 func New(db *sql.DB, store storage.Storage, a *auth.Service, cfg config.Config, logger *slog.Logger) *Server {
@@ -118,6 +120,10 @@ func (s *Server) Handler() http.Handler {
 			r.Post("/documents", s.createDocument)
 			r.Patch("/files/{id}", s.patchFile)
 			r.Delete("/files/{id}", s.deleteFile)
+			r.Get("/trash", s.trash)
+			r.Delete("/trash", s.emptyTrash)
+			r.Post("/trash/{id}/restore", s.restoreTrash)
+			r.Delete("/trash/{id}", s.purgeTrash)
 			r.Post("/uploads", s.createUpload)
 			r.Post("/uploads/{id}/blocks", s.uploadBlocks)
 			r.Post("/uploads/{id}/complete", s.completeUpload)
@@ -362,20 +368,24 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 
 func scanFile(row interface{ Scan(...any) error }) (File, error) {
 	var f File
-	var parent, mime, etag sql.NullString
-	err := row.Scan(&f.ID, &parent, &f.Name, &f.Kind, &f.objectKey, &f.Size, &mime, &etag, &f.Status, &f.CreatedAt, &f.UpdatedAt)
+	var parent, mime, etag, deleted, restoreParent sql.NullString
+	err := row.Scan(&f.ID, &parent, &f.Name, &f.Kind, &f.objectKey, &f.Size, &mime, &etag, &f.Status, &f.CreatedAt, &f.UpdatedAt, &deleted, &restoreParent)
 	if parent.Valid {
 		f.ParentID = &parent.String
 	}
 	f.MimeType = mime.String
 	f.ETag = etag.String
+	f.DeletedAt = deleted.String
+	if restoreParent.Valid {
+		f.RestoreParentID = &restoreParent.String
+	}
 	return f, err
 }
 
-const fileColumns = `id,parent_id,name,kind,COALESCE(object_key,''),size,mime_type,etag,status,created_at,updated_at`
+const fileColumns = `id,parent_id,name,kind,COALESCE(object_key,''),size,mime_type,etag,status,created_at,updated_at,deleted_at,restore_parent_id`
 
 func (s *Server) file(ctx context.Context, id string) (File, error) {
-	return scanFile(s.db.QueryRowContext(ctx, `SELECT `+fileColumns+` FROM files WHERE id=?`, id))
+	return scanFile(s.db.QueryRowContext(ctx, `SELECT `+fileColumns+` FROM files WHERE id=? AND deleted_at IS NULL`, id))
 }
 func (s *Server) getFile(w http.ResponseWriter, r *http.Request) {
 	f, err := s.file(r.Context(), chi.URLParam(r, "id"))
@@ -395,8 +405,8 @@ func (s *Server) getFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"file": f, "breadcrumbs": crumbs})
 }
 func (s *Server) breadcrumbs(ctx context.Context, id string) ([]File, error) {
-	const qualified = `f.id,f.parent_id,f.name,f.kind,COALESCE(f.object_key,''),f.size,f.mime_type,f.etag,f.status,f.created_at,f.updated_at`
-	rows, err := s.db.QueryContext(ctx, `WITH RECURSIVE p(id,parent_id,name,kind,object_key,size,mime_type,etag,status,created_at,updated_at,depth) AS (SELECT `+fileColumns+`,0 FROM files WHERE id=? UNION ALL SELECT `+qualified+`,p.depth+1 FROM files f JOIN p ON f.id=p.parent_id) SELECT `+fileColumns+` FROM p ORDER BY depth DESC`, id)
+	const qualified = `f.id,f.parent_id,f.name,f.kind,COALESCE(f.object_key,''),f.size,f.mime_type,f.etag,f.status,f.created_at,f.updated_at,f.deleted_at,f.restore_parent_id`
+	rows, err := s.db.QueryContext(ctx, `WITH RECURSIVE p(id,parent_id,name,kind,object_key,size,mime_type,etag,status,created_at,updated_at,deleted_at,restore_parent_id,depth) AS (SELECT `+fileColumns+`,0 FROM files WHERE id=? AND deleted_at IS NULL UNION ALL SELECT `+qualified+`,p.depth+1 FROM files f JOIN p ON f.id=p.parent_id WHERE f.deleted_at IS NULL) SELECT `+fileColumns+` FROM p ORDER BY depth DESC`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -417,7 +427,7 @@ func (s *Server) children(w http.ResponseWriter, r *http.Request) {
 		problem(w, 404, "directory not found")
 		return
 	}
-	rows, err := s.db.QueryContext(r.Context(), `SELECT `+fileColumns+` FROM files WHERE parent_id=? ORDER BY kind DESC, name COLLATE NOCASE`, parent.ID)
+	rows, err := s.db.QueryContext(r.Context(), `SELECT `+fileColumns+` FROM files WHERE parent_id=? AND deleted_at IS NULL ORDER BY kind DESC, name COLLATE NOCASE`, parent.ID)
 	if err != nil {
 		problem(w, 500, "database error")
 		return
@@ -437,7 +447,7 @@ func (s *Server) children(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) storageStats(w http.ResponseWriter, r *http.Request) {
 	var totalBytes, fileCount int64
-	if err := s.db.QueryRowContext(r.Context(), `SELECT COALESCE(SUM(size),0),COUNT(*) FROM files WHERE kind='file' AND status='ready'`).Scan(&totalBytes, &fileCount); err != nil {
+	if err := s.db.QueryRowContext(r.Context(), `SELECT COALESCE(SUM(size),0),COUNT(*) FROM files WHERE kind='file' AND status='ready' AND deleted_at IS NULL`).Scan(&totalBytes, &fileCount); err != nil {
 		problem(w, http.StatusInternalServerError, "could not calculate storage usage")
 		return
 	}
@@ -702,30 +712,142 @@ func (s *Server) deleteFile(w http.ResponseWriter, r *http.Request) {
 		problem(w, 404, "file not found")
 		return
 	}
-	if f.Kind == "directory" {
-		var n int
-		if err := s.db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM files WHERE parent_id=?`, id).Scan(&n); err != nil {
-			problem(w, 500, "database error")
-			return
-		}
-		if n > 0 {
-			problem(w, 409, "directory must be empty before deletion")
-			return
-		}
+	// 未完成的文件没有可恢复内容，仍直接清掉上传记录；ready 项（包括
+	// 非空目录）整棵移入回收站，内容块继续被 GC 视为存活引用。
+	if f.Kind == "file" && f.Status != "ready" {
 		if _, err = s.db.ExecContext(r.Context(), `DELETE FROM files WHERE id=?`, id); err != nil {
-			problem(w, 500, "could not delete directory")
+			problem(w, 500, "could not delete file")
 			return
 		}
-		w.WriteHeader(204)
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	// 任何状态的文件行都可以删除：pending 行是失败/中断的上传遗留，
-	// 级联清理 uploads 记录后，孤儿块由垃圾回收器兜底。
-	if _, err = s.db.ExecContext(r.Context(), `DELETE FROM files WHERE id=?`, id); err != nil {
-		problem(w, 500, "could not delete file")
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		problem(w, 500, "could not open trash")
+		return
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err = tx.ExecContext(r.Context(), `WITH RECURSIVE tree(id) AS (SELECT id FROM files WHERE id=? AND deleted_at IS NULL UNION ALL SELECT f.id FROM files f JOIN tree t ON f.parent_id=t.id WHERE f.deleted_at IS NULL) UPDATE files SET deleted_at=?,trash_root_id=? WHERE id IN tree`, id, now, id); err == nil {
+		_, err = tx.ExecContext(r.Context(), `UPDATE files SET restore_parent_id=parent_id,parent_id=NULL WHERE id=?`, id)
+	}
+	if err != nil || tx.Commit() != nil {
+		problem(w, 500, "could not move item to trash")
 		return
 	}
 	w.WriteHeader(204)
+}
+
+func (s *Server) trash(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.QueryContext(r.Context(), `SELECT `+fileColumns+` FROM files WHERE deleted_at IS NOT NULL AND trash_root_id=id ORDER BY deleted_at DESC`)
+	if err != nil {
+		problem(w, 500, "could not read trash")
+		return
+	}
+	defer rows.Close()
+	items := []File{}
+	for rows.Next() {
+		f, scanErr := scanFile(rows)
+		if scanErr != nil {
+			problem(w, 500, "could not read trash")
+			return
+		}
+		items = append(items, f)
+	}
+	if err := rows.Err(); err != nil {
+		problem(w, 500, "could not read trash")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"items": items})
+}
+
+func (s *Server) restoreTrash(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	f, err := scanFile(s.db.QueryRowContext(r.Context(), `SELECT `+fileColumns+` FROM files WHERE id=? AND deleted_at IS NOT NULL AND trash_root_id=id`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		problem(w, 404, "trash item not found")
+		return
+	}
+	if err != nil {
+		problem(w, 500, "could not read trash item")
+		return
+	}
+	parentID := RootID
+	if f.RestoreParentID != nil {
+		var valid int
+		if err := s.db.QueryRowContext(r.Context(), `SELECT EXISTS(SELECT 1 FROM files WHERE id=? AND kind='directory' AND status='ready' AND deleted_at IS NULL)`, *f.RestoreParentID).Scan(&valid); err != nil {
+			problem(w, 500, "could not validate restore location")
+			return
+		}
+		if valid == 1 {
+			parentID = *f.RestoreParentID
+		}
+	}
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		problem(w, 500, "could not restore item")
+		return
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(r.Context(), `UPDATE files SET parent_id=? WHERE id=?`, parentID, id); err == nil {
+		_, err = tx.ExecContext(r.Context(), `UPDATE files SET deleted_at=NULL,restore_parent_id=NULL,trash_root_id=NULL WHERE trash_root_id=?`, id)
+	}
+	if isConflict(err) {
+		problem(w, 409, "an item with that name already exists at the restore location")
+		return
+	}
+	if err != nil || tx.Commit() != nil {
+		problem(w, 500, "could not restore item")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) purgeTrash(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var exists int
+	if err := s.db.QueryRowContext(r.Context(), `SELECT EXISTS(SELECT 1 FROM files WHERE id=? AND deleted_at IS NOT NULL AND trash_root_id=id)`, id).Scan(&exists); err != nil {
+		problem(w, 500, "could not read trash item")
+		return
+	}
+	if exists == 0 {
+		problem(w, 404, "trash item not found")
+		return
+	}
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		problem(w, 500, "could not permanently delete item")
+		return
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(r.Context(), `PRAGMA defer_foreign_keys=ON`)
+	if err == nil {
+		_, err = tx.ExecContext(r.Context(), `WITH RECURSIVE tree(id) AS (SELECT id FROM files WHERE id=? UNION ALL SELECT f.id FROM files f JOIN tree t ON f.parent_id=t.id) DELETE FROM files WHERE id IN tree`, id)
+	}
+	if err != nil || tx.Commit() != nil {
+		problem(w, 500, "could not permanently delete item")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) emptyTrash(w http.ResponseWriter, r *http.Request) {
+	tx, err := s.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		problem(w, 500, "could not empty trash")
+		return
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(r.Context(), `PRAGMA defer_foreign_keys=ON`)
+	if err == nil {
+		_, err = tx.ExecContext(r.Context(), `DELETE FROM files WHERE deleted_at IS NOT NULL`)
+	}
+	if err != nil || tx.Commit() != nil {
+		problem(w, 500, "could not empty trash")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 func (s *Server) download(w http.ResponseWriter, r *http.Request) { s.streamFile(w, r, false) }
 func (s *Server) preview(w http.ResponseWriter, r *http.Request)  { s.streamFile(w, r, true) }
@@ -866,7 +988,7 @@ func newShareToken() (string, error) {
 func (s *Server) getShare(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	var token, created string
-	err := s.db.QueryRowContext(r.Context(), `SELECT s.token,s.created_at FROM shares s JOIN files f ON f.id=s.file_id WHERE s.file_id=? AND f.kind='file' AND f.status='ready'`, id).Scan(&token, &created)
+	err := s.db.QueryRowContext(r.Context(), `SELECT s.token,s.created_at FROM shares s JOIN files f ON f.id=s.file_id WHERE s.file_id=? AND f.kind='file' AND f.status='ready' AND f.deleted_at IS NULL`, id).Scan(&token, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeJSON(w, http.StatusOK, map[string]any{"active": false})
 		return
@@ -918,7 +1040,7 @@ func (s *Server) publicShare(w http.ResponseWriter, r *http.Request) {
 	}
 	var f File
 	var parent, mime, etag sql.NullString
-	err := s.db.QueryRowContext(r.Context(), `SELECT f.id,f.parent_id,f.name,f.kind,COALESCE(f.object_key,''),f.size,f.mime_type,f.etag,f.status,f.created_at,f.updated_at FROM shares s JOIN files f ON f.id=s.file_id WHERE s.token=? AND f.kind='file' AND f.status='ready'`, token).Scan(&f.ID, &parent, &f.Name, &f.Kind, &f.objectKey, &f.Size, &mime, &etag, &f.Status, &f.CreatedAt, &f.UpdatedAt)
+	err := s.db.QueryRowContext(r.Context(), `SELECT f.id,f.parent_id,f.name,f.kind,COALESCE(f.object_key,''),f.size,f.mime_type,f.etag,f.status,f.created_at,f.updated_at FROM shares s JOIN files f ON f.id=s.file_id WHERE s.token=? AND f.kind='file' AND f.status='ready' AND f.deleted_at IS NULL`, token).Scan(&f.ID, &parent, &f.Name, &f.Kind, &f.objectKey, &f.Size, &mime, &etag, &f.Status, &f.CreatedAt, &f.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		problem(w, http.StatusNotFound, "share not found")
 		return

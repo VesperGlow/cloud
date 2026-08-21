@@ -25,8 +25,8 @@ func TestOpenCreatesSchemaAndMigrations(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&versions); err != nil {
 		t.Fatal(err)
 	}
-	if versions < 3 {
-		t.Fatalf("expected at least 3 migrations, got %d", versions)
+	if versions < 4 {
+		t.Fatalf("expected at least 4 migrations, got %d", versions)
 	}
 	// root 行存在
 	var roots int
@@ -71,7 +71,7 @@ func TestOpenIsIdempotent(t *testing.T) {
 	if err := db2.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&versions); err != nil {
 		t.Fatal(err)
 	}
-	if versions != 3 {
+	if versions != 4 {
 		t.Fatalf("migrations reapplied on reopen: %d", versions)
 	}
 }
