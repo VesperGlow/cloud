@@ -3,7 +3,7 @@ import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api } from './api'
-import type { DriveFile } from './api'
+import type { ApiError, DriveFile } from './api'
 import AppDialog from './components/AppDialog.vue'
 import AppTopbar from './components/AppTopbar.vue'
 import FileBrowserHeader from './components/FileBrowserHeader.vue'
@@ -13,7 +13,7 @@ import MediaPreview from './components/MediaPreview.vue'
 import { isBook, isEditable, isImage, isMedia } from './fileTypes'
 import { formatDate, formatSize } from './format'
 import ReaderView from './Reader.vue'
-import type { DownloadTask, FolderOption, ProfileResponse, ShareResponse, StorageStats, UploadTask } from './types'
+import type { DownloadTask, FolderOption, ProfileResponse, ShareResponse, StorageStats, TOTPRecoveryResponse, TOTPSetupResponse, TOTPStatusResponse, UploadTask } from './types'
 
 const ROOT = '00000000-0000-0000-0000-000000000000'
 const FILE_CONCURRENCY = 3
@@ -25,7 +25,7 @@ const user = ref<string|null>(null)
 const hasAvatar = ref(false)
 const avatarVersion = ref(Date.now())
 const checking = ref(true)
-const login = reactive({ username:'admin', password:'', busy:false, error:'', notice:'' })
+const login = reactive({ username:'admin', password:'', secondFactor:'', totpRequired:false, busy:false, error:'', notice:'' })
 const currentId = ref(ROOT)
 const current = ref<DriveFile|null>(null)
 const items = ref<DriveFile[]>([])
@@ -47,6 +47,7 @@ const folders = ref<FolderOption[]>([])
 const modalBusy = ref(false)
 const account = reactive({ username:'', currentPassword:'', password:'', confirmPassword:'', error:'' })
 const avatar = reactive({ busy:false, error:'' })
+const twoFactor = reactive({ enabled:false, recoveryRemaining:0, loading:false, busy:false, stage:'idle' as 'idle'|'setup', currentPassword:'', code:'', secret:'', uri:'', qrDataURL:'', recoveryCodes:[] as string[], copied:false, error:'' })
 const share = reactive({ active:false, url:'', createdAt:'', busy:false, error:'', copied:false })
 const editor = reactive({ isNew:false, readonly:false, fileId:'', name:'', originalName:'', content:'', original:'', etag:'', mode:'edit' as 'edit'|'split'|'preview', busy:false, error:'' })
 const storageStats = reactive<StorageStats>({ total_bytes:0, file_count:0 })
@@ -111,12 +112,19 @@ async function openDeepLink(){
 }
 async function submitLogin() {
   login.busy=true;login.error='';login.notice=''
-  try { const me=await api<ProfileResponse>('/api/auth/login',{method:'POST',body:JSON.stringify({username:login.username,password:login.password})});user.value=me.username;hasAvatar.value=me.has_avatar;login.password='';await openFolder(ROOT) }
-  catch(e){login.error=(e as Error).message}
+  try {
+    const me=await api<ProfileResponse>('/api/auth/login',{method:'POST',body:JSON.stringify({username:login.username,password:login.password,second_factor:login.secondFactor})})
+    user.value=me.username;hasAvatar.value=me.has_avatar;login.password='';login.secondFactor='';login.totpRequired=false;await openFolder(ROOT)
+  }catch(e){
+    const code=((e as ApiError).data as {error?:{code?:string}}|null)?.error?.code
+    if(code==='totp_required'){login.totpRequired=true;login.error='请输入身份验证器验证码或恢复码'}
+    else if(code==='invalid_second_factor'){login.totpRequired=true;login.error='验证码或恢复码不正确'}
+    else login.error=(e as Error).message
+  }
   finally{login.busy=false}
 }
 async function logout(){await api('/api/auth/logout',{method:'POST'});user.value=null;hasAvatar.value=false;items.value=[];tasks.splice(0);downloads.splice(0)}
-function showAccount(){account.username=user.value||'';account.currentPassword='';account.password='';account.confirmPassword='';account.error='';avatar.error='';openModal('account')}
+function showAccount(){account.username=user.value||'';account.currentPassword='';account.password='';account.confirmPassword='';account.error='';avatar.error='';resetTwoFactor();openModal('account');loadTwoFactorStatus()}
 function chooseAvatar(){avatarInput.value?.click()}
 async function uploadAvatar(file:File){
   avatar.error=''
@@ -146,6 +154,67 @@ async function saveAccount(){
     closeModal();login.username=account.username;login.password='';login.notice='账户已更新，请使用新凭据重新登录';user.value=null;items.value=[];tasks.splice(0);downloads.splice(0)
   }catch(e){account.error=(e as Error).message}
   finally{modalBusy.value=false}
+}
+
+function resetTwoFactor(){twoFactor.enabled=false;twoFactor.recoveryRemaining=0;twoFactor.loading=false;twoFactor.busy=false;twoFactor.stage='idle';twoFactor.currentPassword='';twoFactor.code='';twoFactor.secret='';twoFactor.uri='';twoFactor.qrDataURL='';twoFactor.recoveryCodes=[];twoFactor.copied=false;twoFactor.error=''}
+async function loadTwoFactorStatus(){
+  twoFactor.loading=true;twoFactor.error=''
+  try{const status=await api<TOTPStatusResponse>('/api/auth/totp');twoFactor.enabled=status.enabled;twoFactor.recoveryRemaining=status.recovery_codes}
+  catch(e){twoFactor.error=(e as Error).message}
+  finally{twoFactor.loading=false}
+}
+async function beginTwoFactorSetup(){
+  twoFactor.error=''
+  if(!twoFactor.currentPassword){twoFactor.error='请输入当前密码';return}
+  twoFactor.busy=true
+  try{
+    const setup=await api<TOTPSetupResponse>('/api/auth/totp/setup',{method:'POST',body:JSON.stringify({current_password:twoFactor.currentPassword})})
+    twoFactor.secret=setup.secret;twoFactor.uri=setup.uri;twoFactor.qrDataURL=setup.qr_data_url;twoFactor.code='';twoFactor.stage='setup'
+  }catch(e){twoFactor.error=(e as Error).message}
+  finally{twoFactor.busy=false}
+}
+function cancelTwoFactorSetup(){twoFactor.stage='idle';twoFactor.code='';twoFactor.secret='';twoFactor.uri='';twoFactor.qrDataURL='';twoFactor.error=''}
+async function enableTwoFactor(){
+  twoFactor.error=''
+  if(!twoFactor.code.trim()){twoFactor.error='请输入身份验证器中的六位验证码';return}
+  twoFactor.busy=true
+  try{
+    const result=await api<TOTPRecoveryResponse>('/api/auth/totp/enable',{method:'POST',body:JSON.stringify({current_password:twoFactor.currentPassword,code:twoFactor.code})})
+    twoFactor.enabled=true;twoFactor.recoveryRemaining=result.recovery_codes.length;twoFactor.recoveryCodes=result.recovery_codes;twoFactor.stage='idle';twoFactor.currentPassword='';twoFactor.code='';twoFactor.secret='';twoFactor.uri='';twoFactor.qrDataURL='';notify('两步验证已启用','success')
+  }catch(e){twoFactor.error=(e as Error).message}
+  finally{twoFactor.busy=false}
+}
+async function regenerateRecoveryCodes(){
+  twoFactor.error=''
+  if(!twoFactor.currentPassword||!twoFactor.code.trim()){twoFactor.error='请输入当前密码和验证码或恢复码';return}
+  if(!await confirmDialog({title:'重新生成恢复码？',message:'现有恢复码会立即全部失效，请保存新生成的恢复码。',confirmLabel:'重新生成'}))return
+  twoFactor.busy=true
+  try{
+    const result=await api<TOTPRecoveryResponse>('/api/auth/totp/recovery-codes',{method:'POST',body:JSON.stringify({current_password:twoFactor.currentPassword,code:twoFactor.code})})
+    twoFactor.recoveryCodes=result.recovery_codes;twoFactor.recoveryRemaining=result.recovery_codes.length;twoFactor.currentPassword='';twoFactor.code='';twoFactor.copied=false;notify('恢复码已重新生成','success')
+  }catch(e){twoFactor.error=(e as Error).message}
+  finally{twoFactor.busy=false}
+}
+async function disableTwoFactor(){
+  twoFactor.error=''
+  if(!twoFactor.currentPassword||!twoFactor.code.trim()){twoFactor.error='请输入当前密码和验证码或恢复码';return}
+  if(!await confirmDialog({title:'关闭两步验证？',message:'关闭后，只凭管理员密码即可登录。现有恢复码也会全部失效。',confirmLabel:'关闭验证',tone:'danger'}))return
+  twoFactor.busy=true
+  try{
+    await api('/api/auth/totp',{method:'DELETE',body:JSON.stringify({current_password:twoFactor.currentPassword,code:twoFactor.code})})
+    twoFactor.enabled=false;twoFactor.recoveryRemaining=0;twoFactor.currentPassword='';twoFactor.code='';twoFactor.recoveryCodes=[];notify('两步验证已关闭','success')
+  }catch(e){twoFactor.error=(e as Error).message}
+  finally{twoFactor.busy=false}
+}
+async function copyRecoveryCodes(){
+  try{await navigator.clipboard.writeText(twoFactor.recoveryCodes.join('\n'));twoFactor.copied=true;notify('恢复码已复制','success')}
+  catch{twoFactor.error='复制失败，请手动保存恢复码'}
+}
+function downloadRecoveryCodes(){
+  const blob=new Blob([`revaro 恢复码\n生成时间：${new Date().toLocaleString()}\n\n${twoFactor.recoveryCodes.join('\n')}\n`],{type:'text/plain;charset=utf-8'})
+  const url=URL.createObjectURL(blob)
+  const link=document.createElement('a');link.href=url;link.download='revaro-recovery-codes.txt';link.click()
+  window.setTimeout(()=>URL.revokeObjectURL(url),0)
 }
 
 function folderURL(id:string){return id===ROOT?'/':'/f/'+id}
@@ -447,7 +516,17 @@ onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(c
   <div v-if="checking" class="splash"><div class="brand-mark"><img src="/logo.png" alt=""></div><div class="spinner"></div></div>
   <main v-else-if="!user" class="login-page">
     <section class="login-visual"><div class="glow glow-a"></div><div class="glow glow-b"></div><div class="visual-copy"><span class="eyebrow">PRIVATE · DIRECT · YOURS</span><h1>你的文件，<br>安静地待在云上。</h1><p>轻量、自托管，文件按内容块直传你的 S3。</p></div><div class="revaro-card"><span>☁</span><div><strong>Seafile 式块存储</strong><small>内容寻址 · 跨文件去重</small></div></div></section>
-    <section class="login-panel"><form class="login-form" @submit.prevent="submitLogin"><div class="logo"><span class="brand-mark small"><img src="/logo.png" alt=""></span><span>revaro</span></div><div><p class="eyebrow dark">WELCOME BACK</p><h2>登录私人空间</h2><p class="muted">首次启动的随机凭据可在容器日志中查看</p></div><label>用户名<input v-model="login.username" autocomplete="username" maxlength="128" required></label><label>密码<input v-model="login.password" type="password" autocomplete="current-password" maxlength="1024" required></label><p v-if="login.notice" class="form-success">{{ login.notice }}</p><p v-if="login.error" class="form-error">{{ login.error }}</p><button class="primary wide" :disabled="login.busy">{{ login.busy ? '正在验证…' : '进入我的网盘' }}</button></form></section>
+    <section class="login-panel">
+      <form class="login-form" @submit.prevent="submitLogin">
+        <div class="logo"><span class="brand-mark small"><img src="/logo.png" alt=""></span><span>revaro</span></div>
+        <div><p class="eyebrow dark">WELCOME BACK</p><h2>登录私人空间</h2><p class="muted">首次启动的随机凭据可在容器日志中查看</p></div>
+        <label>用户名<input v-model="login.username" autocomplete="username" maxlength="128" required></label>
+        <label>密码<input v-model="login.password" type="password" autocomplete="current-password" maxlength="1024" required></label>
+        <label v-if="login.totpRequired">验证码或恢复码<input v-model="login.secondFactor" autocomplete="one-time-code" maxlength="128" placeholder="6 位验证码或恢复码" required><small class="login-totp-hint">打开身份验证器，或输入一枚尚未使用的恢复码。</small></label>
+        <p v-if="login.notice" class="form-success">{{ login.notice }}</p><p v-if="login.error" class="form-error">{{ login.error }}</p>
+        <button class="primary wide" :disabled="login.busy">{{ login.busy ? '正在验证…' : '进入我的网盘' }}</button>
+      </form>
+    </section>
   </main>
 
   <div v-else class="app-shell" @dragover.prevent="dragActive=true" @dragleave.self="dragActive=false" @drop.prevent="onDrop">
@@ -479,7 +558,64 @@ onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(c
     <div v-if="modal" class="modal-backdrop" :class="{previewing:modal==='preview',editing:modal==='editor',reading:modal==='reader'}" @click.self="closeBackdrop">
       <section v-if="modal==='rename'" class="modal"><header><div><p class="eyebrow dark">EDIT</p><h2>重命名</h2></div><button @click="closeModal">×</button></header><label>新名称<input v-model="renameValue" maxlength="1024" @keyup.enter="saveRename"></label><footer><button class="secondary" @click="closeModal">取消</button><button class="primary" :disabled="modalBusy" @click="saveRename">保存</button></footer></section>
       <section v-else-if="modal==='move'" class="modal folder-modal"><header><div><p class="eyebrow dark">MOVE</p><h2>移动</h2><p class="move-target" :title="moveTargets.length===1?moveTargets[0]?.name:undefined">{{ moveTargets.length===1?`「${moveTargets[0]?.name}」`:`${moveTargets.length} 项` }}</p></div><button @click="closeModal">×</button></header><div v-if="modalBusy" class="state small"><div class="spinner"></div></div><div v-else class="folder-list"><button v-for="folder in folders" :key="folder.id" :style="{paddingLeft:`${18+folder.depth*22}px`}" @click="moveTo(folder.id)"><span>▰</span>{{ folder.name }}</button></div></section>
-      <section v-else-if="modal==='account'" class="modal account-modal"><header><div><p class="eyebrow dark">PROFILE & SECURITY</p><h2>账户设置</h2></div><button @click="closeModal">×</button></header><div class="account-layout"><section class="avatar-settings"><div class="avatar-large"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像"><span v-else>{{ user.slice(0,1).toUpperCase() }}</span></div><h3>个人头像</h3><p>支持 JPG、PNG、GIF 和 WebP，最大 2 MiB。</p><div class="avatar-actions"><button type="button" class="secondary" :disabled="avatar.busy" @click="chooseAvatar">{{ avatar.busy?'处理中…':hasAvatar?'更换头像':'上传头像' }}</button><button v-if="hasAvatar" type="button" class="danger-text" :disabled="avatar.busy" @click="removeAvatar">移除</button></div><input ref="avatarInput" hidden type="file" accept="image/jpeg,image/png,image/gif,image/webp" @change="e=>{const el=e.target as HTMLInputElement;if(el.files?.[0])uploadAvatar(el.files[0]);el.value=''}"><p v-if="avatar.error" class="form-error">{{ avatar.error }}</p></section><form @submit.prevent="saveAccount"><div><h3>登录凭据</h3><p class="modal-hint">修改后会退出所有已登录设备，请使用新凭据重新登录。</p></div><label>管理员用户名<input v-model="account.username" autocomplete="username" maxlength="128" required></label><label>当前密码<input v-model="account.currentPassword" type="password" autocomplete="current-password" maxlength="1024" required></label><div class="account-passwords"><label>新密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><label>确认新密码<input v-model="account.confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label></div><p v-if="account.error" class="form-error">{{ account.error }}</p><footer><button type="button" class="secondary" @click="closeModal">取消</button><button class="primary" :disabled="modalBusy">{{ modalBusy?'正在保存…':'更新并退出' }}</button></footer></form></div></section>
+      <section v-else-if="modal==='account'" class="modal account-modal">
+        <header><div><p class="eyebrow dark">PROFILE & SECURITY</p><h2>账户设置</h2></div><button @click="closeModal">×</button></header>
+        <div class="account-layout">
+          <section class="avatar-settings">
+            <div class="avatar-large"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像"><span v-else>{{ user.slice(0,1).toUpperCase() }}</span></div>
+            <h3>个人头像</h3><p>支持 JPG、PNG、GIF 和 WebP，最大 2 MiB。</p>
+            <div class="avatar-actions"><button type="button" class="secondary" :disabled="avatar.busy" @click="chooseAvatar">{{ avatar.busy?'处理中…':hasAvatar?'更换头像':'上传头像' }}</button><button v-if="hasAvatar" type="button" class="danger-text" :disabled="avatar.busy" @click="removeAvatar">移除</button></div>
+            <input ref="avatarInput" hidden type="file" accept="image/jpeg,image/png,image/gif,image/webp" @change="e=>{const el=e.target as HTMLInputElement;if(el.files?.[0])uploadAvatar(el.files[0]);el.value=''}"><p v-if="avatar.error" class="form-error">{{ avatar.error }}</p>
+          </section>
+          <form @submit.prevent="saveAccount">
+            <div><h3>登录凭据</h3><p class="modal-hint">修改后会退出所有已登录设备，请使用新凭据重新登录。</p></div>
+            <label>管理员用户名<input v-model="account.username" autocomplete="username" maxlength="128" required></label>
+            <label>当前密码<input v-model="account.currentPassword" type="password" autocomplete="current-password" maxlength="1024" required></label>
+            <div class="account-passwords"><label>新密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><label>确认新密码<input v-model="account.confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label></div>
+            <p v-if="account.error" class="form-error">{{ account.error }}</p>
+            <footer><button type="button" class="secondary" @click="closeModal">取消</button><button class="primary" :disabled="modalBusy">{{ modalBusy?'正在保存…':'更新并退出' }}</button></footer>
+          </form>
+        </div>
+
+        <section class="two-factor-settings">
+          <div class="two-factor-head">
+            <div><h3>两步验证</h3><p>使用兼容 TOTP 的身份验证器，为管理员登录增加一次性验证码。</p></div>
+            <span class="security-badge" :class="{enabled:twoFactor.enabled}">{{ twoFactor.enabled?'已启用':'未启用' }}</span>
+          </div>
+          <div v-if="twoFactor.loading" class="two-factor-loading"><div class="spinner"></div><span>正在读取安全设置…</span></div>
+          <template v-else>
+            <section v-if="twoFactor.recoveryCodes.length" class="recovery-panel">
+              <div><strong>立即保存恢复码</strong><p>每枚恢复码只能使用一次。离开此页面后将无法再次查看。</p></div>
+              <div class="recovery-grid"><code v-for="code in twoFactor.recoveryCodes" :key="code">{{ code }}</code></div>
+              <div class="recovery-actions"><button type="button" class="secondary" @click="copyRecoveryCodes">{{ twoFactor.copied?'已复制':'复制恢复码' }}</button><button type="button" class="secondary" @click="downloadRecoveryCodes">下载文本</button></div>
+            </section>
+
+            <template v-if="!twoFactor.enabled">
+              <div v-if="twoFactor.stage==='idle'" class="two-factor-idle">
+                <p>启用后，登录时除密码外还需输入身份验证器生成的 6 位验证码。</p>
+                <label>当前密码<input v-model="twoFactor.currentPassword" type="password" autocomplete="current-password" maxlength="1024" placeholder="确认是你本人"></label>
+                <button type="button" class="primary" :disabled="twoFactor.busy" @click="beginTwoFactorSetup">{{ twoFactor.busy?'正在生成…':'设置两步验证' }}</button>
+              </div>
+              <div v-else class="totp-enroll">
+                <div class="totp-qr"><img :src="twoFactor.qrDataURL" alt="两步验证二维码"></div>
+                <div class="totp-instructions">
+                  <h4>扫描二维码</h4><p>用身份验证器扫描二维码，然后输入应用中显示的验证码完成绑定。</p>
+                  <p class="manual-secret">无法扫码？手动输入密钥 <code>{{ twoFactor.secret }}</code></p>
+                  <label>6 位验证码<input v-model="twoFactor.code" autocomplete="one-time-code" inputmode="numeric" maxlength="8" placeholder="000000"></label>
+                  <div class="two-factor-actions"><button type="button" class="secondary" :disabled="twoFactor.busy" @click="cancelTwoFactorSetup">取消</button><button type="button" class="primary" :disabled="twoFactor.busy" @click="enableTwoFactor">{{ twoFactor.busy?'正在验证…':'启用并生成恢复码' }}</button></div>
+                </div>
+              </div>
+            </template>
+
+            <div v-else class="two-factor-enabled">
+              <p>剩余 <strong>{{ twoFactor.recoveryRemaining }}</strong> 枚恢复码。重新生成或关闭验证前，需要再次确认当前密码和验证码。</p>
+              <div class="two-factor-fields"><label>当前密码<input v-model="twoFactor.currentPassword" type="password" autocomplete="current-password" maxlength="1024"></label><label>验证码或恢复码<input v-model="twoFactor.code" autocomplete="one-time-code" maxlength="128"></label></div>
+              <div class="two-factor-actions"><button type="button" class="secondary" :disabled="twoFactor.busy" @click="regenerateRecoveryCodes">重新生成恢复码</button><button type="button" class="danger-button" :disabled="twoFactor.busy" @click="disableTwoFactor">关闭两步验证</button></div>
+            </div>
+          </template>
+          <p v-if="twoFactor.error" class="form-error two-factor-error">{{ twoFactor.error }}</p>
+        </section>
+      </section>
       <section v-else-if="modal==='editor'" class="document-editor">
         <header class="editor-header">
           <div class="editor-title"><span>▤</span><div><input v-if="editor.isNew" v-model="editor.name" aria-label="文档文件名" maxlength="1024"><strong v-else :title="editor.name">{{ editor.name }}</strong><small>{{ editor.isNew?'保存在当前文件夹':editor.readonly?'回收站只读预览':'文本编辑器' }}</small></div></div>

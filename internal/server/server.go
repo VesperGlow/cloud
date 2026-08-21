@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/png"
 	"io"
 	"log/slog"
 	"mime"
@@ -30,6 +31,7 @@ import (
 	"github.com/VesperGlow/revaro/internal/webui"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/pquerna/otp"
 )
 
 const RootID = "00000000-0000-0000-0000-000000000000"
@@ -95,6 +97,11 @@ func (s *Server) Handler() http.Handler {
 			r.Post("/auth/logout", s.logout)
 			r.Get("/auth/me", s.me)
 			r.Patch("/auth/credentials", s.changeCredentials)
+			r.Get("/auth/totp", s.totpStatus)
+			r.Post("/auth/totp/setup", s.beginTOTPSetup)
+			r.Post("/auth/totp/enable", s.enableTOTP)
+			r.Post("/auth/totp/recovery-codes", s.regenerateTOTPRecoveryCodes)
+			r.Delete("/auth/totp", s.disableTOTP)
 			r.Get("/profile/avatar", s.getAvatar)
 			r.Put("/profile/avatar", s.updateAvatar)
 			r.Delete("/profile/avatar", s.deleteAvatar)
@@ -201,21 +208,33 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Username     string `json:"username"`
+		Password     string `json:"password"`
+		SecondFactor string `json:"second_factor"`
 	}
 	if err := decodeJSON(w, r, &in); err != nil {
 		return
 	}
-	if len(in.Username) > 128 || len(in.Password) > 1024 {
+	if len(in.Username) > 128 || len(in.Password) > 1024 || len(in.SecondFactor) > 128 {
 		s.limiter.fail(ip)
 		problem(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
-	token, expires, err := s.auth.Login(r.Context(), in.Username, in.Password)
+	token, expires, err := s.auth.Login(r.Context(), in.Username, in.Password, in.SecondFactor)
 	if err != nil {
-		s.limiter.fail(ip)
-		problem(w, http.StatusUnauthorized, "invalid credentials")
+		switch {
+		case errors.Is(err, auth.ErrTOTPRequired):
+			problemCode(w, http.StatusUnauthorized, "totp_required", "enter your authenticator or recovery code")
+		case errors.Is(err, auth.ErrInvalidSecondFactor):
+			s.limiter.fail(ip)
+			problemCode(w, http.StatusUnauthorized, "invalid_second_factor", "the authenticator or recovery code is incorrect")
+		case errors.Is(err, auth.ErrInvalidCredentials):
+			s.limiter.fail(ip)
+			problem(w, http.StatusUnauthorized, "invalid credentials")
+		default:
+			s.log.Error("login failed", "error", err)
+			problem(w, http.StatusInternalServerError, "could not verify login")
+		}
 		return
 	}
 	s.limiter.success(ip)
@@ -232,6 +251,146 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"username": r.Context().Value(userKey{}).(string), "has_avatar": s.hasAvatar(r.Context())})
+}
+
+func (s *Server) totpStatus(w http.ResponseWriter, r *http.Request) {
+	status, err := s.auth.TOTPStatus(r.Context())
+	if err != nil {
+		s.log.Error("TOTP status read failed", "error", err)
+		problem(w, http.StatusInternalServerError, "could not read two-factor settings")
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) beginTOTPSetup(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		CurrentPassword string `json:"current_password"`
+	}
+	if err := decodeJSON(w, r, &in); err != nil {
+		return
+	}
+	if in.CurrentPassword == "" || len(in.CurrentPassword) > 1024 {
+		problem(w, http.StatusBadRequest, "current password is required")
+		return
+	}
+	username := r.Context().Value(userKey{}).(string)
+	setup, err := s.auth.BeginTOTPSetup(r.Context(), username, in.CurrentPassword)
+	if err != nil {
+		s.totpProblem(w, err)
+		return
+	}
+	key, err := otp.NewKeyFromURL(setup.URI)
+	if err != nil {
+		s.log.Error("TOTP QR key creation failed", "error", err)
+		problem(w, http.StatusInternalServerError, "could not create authenticator QR code")
+		return
+	}
+	image, err := key.Image(256, 256)
+	if err != nil {
+		s.log.Error("TOTP QR image creation failed", "error", err)
+		problem(w, http.StatusInternalServerError, "could not create authenticator QR code")
+		return
+	}
+	var pngData bytes.Buffer
+	if err := png.Encode(&pngData, image); err != nil {
+		s.log.Error("TOTP QR encoding failed", "error", err)
+		problem(w, http.StatusInternalServerError, "could not create authenticator QR code")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"secret":      setup.Secret,
+		"uri":         setup.URI,
+		"qr_data_url": "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngData.Bytes()),
+	})
+}
+
+type totpConfirmation struct {
+	CurrentPassword string `json:"current_password"`
+	Code            string `json:"code"`
+}
+
+func (s *Server) enableTOTP(w http.ResponseWriter, r *http.Request) {
+	var in totpConfirmation
+	if err := decodeJSON(w, r, &in); err != nil {
+		return
+	}
+	if !validTOTPConfirmation(in) {
+		problem(w, http.StatusBadRequest, "current password and verification code are required")
+		return
+	}
+	codes, err := s.auth.ConfirmTOTPSetup(r.Context(), r.Context().Value(userKey{}).(string), in.CurrentPassword, in.Code, currentSessionToken(r))
+	if err != nil {
+		s.totpProblem(w, err)
+		return
+	}
+	s.log.Info("TOTP two-factor authentication enabled", "user", r.Context().Value(userKey{}).(string))
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": true, "recovery_codes": codes})
+}
+
+func (s *Server) regenerateTOTPRecoveryCodes(w http.ResponseWriter, r *http.Request) {
+	var in totpConfirmation
+	if err := decodeJSON(w, r, &in); err != nil {
+		return
+	}
+	if !validTOTPConfirmation(in) {
+		problem(w, http.StatusBadRequest, "current password and verification code are required")
+		return
+	}
+	codes, err := s.auth.RegenerateRecoveryCodes(r.Context(), r.Context().Value(userKey{}).(string), in.CurrentPassword, in.Code)
+	if err != nil {
+		s.totpProblem(w, err)
+		return
+	}
+	s.log.Info("TOTP recovery codes regenerated", "user", r.Context().Value(userKey{}).(string))
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": true, "recovery_codes": codes})
+}
+
+func (s *Server) disableTOTP(w http.ResponseWriter, r *http.Request) {
+	var in totpConfirmation
+	if err := decodeJSON(w, r, &in); err != nil {
+		return
+	}
+	if !validTOTPConfirmation(in) {
+		problem(w, http.StatusBadRequest, "current password and verification code are required")
+		return
+	}
+	username := r.Context().Value(userKey{}).(string)
+	if err := s.auth.DisableTOTP(r.Context(), username, in.CurrentPassword, in.Code, currentSessionToken(r)); err != nil {
+		s.totpProblem(w, err)
+		return
+	}
+	s.log.Info("TOTP two-factor authentication disabled", "user", username)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func validTOTPConfirmation(in totpConfirmation) bool {
+	return in.CurrentPassword != "" && len(in.CurrentPassword) <= 1024 && strings.TrimSpace(in.Code) != "" && len(in.Code) <= 128
+}
+
+func currentSessionToken(r *http.Request) string {
+	if cookie, err := r.Cookie("revaro_session"); err == nil {
+		return cookie.Value
+	}
+	return ""
+}
+
+func (s *Server) totpProblem(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, auth.ErrInvalidCredentials):
+		problem(w, http.StatusUnauthorized, "current password is incorrect")
+	case errors.Is(err, auth.ErrInvalidSecondFactor):
+		problem(w, http.StatusUnauthorized, "the authenticator or recovery code is incorrect")
+	case errors.Is(err, auth.ErrTOTPAlreadyEnabled):
+		problem(w, http.StatusConflict, "two-factor authentication is already enabled")
+	case errors.Is(err, auth.ErrTOTPNotEnabled):
+		problem(w, http.StatusConflict, "two-factor authentication is not enabled")
+	case errors.Is(err, auth.ErrTOTPSetupExpired):
+		problem(w, http.StatusGone, "two-factor setup expired; start again")
+	default:
+		s.log.Error("TOTP operation failed", "error", err)
+		problem(w, http.StatusInternalServerError, "could not update two-factor settings")
+	}
 }
 
 func (s *Server) hasAvatar(ctx context.Context) bool {
@@ -1792,6 +1951,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 func problem(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"status": status, "message": message}})
+}
+func problemCode(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, map[string]any{"error": map[string]any{"status": status, "code": code, "message": message}})
 }
 
 type loginAttempt struct {

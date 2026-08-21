@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -42,6 +43,7 @@ type Service struct {
 	DB       *sql.DB
 	Username string
 	Params   Params
+	Now      func() time.Time
 }
 
 func (s *Service) Initialize(ctx context.Context, username, password string) (InitialCredentials, error) {
@@ -88,25 +90,33 @@ func (s *Service) Initialize(ctx context.Context, username, password string) (In
 	return credentials, nil
 }
 
-func (s *Service) Login(ctx context.Context, username, password string) (string, time.Time, error) {
-	var savedUser, savedHash string
-	if err := s.DB.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='admin_username'`).Scan(&savedUser); err != nil {
-		return "", time.Time{}, err
-	}
-	if err := s.DB.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='admin_password_hash'`).Scan(&savedHash); err != nil {
-		return "", time.Time{}, err
-	}
-	valid, err := VerifyPassword(password, savedHash)
-	if err != nil || subtle.ConstantTimeCompare([]byte(username), []byte(savedUser)) != 1 || !valid {
+func (s *Service) Login(ctx context.Context, username, password, secondFactor string) (string, time.Time, error) {
+	if err := s.verifyCredentials(ctx, username, password); err != nil {
 		return "", time.Time{}, ErrInvalidCredentials
+	}
+	status, err := s.TOTPStatus(ctx)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	if status.Enabled {
+		if strings.TrimSpace(secondFactor) == "" {
+			return "", time.Time{}, ErrTOTPRequired
+		}
+		if err := s.consumeSecondFactor(ctx, password, secondFactor, s.now()); err != nil {
+			if errors.Is(err, ErrInvalidSecondFactor) {
+				return "", time.Time{}, ErrInvalidSecondFactor
+			}
+			return "", time.Time{}, err
+		}
 	}
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		return "", time.Time{}, err
 	}
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
-	expires := time.Now().UTC().Add(sessionLifetime)
-	_, err = s.DB.ExecContext(ctx, `INSERT INTO sessions(id, token_hash, created_at, expires_at) VALUES(?,?,?,?)`, ids.New(), TokenHash(token), time.Now().UTC().Format(time.RFC3339Nano), expires.Format(time.RFC3339Nano))
+	now := s.now()
+	expires := now.Add(sessionLifetime)
+	_, err = s.DB.ExecContext(ctx, `INSERT INTO sessions(id, token_hash, created_at, expires_at) VALUES(?,?,?,?)`, ids.New(), TokenHash(token), now.Format(time.RFC3339Nano), expires.Format(time.RFC3339Nano))
 	return token, expires, err
 }
 
@@ -114,16 +124,28 @@ func (s *Service) ChangeCredentials(ctx context.Context, currentUsername, curren
 	if newUsername == "" || len(newUsername) > 128 || len(newPassword) < 12 || len(newPassword) > 1024 {
 		return errors.New("administrator username/password length is invalid (password minimum is 12 characters)")
 	}
-	var savedUser, savedHash string
-	if err := s.DB.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='admin_username'`).Scan(&savedUser); err != nil {
-		return err
-	}
-	if err := s.DB.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='admin_password_hash'`).Scan(&savedHash); err != nil {
-		return err
-	}
-	valid, err := VerifyPassword(currentPassword, savedHash)
-	if err != nil || subtle.ConstantTimeCompare([]byte(currentUsername), []byte(savedUser)) != 1 || !valid {
+	if err := s.verifyCredentials(ctx, currentUsername, currentPassword); err != nil {
 		return ErrInvalidCredentials
+	}
+	var reencrypted *encryptedSecret
+	var rawSecret string
+	err := s.DB.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, totpConfigKey).Scan(&rawSecret)
+	if err == nil {
+		var encrypted encryptedSecret
+		if err := json.Unmarshal([]byte(rawSecret), &encrypted); err != nil {
+			return fmt.Errorf("decode TOTP secret: %w", err)
+		}
+		secret, err := decryptSecret(currentPassword, encrypted)
+		if err != nil {
+			return fmt.Errorf("decrypt TOTP secret: %w", err)
+		}
+		next, err := encryptSecret(newPassword, secret, s.params())
+		if err != nil {
+			return err
+		}
+		reencrypted = &next
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
 	}
 	newHash, err := HashPassword(newPassword, s.params())
 	if err != nil {
@@ -139,6 +161,18 @@ func (s *Service) ChangeCredentials(ctx context.Context, currentUsername, curren
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE settings SET value=?,updated_at=? WHERE key='admin_password_hash'`, newHash, now); err != nil {
+		return err
+	}
+	if reencrypted != nil {
+		raw, err := json.Marshal(reencrypted)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE settings SET value=?,updated_at=? WHERE key=?`, string(raw), now, totpConfigKey); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key=?`, totpPendingKey); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions`); err != nil {
@@ -169,6 +203,9 @@ func (s *Service) ResetCredentials(ctx context.Context, username string) (Initia
 		if _, err := tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`, key, value, now); err != nil {
 			return InitialCredentials{}, err
 		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key IN (?,?,?,?)`, totpConfigKey, totpRecoveryKey, totpLastStepKey, totpPendingKey); err != nil {
+		return InitialCredentials{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions`); err != nil {
 		return InitialCredentials{}, err
@@ -212,6 +249,26 @@ func (s *Service) params() Params {
 		return DefaultParams
 	}
 	return s.Params
+}
+func (s *Service) now() time.Time {
+	if s.Now != nil {
+		return s.Now().UTC()
+	}
+	return time.Now().UTC()
+}
+func (s *Service) verifyCredentials(ctx context.Context, username, password string) error {
+	var savedUser, savedHash string
+	if err := s.DB.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='admin_username'`).Scan(&savedUser); err != nil {
+		return err
+	}
+	if err := s.DB.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='admin_password_hash'`).Scan(&savedHash); err != nil {
+		return err
+	}
+	valid, err := VerifyPassword(password, savedHash)
+	if err != nil || subtle.ConstantTimeCompare([]byte(username), []byte(savedUser)) != 1 || !valid {
+		return ErrInvalidCredentials
+	}
+	return nil
 }
 func TokenHash(token string) string {
 	sum := sha256.Sum256([]byte(token))

@@ -28,6 +28,7 @@ import (
 	"github.com/VesperGlow/revaro/internal/ids"
 	"github.com/VesperGlow/revaro/internal/storage"
 	"github.com/aws/smithy-go"
+	"github.com/pquerna/otp/totp"
 )
 
 // notFoundError emulates the S3 NoSuchKey API error the real store returns.
@@ -266,7 +267,7 @@ func newTestAppWithBlockSize(t *testing.T, blockSize int64) *testApp {
 		t.Fatal(err)
 	}
 	store := newMockStorage(blockSize)
-	cfg := config.Config{BaseURL: "http://example.test", BlockSize: blockSize, PresignExpires: time.Minute, UploadExpires: time.Hour}
+	cfg := config.Config{BaseURL: "http://example.test", BlockSize: blockSize, PresignExpires: time.Minute, UploadExpires: time.Hour, FFmpegPath: "ffmpeg"}
 	app := &testApp{t: t, db: db, store: store}
 	app.srv = New(db, store, a, cfg, nil)
 	app.handler = app.srv.Handler()
@@ -339,6 +340,87 @@ func TestChangeCredentialsRequiresCurrentPasswordAndRevokesSession(t *testing.T)
 	newLogin := a.request("POST", "/api/auth/login", map[string]any{"username": "owner", "password": "a-new-secure-password"}, false)
 	if newLogin.Code != http.StatusOK {
 		t.Fatalf("new login status=%d: %s", newLogin.Code, newLogin.Body.String())
+	}
+}
+
+func TestTOTPAPISetupLoginRecoveryAndDisable(t *testing.T) {
+	a := newTestApp(t)
+	now := time.Date(2026, 8, 22, 1, 0, 0, 0, time.UTC)
+	a.srv.auth.Now = func() time.Time { return now }
+
+	statusResponse := a.request("GET", "/api/auth/totp", nil, true)
+	if statusResponse.Code != http.StatusOK {
+		t.Fatalf("initial TOTP status=%d: %s", statusResponse.Code, statusResponse.Body.String())
+	}
+	initial := decode[auth.TOTPStatus](t, statusResponse)
+	if initial.Enabled {
+		t.Fatal("TOTP is enabled before setup")
+	}
+	setupResponse := a.request("POST", "/api/auth/totp/setup", map[string]any{"current_password": "a-secure-test-password"}, true)
+	if setupResponse.Code != http.StatusCreated {
+		t.Fatalf("begin TOTP setup=%d: %s", setupResponse.Code, setupResponse.Body.String())
+	}
+	setup := decode[struct {
+		Secret    string `json:"secret"`
+		URI       string `json:"uri"`
+		QRDataURL string `json:"qr_data_url"`
+	}](t, setupResponse)
+	if setup.Secret == "" || !strings.HasPrefix(setup.URI, "otpauth://totp/") || !strings.HasPrefix(setup.QRDataURL, "data:image/png;base64,") {
+		t.Fatalf("invalid setup response: secret=%t uri=%q qr=%q", setup.Secret != "", setup.URI, setup.QRDataURL)
+	}
+	code, err := totp.GenerateCode(setup.Secret, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enableResponse := a.request("POST", "/api/auth/totp/enable", map[string]any{"current_password": "a-secure-test-password", "code": code}, true)
+	if enableResponse.Code != http.StatusOK {
+		t.Fatalf("enable TOTP=%d: %s", enableResponse.Code, enableResponse.Body.String())
+	}
+	enabled := decode[struct {
+		Enabled       bool     `json:"enabled"`
+		RecoveryCodes []string `json:"recovery_codes"`
+	}](t, enableResponse)
+	if !enabled.Enabled || len(enabled.RecoveryCodes) != 10 {
+		t.Fatalf("enable response = enabled=%v recovery=%d", enabled.Enabled, len(enabled.RecoveryCodes))
+	}
+	var storedRecovery string
+	if err := a.db.QueryRow(`SELECT value FROM settings WHERE key='admin_totp_recovery_codes'`).Scan(&storedRecovery); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(storedRecovery, enabled.RecoveryCodes[0]) {
+		t.Fatal("plaintext recovery code was stored")
+	}
+	if me := a.request("GET", "/api/auth/me", nil, true); me.Code != http.StatusOK {
+		t.Fatalf("enabling TOTP revoked current session: %d", me.Code)
+	}
+
+	missing := a.request("POST", "/api/auth/login", map[string]any{"username": "admin", "password": "a-secure-test-password"}, false)
+	if missing.Code != http.StatusUnauthorized || !strings.Contains(missing.Body.String(), `"code":"totp_required"`) {
+		t.Fatalf("password-only login=%d: %s", missing.Code, missing.Body.String())
+	}
+	now = now.Add(30 * time.Second)
+	code, _ = totp.GenerateCode(setup.Secret, now)
+	verified := a.request("POST", "/api/auth/login", map[string]any{"username": "admin", "password": "a-secure-test-password", "second_factor": code}, false)
+	if verified.Code != http.StatusOK {
+		t.Fatalf("TOTP login=%d: %s", verified.Code, verified.Body.String())
+	}
+	recovered := a.request("POST", "/api/auth/login", map[string]any{"username": "admin", "password": "a-secure-test-password", "second_factor": enabled.RecoveryCodes[0]}, false)
+	if recovered.Code != http.StatusOK {
+		t.Fatalf("recovery login=%d: %s", recovered.Code, recovered.Body.String())
+	}
+	status := decode[auth.TOTPStatus](t, a.request("GET", "/api/auth/totp", nil, true))
+	if status.RecoveryCodes != 9 {
+		t.Fatalf("recovery codes remaining=%d", status.RecoveryCodes)
+	}
+
+	now = now.Add(30 * time.Second)
+	code, _ = totp.GenerateCode(setup.Secret, now)
+	disabled := a.request("DELETE", "/api/auth/totp", map[string]any{"current_password": "a-secure-test-password", "code": code}, true)
+	if disabled.Code != http.StatusNoContent {
+		t.Fatalf("disable TOTP=%d: %s", disabled.Code, disabled.Body.String())
+	}
+	if status := decode[auth.TOTPStatus](t, a.request("GET", "/api/auth/totp", nil, true)); status.Enabled {
+		t.Fatal("TOTP remained enabled")
 	}
 }
 
@@ -1437,10 +1519,11 @@ func TestVideoThumbnailWithFFmpeg(t *testing.T) {
 		t.Skip("ffmpeg not available")
 	}
 	a := newTestApp(t)
-	// 用 ffmpeg 现场生成一段 1 秒测试视频
+	// 用 ffmpeg 现场生成一段 2 秒测试视频，确保服务端在第 1 秒抽帧时
+	// 不会刚好落在媒体结尾。
 	tmp := t.TempDir() + "/test.mp4"
 	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
-		"-f", "lavfi", "-i", "testsrc=size=160x90:rate=10", "-t", "1", "-pix_fmt", "yuv420p", tmp)
+		"-f", "lavfi", "-i", "testsrc=size=160x90:rate=10", "-t", "2", "-pix_fmt", "yuv420p", tmp)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("ffmpeg fixture failed: %v %s", err, out)
 	}
