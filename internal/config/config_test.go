@@ -100,19 +100,19 @@ func TestLoadOverrides(t *testing.T) {
 func TestLoadValidations(t *testing.T) {
 	cases := []struct {
 		name   string
-		mutate func()
+		mutate func(*testing.T)
 	}{
-		{"missing s3 credentials", func() { t.Setenv("S3_ACCESS_KEY", "") }},
-		{"bad block size", func() { t.Setenv("BLOCK_SIZE", "1024") }},
-		{"bad fastcdc min", func() { t.Setenv("FASTCDC_MIN_SIZE", "1024") }},
-		{"bad fastcdc max", func() { t.Setenv("FASTCDC_MAX_SIZE", "1024") }},
-		{"bad base url", func() { t.Setenv("APP_BASE_URL", "not-a-url") }},
-		{"bad upload expires", func() { t.Setenv("UPLOAD_EXPIRES", "0s") }},
-		{"bad gc interval", func() { t.Setenv("GC_INTERVAL", "-1s") }},
-		{"bad bool", func() { t.Setenv("S3_PATH_STYLE", "maybe") }},
-		{"bad proxy bool", func() { t.Setenv("S3_PROXY_TRANSFERS", "maybe") }},
-		{"bad duration", func() { t.Setenv("PRESIGN_EXPIRES", "soon") }},
-		{"bad endpoint", func() { t.Setenv("S3_ENDPOINT", "minio://host") }},
+		{"missing s3 credentials", func(t *testing.T) { t.Setenv("S3_ACCESS_KEY", "") }},
+		{"bad block size", func(t *testing.T) { t.Setenv("BLOCK_SIZE", "1024") }},
+		{"bad fastcdc min", func(t *testing.T) { t.Setenv("FASTCDC_MIN_SIZE", "1024") }},
+		{"bad fastcdc max", func(t *testing.T) { t.Setenv("FASTCDC_MAX_SIZE", "1024") }},
+		{"bad base url", func(t *testing.T) { t.Setenv("APP_BASE_URL", "not-a-url") }},
+		{"bad upload expires", func(t *testing.T) { t.Setenv("UPLOAD_EXPIRES", "0s") }},
+		{"bad gc interval", func(t *testing.T) { t.Setenv("GC_INTERVAL", "-1s") }},
+		{"bad bool", func(t *testing.T) { t.Setenv("S3_PATH_STYLE", "maybe") }},
+		{"bad proxy bool", func(t *testing.T) { t.Setenv("S3_PROXY_TRANSFERS", "maybe") }},
+		{"bad duration", func(t *testing.T) { t.Setenv("PRESIGN_EXPIRES", "soon") }},
+		{"bad endpoint", func(t *testing.T) { t.Setenv("S3_ENDPOINT", "minio://host") }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -126,9 +126,10 @@ func TestLoadValidations(t *testing.T) {
 			t.Setenv("UPLOAD_EXPIRES", "24h")
 			t.Setenv("GC_INTERVAL", "1h")
 			t.Setenv("S3_PATH_STYLE", "false")
+			t.Setenv("S3_PROXY_TRANSFERS", "false")
 			t.Setenv("PRESIGN_EXPIRES", "15m")
 			t.Setenv("S3_ENDPOINT", "http://minio:9000")
-			tc.mutate()
+			tc.mutate(t)
 			if _, err := Load(); err == nil {
 				t.Fatal("Load must fail")
 			}
@@ -141,6 +142,7 @@ func TestLoadValidations(t *testing.T) {
 	t.Setenv("BLOCK_SIZE", "1073741824")
 	t.Setenv("FASTCDC_MIN_SIZE", "268435456")
 	t.Setenv("FASTCDC_MAX_SIZE", "1073741824")
+	t.Setenv("S3_PROXY_TRANSFERS", "false")
 	t.Setenv("S3_ENDPOINT", "")
 	if _, err := Load(); err != nil {
 		t.Fatalf("max block size rejected: %v", err)
