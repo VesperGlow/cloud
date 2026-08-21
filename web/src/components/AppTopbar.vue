@@ -25,7 +25,6 @@ defineEmits<{
 <template>
   <header class="topbar">
     <button class="logo brand-button" title="回到我的文件" @click="$emit('home')">
-      <span class="brand-mark small"><img src="/logo.png" alt=""></span>
       <span>Cloud</span>
     </button>
     <div class="top-actions">
@@ -46,6 +45,6 @@ defineEmits<{
 </template>
 
 <style scoped>
-.trash-button{display:grid;place-items:center;width:38px;height:38px;padding:0;border:0;border-radius:11px;background:transparent;color:#64748b}.trash-button:hover{background:#f1f5f9;color:#334155}.trash-button svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
-@media(max-width:850px){.trash-button{width:36px;height:36px}.top-actions{gap:8px}}
+.trash-button{display:grid;place-items:center;width:44px;height:44px;padding:0;border:0;border-radius:50%;background:transparent;color:#64748b}.trash-button:hover{background:#f1f5f9;color:#334155}.trash-button svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+@media(max-width:850px){.trash-button{width:40px;height:40px}.top-actions{gap:8px}}
 </style>

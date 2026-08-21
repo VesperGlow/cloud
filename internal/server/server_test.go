@@ -508,6 +508,44 @@ func TestTrashRestoresTreeAndProtectsContentFromGC(t *testing.T) {
 	}
 }
 
+func TestTrashFilesRemainReadableUntilPurged(t *testing.T) {
+	a := newTestApp(t)
+	photo := a.readyFile(t, "photo.png", realPNG(t, 320, 180))
+	video := a.readyFile(t, "clip.mp4", []byte("video preview"))
+	audio := a.readyFile(t, "song.mp3", []byte("audio preview"))
+	book := a.readyFile(t, "novel.txt", []byte("第一章\n回收站里的正文"))
+	document := a.readyFile(t, "notes.md", []byte("# 仍可查看"))
+
+	for _, f := range []File{photo, video, audio, book, document} {
+		if rr := a.request("DELETE", "/api/files/"+f.ID, nil, true); rr.Code != http.StatusNoContent {
+			t.Fatalf("trash %s=%d: %s", f.Name, rr.Code, rr.Body.String())
+		}
+	}
+	for _, f := range []File{photo, video, audio} {
+		if rr := a.request("GET", "/api/files/"+f.ID+"/preview", nil, true); rr.Code != http.StatusFound {
+			t.Fatalf("trashed preview %s=%d: %s", f.Name, rr.Code, rr.Body.String())
+		}
+	}
+	if rr := a.request("GET", "/api/files/"+photo.ID+"/thumbnail", nil, true); rr.Code != http.StatusOK {
+		t.Fatalf("trashed thumbnail=%d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := a.request("GET", "/api/files/"+audio.ID+"/download", nil, true); rr.Code != http.StatusFound {
+		t.Fatalf("trashed download=%d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := a.request("GET", "/api/files/"+book.ID+"/book/content", nil, true); rr.Code != http.StatusOK {
+		t.Fatalf("trashed book=%d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := a.request("GET", "/api/files/"+document.ID+"/content", nil, true); rr.Code != http.StatusOK {
+		t.Fatalf("trashed document=%d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := a.request("DELETE", "/api/trash/"+photo.ID, nil, true); rr.Code != http.StatusNoContent {
+		t.Fatalf("purge photo=%d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := a.request("GET", "/api/files/"+photo.ID+"/preview", nil, true); rr.Code != http.StatusNotFound {
+		t.Fatalf("purged preview remains readable: %d", rr.Code)
+	}
+}
+
 func TestEmptyTrashRemovesEveryDeletedTree(t *testing.T) {
 	a := newTestApp(t)
 	first := a.readyFile(t, "first.txt", []byte("first"))

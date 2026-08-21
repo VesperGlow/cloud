@@ -48,7 +48,7 @@ function runCreate(action:'document'|'folder'){
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V6m0 0-5 5m5-5 5 5"/></svg>
         </button>
         <h1>{{ trashMode?'回收站':current?.name || '我的文件' }}</h1>
-        <div v-if="!trashMode" class="view-switch" role="group" aria-label="文件显示方式">
+        <div class="view-switch" role="group" aria-label="文件显示方式">
           <button :class="{active:viewMode==='list'}" title="列表视图" aria-label="列表视图" @click="$emit('setView','list')">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>
           </button>

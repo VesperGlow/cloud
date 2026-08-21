@@ -30,7 +30,7 @@ func isReadableFile(f File) bool {
 }
 
 func (s *Server) readerFile(w http.ResponseWriter, r *http.Request) (File, bool) {
-	f, err := s.file(r.Context(), chi.URLParam(r, "id"))
+	f, err := s.readableFile(r.Context(), chi.URLParam(r, "id"))
 	if err != nil || f.Kind != "file" || f.Status != "ready" {
 		problem(w, http.StatusNotFound, "ready file not found")
 		return File{}, false

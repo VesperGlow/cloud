@@ -36,10 +36,10 @@ function thumbFallback(event:Event,item:DriveFile){
 <template>
   <div class="file-table">
     <div class="table-head"><span class="table-name-heading"><button class="table-select-all" :class="{active:selectedIds.size===items.length}" :title="selectedIds.size===items.length?'取消全选':'全选'" :aria-label="selectedIds.size===items.length?'取消全选':'全选'" :aria-pressed="selectedIds.size===items.length" @click="$emit('selectAll')"><svg viewBox="0 0 24 24" aria-hidden="true"><path v-if="selectedIds.size===items.length" d="m5 12 4 4L19 6"/><path v-else-if="selectedIds.size" d="M6 12h12"/></svg></button>名称</span><span>大小</span><span>修改时间</span><span>操作</span></div>
-    <div v-for="item in items" :key="item.id" class="file-row" :class="{mutedrow:item.status!=='ready',selected:selectedIds.has(item.id)}" @dblclick="!trashMode&&$emit('open',item)">
+    <div v-for="item in items" :key="item.id" class="file-row" :class="{mutedrow:item.status!=='ready',selected:selectedIds.has(item.id)}" @dblclick="(!trashMode||item.kind==='file')&&$emit('open',item)">
       <div class="file-name">
         <button class="row-select" :class="{active:selectedIds.has(item.id)}" :title="selectedIds.has(item.id)?'取消选择':'选择项目'" :aria-label="selectedIds.has(item.id)?'取消选择':'选择项目'" :aria-pressed="selectedIds.has(item.id)" @click.stop="$emit('select',item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button>
-        <button class="file-icon" :class="{directory:item.kind==='directory',image:isImage(item),document:isEditable(item),video:isVideo(item),audio:isAudio(item)}" :disabled="trashMode" :title="trashMode?'回收站项目':item.kind==='directory'?'打开文件夹':isEditable(item)?'编辑文档':isImage(item)?'预览图片':isVideo(item)?'播放视频':isAudio(item)?'播放音频':'文件'" @click="!trashMode&&$emit('open',item)">
+        <button class="file-icon" :class="{directory:item.kind==='directory',image:isImage(item),document:isEditable(item),video:isVideo(item),audio:isAudio(item)}" :disabled="trashMode&&item.kind==='directory'" :title="trashMode&&item.kind==='directory'?'恢复后可打开文件夹':isBook(item)?'阅读':trashMode&&isEditable(item)?'只读查看':isEditable(item)?'编辑文档':isImage(item)?'预览图片':isVideo(item)?'播放视频':isAudio(item)?'播放音频':item.kind==='directory'?'打开文件夹':'文件'" @click="(!trashMode||item.kind==='file')&&$emit('open',item)">
           <span v-if="item.kind==='directory'" class="folder-glyph">▰</span>
           <img v-else-if="isImage(item)" :src="thumbSRC(item)" :alt="item.name" loading="lazy" @error="thumbFallback($event,item)">
           <VideoThumb v-else-if="isVideo(item)" :file="item"><span>▶</span></VideoThumb>
@@ -50,7 +50,7 @@ function thumbFallback(event:Event,item:DriveFile){
       </div>
       <span>{{ item.kind==='directory'?'—':formatSize(item.size) }}</span><span>{{ formatDate(item.updated_at) }}</span>
       <div class="row-actions">
-        <template v-if="trashMode"><button title="恢复" aria-label="恢复" class="restore-action" @click="$emit('restore',item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10a8 8 0 1 0 2-4m-2-3v7h7"/></svg></button><button title="永久删除" aria-label="永久删除" class="danger" @click="$emit('purge',item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg></button></template>
+        <template v-if="trashMode"><button v-if="isBook(item)||isEditable(item)||isMedia(item)" :title="isBook(item)?'阅读':isImage(item)?'预览':isMedia(item)?'播放':'只读查看'" :aria-label="isBook(item)?'阅读':isImage(item)?'预览':isMedia(item)?'播放':'只读查看'" @click="$emit('open',item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path v-if="isBook(item)" d="M12 5c-1.7-1.4-4.2-2-8-2v14c3.8 0 6.3.6 8 2 1.7-1.4 4.2-2 8-2V3c-3.8 0-6.3.6-8 2Zm0 0v14"/><template v-else-if="isImage(item)"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.6"/></template><path v-else-if="isMedia(item)" d="M8 5v14l11-7Z"/><path v-else d="M5 5h14M12 5v14M9 19h6"/></svg></button><button title="恢复" aria-label="恢复" class="restore-action" @click="$emit('restore',item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10a8 8 0 1 0 2-4m-2-3v7h7"/></svg></button><button title="永久删除" aria-label="永久删除" class="danger" @click="$emit('purge',item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg></button></template>
         <template v-else>
           <button v-if="isEditable(item)" title="编辑" aria-label="编辑" @click="$emit('edit',item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path d="m13.8 6.2 3.2 3.2"/></svg></button>
           <button v-if="isMedia(item)" :title="isImage(item)?'预览':'播放'" :aria-label="isImage(item)?'预览':'播放'" @click="$emit('preview',item)"><svg viewBox="0 0 24 24" aria-hidden="true"><template v-if="isImage(item)"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.6"/></template><path v-else d="M8 5v14l11-7Z"/></svg></button>
@@ -65,7 +65,7 @@ function thumbFallback(event:Event,item:DriveFile){
       <details class="row-menu">
         <summary aria-label="更多操作">•••</summary>
         <div class="row-menu-popover">
-          <template v-if="trashMode"><button @click="$emit('restore',item)">恢复</button><button class="danger" @click="$emit('purge',item)">永久删除</button></template>
+          <template v-if="trashMode"><button v-if="isBook(item)||isEditable(item)||isMedia(item)" @click="$emit('open',item)">{{ isBook(item)?'阅读':isImage(item)?'预览':isMedia(item)?'播放':'只读查看' }}</button><button @click="$emit('restore',item)">恢复</button><button class="danger" @click="$emit('purge',item)">永久删除</button></template>
           <template v-else>
             <button v-if="isEditable(item)" @click="$emit('edit',item)">编辑</button>
             <button v-if="isMedia(item)" @click="$emit('preview',item)">{{ isImage(item)?'预览':'播放' }}</button>

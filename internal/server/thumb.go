@@ -75,7 +75,7 @@ func hexSHA256(data []byte) string {
 
 // thumbnail GET：已有缩略图直接返回（长期缓存）；否则按类型生成一次并落盘。
 func (s *Server) thumbnail(w http.ResponseWriter, r *http.Request) {
-	f, err := s.file(r.Context(), chi.URLParam(r, "id"))
+	f, err := s.readableFile(r.Context(), chi.URLParam(r, "id"))
 	if err != nil || f.Kind != "file" || f.Status != "ready" {
 		problem(w, http.StatusNotFound, "ready file not found")
 		return
@@ -202,7 +202,7 @@ func (s *Server) generateVideoThumb(ctx context.Context, f File) ([]byte, bool) 
 // saveThumbnail PUT：接收前端抽帧生成的视频缩略图（小 JPEG），落盘到
 // 内容寻址的 thumbs/ 对象，之后的请求直接命中。
 func (s *Server) saveThumbnail(w http.ResponseWriter, r *http.Request) {
-	f, err := s.file(r.Context(), chi.URLParam(r, "id"))
+	f, err := s.readableFile(r.Context(), chi.URLParam(r, "id"))
 	if err != nil || f.Kind != "file" || f.Status != "ready" {
 		problem(w, http.StatusNotFound, "ready file not found")
 		return
