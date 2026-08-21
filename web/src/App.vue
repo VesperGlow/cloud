@@ -292,15 +292,20 @@ function onDrop(event:DragEvent){dragActive.value=false;if(event.dataTransfer?.f
 function pumpQueue(){while(activeUploads<FILE_CONCURRENCY){const task=tasks.find(t=>t.status==='queued');if(!task)return;activeUploads++;runUpload(task).finally(()=>{activeUploads--;pumpQueue()})}}
 interface BlockSpec { id:string; size:number; offset:number }
 interface RegisteredBlock { id:string; size:number; exists:boolean; url?:string; offset:number }
+interface ChunkingSpec { algorithm:'fastcdc-v1'; min_size:number; avg_size:number; max_size:number }
+interface CreatedUpload { upload_id:string; mode:'blocks'; block_size:number; block_count:number; chunking?:ChunkingSpec }
+interface HashJob { worker:Worker; reject:(reason?:unknown)=>void }
+const hashJobs=new Map<string,HashJob>()
 
 async function runUpload(task:UploadTask){
   task.status='uploading';task.error='';task.cancelled=false;task.progress=0
   try{
-    const created=await api<{upload_id:string;mode:'blocks';block_size:number;block_count:number}>('/api/uploads',{method:'POST',body:JSON.stringify({parent_id:currentId.value,name:task.file.name,size:task.file.size,mime_type:task.file.type||'application/octet-stream'})})
+    const created=await api<CreatedUpload>('/api/uploads',{method:'POST',body:JSON.stringify({parent_id:currentId.value,name:task.file.name,size:task.file.size,mime_type:task.file.type||'application/octet-stream'})})
     task.uploadId=created.upload_id
     if(task.cancelled){await abortRemote(task);return}
-    // 1) 按块切分文件并计算每个块的 SHA-256（内容寻址，重复块自动去重）。
-    const blocks=await hashBlocks(task,created.block_size,created.block_count)
+    // 1) 在 Worker 中用 FastCDC 分块并计算 SHA-256；旧服务端回退为固定分块。
+    const chunking=created.chunking??{algorithm:'fastcdc-v1' as const,min_size:created.block_size,avg_size:created.block_size,max_size:created.block_size}
+    const blocks=await hashBlocks(task,chunking)
     if(task.cancelled){await abortRemote(task);return}
     // 2) 登记全部块；服务端为缺失的块签发条件 PUT 的预签名 URL。
     const registered=await registerBlocks(task,created.upload_id,blocks)
@@ -314,23 +319,27 @@ async function runUpload(task:UploadTask){
   }catch(e){if(task.cancelled){task.status='cancelled';scheduleAutoClear()}else{task.status='failed';task.error=(e as Error).message}}
 }
 
-async function sha256Hex(blob:Blob):Promise<string>{
-  const digest=await crypto.subtle.digest('SHA-256',await blob.arrayBuffer())
-  return Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,'0')).join('')
-}
-
-async function hashBlocks(task:UploadTask,blockSize:number,count:number):Promise<BlockSpec[]>{
-  const blocks:BlockSpec[]=[]
-  let hashed=0
-  for(let i=0;i<count;i++){
-    if(task.cancelled)throw new Error('上传已取消')
-    const start=i*blockSize,end=Math.min(start+blockSize,task.file.size)
-    const id=await sha256Hex(task.file.slice(start,end))
-    blocks.push({id,size:end-start,offset:start})
-    hashed+=end-start
-    task.progress=Math.floor(percentage(hashed,task.file.size)*0.35)
-  }
-  return blocks
+function hashBlocks(task:UploadTask,chunking:ChunkingSpec):Promise<BlockSpec[]>{
+  return new Promise((resolve,reject)=>{
+    const worker=new Worker(new URL('./fastcdc.worker.ts',import.meta.url),{type:'module'})
+    const blocks:BlockSpec[]=[]
+    let settled=false
+    const finish=(error?:unknown)=>{
+      if(settled)return
+      settled=true;worker.terminate();hashJobs.delete(task.id)
+      if(error)reject(error);else resolve(blocks)
+    }
+    hashJobs.set(task.id,{worker,reject:reason=>finish(reason)})
+    worker.onerror=()=>finish(new Error('FastCDC Worker 启动失败'))
+    worker.onmessage=(event:MessageEvent<{type:'block';block:BlockSpec;hashed:number}|{type:'done'}|{type:'error';message:string}>)=>{
+      if(event.data.type==='block'){
+        blocks.push(event.data.block)
+        task.progress=Math.floor(percentage(event.data.hashed,task.file.size)*0.35)
+      }else if(event.data.type==='done')finish()
+      else finish(new Error(event.data.message))
+    }
+    worker.postMessage({file:task.file,config:{minSize:chunking.min_size,avgSize:chunking.avg_size,maxSize:chunking.max_size}})
+  })
 }
 
 async function registerBlocks(task:UploadTask,uploadId:string,blocks:BlockSpec[]):Promise<RegisteredBlock[]>{
@@ -401,7 +410,7 @@ function xhrPutBlock(url:string,body:Blob,task:UploadTask,onProgress:(n:number)=
   })
 }
 function percentage(done:number,total:number){return total===0?100:Math.min(99,Math.round(done/total*100))}
-async function cancelUpload(task:UploadTask){task.cancelled=true;task.requests.forEach(x=>x.abort());await abortRemote(task);task.status='cancelled'}
+async function cancelUpload(task:UploadTask){task.cancelled=true;hashJobs.get(task.id)?.reject(new Error('上传已取消'));task.requests.forEach(x=>x.abort());await abortRemote(task);task.status='cancelled'}
 async function abortRemote(task:UploadTask){if(task.uploadId){try{await api(`/api/uploads/${task.uploadId}`,{method:'DELETE'})}catch{/* stale cleanup retries later */}}}
 async function retry(task:UploadTask){await abortRemote(task);task.status='queued';task.error='';task.uploadId=undefined;task.requests=[];task.cancelled=false;pumpQueue()}
 function clearFinished(){for(let i=tasks.length-1;i>=0;i--)if(['done','cancelled'].includes(tasks[i].status))tasks.splice(i,1);window.clearTimeout(autoClearTimer)}
@@ -409,7 +418,7 @@ function clearFinished(){for(let i=tasks.length-1;i>=0;i--)if(['done','cancelled
 let autoClearTimer=0
 function scheduleAutoClear(){window.clearTimeout(autoClearTimer);if(unfinished.value.length)return;autoClearTimer=window.setTimeout(clearFinished,4000)}
 onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='list'||saved==='grid')viewMode.value=saved;window.addEventListener('popstate',handlePopState);checkSession()})
-onBeforeUnmount(()=>window.removeEventListener('popstate',handlePopState))
+onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(const job of hashJobs.values())job.reject(new Error('页面已关闭'));hashJobs.clear()})
 </script>
 
 <template>

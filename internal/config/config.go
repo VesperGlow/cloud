@@ -26,10 +26,14 @@ type Config struct {
 	S3SecretKey      string
 	S3PathStyle      bool
 	PresignExpires   time.Duration
-	BlockSize        int64
-	UploadExpires    time.Duration
-	GCInterval       time.Duration
-	FFmpegPath       string
+	// BlockSize is the target average FastCDC chunk size. BlockMinSize and
+	// BlockMaxSize bound the variable-size chunks around that target.
+	BlockMinSize  int64
+	BlockSize     int64
+	BlockMaxSize  int64
+	UploadExpires time.Duration
+	GCInterval    time.Duration
+	FFmpegPath    string
 }
 
 func Load() (Config, error) {
@@ -69,8 +73,21 @@ func Load() (Config, error) {
 	if c.BlockSize, err = int64Env("BLOCK_SIZE", 4*1024*1024); err != nil {
 		return c, err
 	}
-	if c.BlockSize < 1*1024*1024 || c.BlockSize > 1*1024*1024*1024 {
+	if c.BlockMinSize, err = int64Env("FASTCDC_MIN_SIZE", c.BlockSize/4); err != nil {
+		return c, err
+	}
+	defaultMax := min(c.BlockSize*4, int64(1024*1024*1024))
+	if c.BlockMaxSize, err = int64Env("FASTCDC_MAX_SIZE", defaultMax); err != nil {
+		return c, err
+	}
+	if c.BlockSize < 1*1024*1024 || c.BlockSize > 1024*1024*1024 {
 		return c, errors.New("BLOCK_SIZE must be between 1 MiB and 1 GiB")
+	}
+	if c.BlockMinSize < 64*1024 || c.BlockMinSize > c.BlockSize {
+		return c, errors.New("FASTCDC_MIN_SIZE must be between 64 KiB and BLOCK_SIZE")
+	}
+	if c.BlockMaxSize < c.BlockSize || c.BlockMaxSize > 1024*1024*1024 {
+		return c, errors.New("FASTCDC_MAX_SIZE must be between BLOCK_SIZE and 1 GiB")
 	}
 	if c.UploadExpires <= 0 {
 		return c, errors.New("UPLOAD_EXPIRES must be positive")
@@ -101,6 +118,24 @@ func Load() (Config, error) {
 }
 
 func (c Config) DatabasePath() string { return filepath.Join(c.DataDir, "cloud.db") }
+
+// ChunkSizes also supplies useful defaults for tests and embedded callers
+// that construct Config directly instead of using Load.
+func (c Config) ChunkSizes() (minimum, average, maximum int64) {
+	average = c.BlockSize
+	if average <= 0 {
+		average = 4 * 1024 * 1024
+	}
+	minimum = c.BlockMinSize
+	if minimum <= 0 {
+		minimum = max(1, average/4)
+	}
+	maximum = c.BlockMaxSize
+	if maximum <= 0 {
+		maximum = min(average*4, int64(1024*1024*1024))
+	}
+	return minimum, average, maximum
+}
 
 func env(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
