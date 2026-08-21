@@ -387,6 +387,13 @@ const fileColumns = `id,parent_id,name,kind,COALESCE(object_key,''),size,mime_ty
 func (s *Server) file(ctx context.Context, id string) (File, error) {
 	return scanFile(s.db.QueryRowContext(ctx, `SELECT `+fileColumns+` FROM files WHERE id=? AND deleted_at IS NULL`, id))
 }
+
+// readableFile also resolves soft-deleted files. It is only used by
+// authenticated content delivery and derived-thumbnail endpoints so items
+// can still be viewed before they are restored or permanently deleted.
+func (s *Server) readableFile(ctx context.Context, id string) (File, error) {
+	return scanFile(s.db.QueryRowContext(ctx, `SELECT `+fileColumns+` FROM files WHERE id=?`, id))
+}
 func (s *Server) getFile(w http.ResponseWriter, r *http.Request) {
 	f, err := s.file(r.Context(), chi.URLParam(r, "id"))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -568,7 +575,7 @@ func (s *Server) createDocument(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getDocument(w http.ResponseWriter, r *http.Request) {
-	f, err := s.file(r.Context(), chi.URLParam(r, "id"))
+	f, err := s.readableFile(r.Context(), chi.URLParam(r, "id"))
 	if err != nil || f.Kind != "file" || f.Status != "ready" {
 		problem(w, http.StatusNotFound, "ready file not found")
 		return
@@ -852,7 +859,7 @@ func (s *Server) emptyTrash(w http.ResponseWriter, r *http.Request) {
 func (s *Server) download(w http.ResponseWriter, r *http.Request) { s.streamFile(w, r, false) }
 func (s *Server) preview(w http.ResponseWriter, r *http.Request)  { s.streamFile(w, r, true) }
 func (s *Server) streamFile(w http.ResponseWriter, r *http.Request, inline bool) {
-	f, err := s.file(r.Context(), chi.URLParam(r, "id"))
+	f, err := s.readableFile(r.Context(), chi.URLParam(r, "id"))
 	if err != nil || f.Kind != "file" || f.Status != "ready" {
 		problem(w, 404, "ready file not found")
 		return
