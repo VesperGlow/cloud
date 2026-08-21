@@ -115,7 +115,7 @@ async function submitLogin() {
   catch(e){login.error=(e as Error).message}
   finally{login.busy=false}
 }
-async function logout(){await api('/api/auth/logout',{method:'POST'});user.value=null;hasAvatar.value=false;items.value=[];tasks.splice(0)}
+async function logout(){await api('/api/auth/logout',{method:'POST'});user.value=null;hasAvatar.value=false;items.value=[];tasks.splice(0);downloads.splice(0)}
 function showAccount(){account.username=user.value||'';account.currentPassword='';account.password='';account.confirmPassword='';account.error='';avatar.error='';openModal('account')}
 function chooseAvatar(){avatarInput.value?.click()}
 async function uploadAvatar(file:File){
@@ -143,7 +143,7 @@ async function saveAccount(){
   modalBusy.value=true
   try{
     await api('/api/auth/credentials',{method:'PATCH',body:JSON.stringify({current_password:account.currentPassword,username:account.username,password:account.password})})
-    closeModal();login.username=account.username;login.password='';login.notice='账户已更新，请使用新凭据重新登录';user.value=null;items.value=[];tasks.splice(0)
+    closeModal();login.username=account.username;login.password='';login.notice='账户已更新，请使用新凭据重新登录';user.value=null;items.value=[];tasks.splice(0);downloads.splice(0)
   }catch(e){account.error=(e as Error).message}
   finally{modalBusy.value=false}
 }
@@ -411,19 +411,20 @@ async function completeWithRepair(task:UploadTask,uploadId:string,blocks:BlockSp
 function xhrPutBlock(url:string,body:Blob,task:UploadTask,onProgress:(n:number)=>void):Promise<void>{
   return new Promise((resolve,reject)=>{
     const xhr=new XMLHttpRequest()
+    const detach=()=>{task.requests=task.requests.filter(request=>request!==xhr)}
     task.requests.push(xhr)
     xhr.open('PUT',url)
     xhr.setRequestHeader('Content-Type','application/octet-stream')
     xhr.setRequestHeader('If-None-Match','*')
     xhr.upload.onprogress=e=>{if(e.lengthComputable)onProgress(e.loaded)}
     xhr.onload=()=>{
-      task.requests=task.requests.filter(x=>x!==xhr)
+      detach()
       if(xhr.status>=200&&xhr.status<300)resolve()
       else if(xhr.status===412)resolve() // 内容相同的块已存在（并发去重），视为成功
       else reject(new Error(`S3 块上传失败 (${xhr.status})`))
     }
-    xhr.onerror=()=>reject(new Error('无法连接对象存储，请检查 S3 CORS'))
-    xhr.onabort=()=>reject(new Error('上传已取消'))
+    xhr.onerror=()=>{detach();reject(new Error('无法连接对象存储，请检查 S3 CORS'))}
+    xhr.onabort=()=>{detach();reject(new Error('上传已取消'))}
     xhr.send(body)
   })
 }
