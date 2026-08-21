@@ -4,16 +4,16 @@ import { marked } from 'marked'
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api } from './api'
 import type { DriveFile } from './api'
+import AppDialog from './components/AppDialog.vue'
 import AppTopbar from './components/AppTopbar.vue'
 import FileBrowserHeader from './components/FileBrowserHeader.vue'
 import FileGrid from './components/FileGrid.vue'
 import FileTable from './components/FileTable.vue'
 import MediaPreview from './components/MediaPreview.vue'
-import UploadPanel from './components/UploadPanel.vue'
 import { isBook, isEditable, isImage, isMedia } from './fileTypes'
 import { formatDate, formatSize } from './format'
 import ReaderView from './Reader.vue'
-import type { FolderOption, ProfileResponse, ShareResponse, StorageStats, UploadTask } from './types'
+import type { DownloadTask, FolderOption, ProfileResponse, ShareResponse, StorageStats, UploadTask } from './types'
 
 const ROOT = '00000000-0000-0000-0000-000000000000'
 const FILE_CONCURRENCY = 3
@@ -34,6 +34,8 @@ const loading = ref(false)
 const dragActive = ref(false)
 const toast = reactive({ text:'', kind:'error' as 'error'|'success' })
 const tasks = reactive<UploadTask[]>([])
+const downloads = reactive<DownloadTask[]>([])
+const trashMode = ref(false)
 const selected = ref<DriveFile|null>(null)
 const selectedIds = ref<Set<string>>(new Set())
 const moveTargets = ref<DriveFile[]>([])
@@ -51,10 +53,11 @@ const storageStats = reactive<StorageStats>({ total_bytes:0, file_count:0 })
 const fileInput = ref<HTMLInputElement|null>(null)
 const avatarInput = ref<HTMLInputElement|null>(null)
 const viewMode = ref<'list'|'grid'>('list')
+const dialog = reactive({open:false,title:'',message:'',confirmLabel:'确定',cancelLabel:'取消',tone:'default' as 'default'|'danger',input:false,value:'',placeholder:''})
+let dialogResolve:((value:string|boolean|null)=>void)|null=null
 let activeUploads = 0
 let toastTimer = 0
 
-const unfinished = computed(() => tasks.filter(t => t.status !== 'done' && t.status !== 'cancelled'))
 const editorDirty = computed(() => editor.content !== editor.original || editor.name !== editor.originalName)
 const editorBytes = computed(() => new Blob([editor.content]).size)
 const editorIsMarkdown = computed(() => /\.(md|markdown)$/i.test(editor.name))
@@ -64,6 +67,14 @@ const selectedItems = computed(() => items.value.filter(item => selectedIds.valu
 const selectedBytes = computed(() => selectedItems.value.reduce((total,item) => total+(item.kind==='file'?item.size:0),0))
 const selectedFiles = computed(() => selectedItems.value.filter(item => item.kind==='file'))
 const singleSelected = computed(() => selectedItems.value.length===1?selectedItems.value[0]:null)
+
+function askDialog(options:{title:string;message:string;confirmLabel?:string;cancelLabel?:string;tone?:'default'|'danger';input?:boolean;value?:string;placeholder?:string}){
+  dialog.title=options.title;dialog.message=options.message;dialog.confirmLabel=options.confirmLabel||'确定';dialog.cancelLabel=options.cancelLabel||'取消';dialog.tone=options.tone||'default';dialog.input=!!options.input;dialog.value=options.value||'';dialog.placeholder=options.placeholder||'';dialog.open=true
+  return new Promise<string|boolean|null>(resolve=>{dialogResolve=resolve})
+}
+async function confirmDialog(options:{title:string;message:string;confirmLabel?:string;tone?:'default'|'danger'}){return await askDialog(options)===true}
+async function promptDialog(options:{title:string;message:string;value?:string;placeholder?:string;confirmLabel?:string}){const result=await askDialog({...options,input:true});return typeof result==='string'?result:null}
+function finishDialog(confirmed:boolean){const resolve=dialogResolve;dialogResolve=null;dialog.open=false;if(!resolve)return;resolve(confirmed?(dialog.input?dialog.value.trim():true):null)}
 
 function notify(text:string, kind:'error'|'success'='error') { toast.text=text;toast.kind=kind;window.clearTimeout(toastTimer);toastTimer=window.setTimeout(()=>toast.text='',3600) }
 
@@ -148,7 +159,7 @@ async function openFolder(id:string){
     const [meta,list,stats]=await Promise.all([api<{file:DriveFile;breadcrumbs:DriveFile[]}>(`/api/files/${id}`),api<{items:DriveFile[]}>(`/api/files/${id}/children`),api<StorageStats>('/api/storage/stats')])
     if(seq!==folderSeq)return
     if(!suppressHistory&&id!==currentId.value){navActions.value.push({kind:'folder',id:currentId.value});window.history.pushState({cloudNav:true},'')}
-    currentId.value=id;current.value=meta.file;breadcrumbs.value=meta.breadcrumbs;items.value=list.items;storageStats.total_bytes=stats.total_bytes;storageStats.file_count=stats.file_count;selected.value=null;clearSelection();history.replaceState({cloudNav:true},'',folderURL(id))
+    trashMode.value=false;currentId.value=id;current.value=meta.file;breadcrumbs.value=meta.breadcrumbs;items.value=list.items;storageStats.total_bytes=stats.total_bytes;storageStats.file_count=stats.file_count;selected.value=null;clearSelection();history.replaceState({cloudNav:true},'',folderURL(id))
   }catch(e){if(seq===folderSeq)notify((e as Error).message)}
   finally{if(seq===folderSeq)loading.value=false}
 }
@@ -177,14 +188,13 @@ function openModal(name:ModalName){
 }
 function closeModal(){if(modal.value)window.history.back()}
 function goUp(){const parent=current.value?.parent_id;if(parent)openFolder(parent)}
-async function createFolder(){const name=window.prompt('新文件夹名称');if(!name)return;try{await api('/api/directories',{method:'POST',body:JSON.stringify({parent_id:currentId.value,name})});await openFolder(currentId.value);notify('文件夹已创建','success')}catch(e){notify((e as Error).message)}}
-async function removeItem(item:DriveFile){const text=item.kind==='directory'?'仅空文件夹可删除。确定删除吗？':'确定永久删除这个文件吗？';if(!window.confirm(`${text}\n\n${item.name}`))return;try{await api(`/api/files/${item.id}`,{method:'DELETE'});await openFolder(currentId.value);notify('已删除','success')}catch(e){notify((e as Error).message)}}
+async function openTrash(){loading.value=true;try{const data=await api<{items:DriveFile[]}>('/api/trash');trashMode.value=true;items.value=data.items;current.value=null;breadcrumbs.value=[];selected.value=null;clearSelection()}catch(e){notify((e as Error).message)}finally{loading.value=false}}
+async function createFolder(){const name=await promptDialog({title:'新建文件夹',message:'给这个文件夹起个名字。',placeholder:'文件夹名称',confirmLabel:'创建'});if(!name)return;try{await api('/api/directories',{method:'POST',body:JSON.stringify({parent_id:currentId.value,name})});await openFolder(currentId.value);notify('文件夹已创建','success')}catch(e){notify((e as Error).message)}}
+async function removeItem(item:DriveFile){if(!await confirmDialog({title:'移入回收站？',message:`「${item.name}」${item.kind==='directory'?'及其中的全部内容':''}会移入回收站，之后仍可恢复。`,confirmLabel:'移入回收站',tone:'danger'}))return;try{await api(`/api/files/${item.id}`,{method:'DELETE'});await openFolder(currentId.value);notify('已移入回收站','success')}catch(e){notify((e as Error).message)}}
 async function removeSelected(){
   const targets=[...selectedItems.value]
   if(!targets.length)return
-  const directories=targets.filter(item=>item.kind==='directory').length
-  const hint=directories?`\n其中有 ${directories} 个文件夹；只有空文件夹可以删除。`:''
-  if(!window.confirm(`确定永久删除选中的 ${targets.length} 项吗？${hint}`))return
+  if(!await confirmDialog({title:`移入回收站？`,message:`选中的 ${targets.length} 项会移入回收站，文件夹中的内容也会一起保留。`,confirmLabel:'移入回收站',tone:'danger'}))return
   let removed=0
   const errors:string[]=[]
   for(const item of targets){
@@ -192,9 +202,14 @@ async function removeSelected(){
     catch(e){errors.push(`${item.name}：${(e as Error).message}`)}
   }
   await openFolder(currentId.value)
-  if(errors.length)notify(`已删除 ${removed} 项，${errors.length} 项失败：${errors[0]}`)
-  else notify(`已删除 ${removed} 项`,'success')
+  if(errors.length)notify(`已移入 ${removed} 项，${errors.length} 项失败：${errors[0]}`)
+  else notify(`已将 ${removed} 项移入回收站`,'success')
 }
+async function restoreItem(item:DriveFile){try{await api(`/api/trash/${item.id}/restore`,{method:'POST'});await openTrash();notify('已恢复到原位置','success')}catch(e){notify((e as Error).message)}}
+async function restoreSelected(){for(const item of [...selectedItems.value]){try{await api(`/api/trash/${item.id}/restore`,{method:'POST'})}catch(e){notify(`${item.name}：${(e as Error).message}`);return}}await openTrash();notify('所选项目已恢复','success')}
+async function purgeItem(item:DriveFile){if(!await confirmDialog({title:'永久删除？',message:`「${item.name}」${item.kind==='directory'?'及其中的全部内容':''}将无法恢复，对应的无引用数据块会在垃圾回收后清理。`,confirmLabel:'永久删除',tone:'danger'}))return;try{await api(`/api/trash/${item.id}`,{method:'DELETE'});await openTrash();notify('已永久删除','success')}catch(e){notify((e as Error).message)}}
+async function purgeSelected(){const targets=[...selectedItems.value];if(!targets.length||!await confirmDialog({title:`永久删除 ${targets.length} 项？`,message:'这个操作无法撤销。无引用的数据块会在垃圾回收后清理。',confirmLabel:'永久删除',tone:'danger'}))return;for(const item of targets){try{await api(`/api/trash/${item.id}`,{method:'DELETE'})}catch(e){notify(`${item.name}：${(e as Error).message}`);return}}await openTrash();notify('已永久删除所选项目','success')}
+async function emptyTrash(){if(!items.value.length||!await confirmDialog({title:'清空回收站？',message:`回收站中的 ${items.value.length} 项及其内容都会永久删除，无法恢复。`,confirmLabel:'清空回收站',tone:'danger'}))return;try{await api('/api/trash',{method:'DELETE'});await openTrash();notify('回收站已清空','success')}catch(e){notify((e as Error).message)}}
 function showRename(item:DriveFile){selected.value=item;renameValue.value=item.name;openModal('rename')}
 async function saveRename(){if(!selected.value)return;modalBusy.value=true;try{await api(`/api/files/${selected.value.id}`,{method:'PATCH',body:JSON.stringify({name:renameValue.value})});closeModal();await openFolder(currentId.value);notify('已重命名','success')}catch(e){notify((e as Error).message)}finally{modalBusy.value=false}}
 async function showMove(item:DriveFile){await showMoveTargets([item])}
@@ -236,8 +251,8 @@ async function moveTo(parentId:string){
 }
 function showPreview(item:DriveFile){selected.value=item;openModal('preview')}
 async function showShare(item:DriveFile){selected.value=item;openModal('share');share.active=false;share.url='';share.createdAt='';share.error='';share.copied=false;share.busy=true;try{const data=await api<ShareResponse>(`/api/files/${item.id}/share`);share.active=data.active;share.url=data.url||'';share.createdAt=data.created_at||''}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
-async function createShare(replace=false){if(!selected.value)return;if(replace&&!window.confirm('重新生成后，旧分享链接会立即失效。继续吗？'))return;share.busy=true;share.error='';share.copied=false;try{const data=await api<ShareResponse>(`/api/files/${selected.value.id}/share`,{method:'POST'});share.active=data.active;share.url=data.url||'';share.createdAt=data.created_at||''}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
-async function revokeShare(){if(!selected.value||!window.confirm('停止分享后，现有订阅链接会立即失效。继续吗？'))return;share.busy=true;share.error='';try{await api(`/api/files/${selected.value.id}/share`,{method:'DELETE'});share.active=false;share.url='';share.createdAt='';share.copied=false;notify('分享已停止','success')}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
+async function createShare(replace=false){if(!selected.value)return;if(replace&&!await confirmDialog({title:'重新生成分享链接？',message:'旧分享链接会立即失效，拿到旧链接的人将无法继续访问。',confirmLabel:'重新生成'}))return;share.busy=true;share.error='';share.copied=false;try{const data=await api<ShareResponse>(`/api/files/${selected.value.id}/share`,{method:'POST'});share.active=data.active;share.url=data.url||'';share.createdAt=data.created_at||''}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
+async function revokeShare(){if(!selected.value||!await confirmDialog({title:'停止分享？',message:'现有公开链接会立即失效。文件本身不会被删除。',confirmLabel:'停止分享',tone:'danger'}))return;share.busy=true;share.error='';try{await api(`/api/files/${selected.value.id}/share`,{method:'DELETE'});share.active=false;share.url='';share.createdAt='';share.copied=false;notify('分享已停止','success')}catch(e){share.error=(e as Error).message}finally{share.busy=false}}
 async function copyShare(){if(!share.url)return;try{await navigator.clipboard.writeText(share.url);share.copied=true;window.setTimeout(()=>share.copied=false,2200)}catch{share.error='复制失败，请手动选择链接复制'}}
 function openItem(item:DriveFile){if(item.kind==='directory')openFolder(item.id);else if(isBook(item)&&(!isEditable(item)||/\.epub$/i.test(item.name)))openReader(item);else if(isEditable(item))openEditor(item);else if(isMedia(item))showPreview(item)}
 function newDocument(){selected.value=null;editor.isNew=true;editor.fileId='';editor.name='未命名文档.md';editor.originalName=editor.name;editor.content='';editor.original='';editor.etag='';editor.mode='edit';editor.busy=false;editor.error='';openModal('editor')}
@@ -262,8 +277,8 @@ async function saveDocument(){
   }catch(e){editor.error=(e as Error).message}
   finally{editor.busy=false}
 }
-function closeEditor(){if(editorDirty.value&&!window.confirm('还有未保存的修改，确定关闭吗？'))return;closeModal()}
-function closeBackdrop(){if(modal.value==='editor')closeEditor();else closeModal()}
+async function closeEditor(){if(editorDirty.value&&!await confirmDialog({title:'放弃未保存的修改？',message:'关闭后，本次修改将无法恢复。',confirmLabel:'放弃修改',tone:'danger'}))return;closeModal()}
+function closeBackdrop(){if(modal.value==='editor')void closeEditor();else closeModal()}
 function setViewMode(mode:'list'|'grid'){viewMode.value=mode;localStorage.setItem('cloud-view-mode',mode)}
 function toggleSelection(item:DriveFile){
   const next=new Set(selectedIds.value)
@@ -278,17 +293,20 @@ function clearSelectionFromBlank(event:MouseEvent){
   if(!(target instanceof Element)||target.closest('button,a,input,textarea,select,[role="toolbar"],.file-card,.file-row'))return
   clearSelection()
 }
-function download(item:DriveFile){window.location.assign(`/api/files/${item.id}/download`)}
+function startDownload(item:DriveFile){
+  const task:DownloadTask={id:crypto.randomUUID(),name:item.name,size:item.size,status:'starting',error:''};downloads.unshift(task)
+  try{const link=document.createElement('a');link.href=`/api/files/${item.id}/download`;link.download=item.name;link.hidden=true;document.body.appendChild(link);link.click();link.remove();window.setTimeout(()=>task.status='handed-off',500)}
+  catch(e){task.status='failed';task.error=(e as Error).message}
+}
+function download(item:DriveFile){startDownload(item)}
 function downloadSelected(){
   const files=[...selectedFiles.value]
-  files.forEach((item,index)=>window.setTimeout(()=>{
-    const link=document.createElement('a');link.href=`/api/files/${item.id}/download`;link.download=item.name;link.hidden=true;document.body.appendChild(link);link.click();link.remove()
-  },index*180))
+  files.forEach((item,index)=>window.setTimeout(()=>startDownload(item),index*180))
 }
 
 function chooseFiles(){fileInput.value?.click()}
 function acceptFiles(list:FileList|File[]){for(const file of Array.from(list)){tasks.push({id:crypto.randomUUID(),file,progress:0,status:'queued',error:'',cancelled:false,requests:[]})}pumpQueue()}
-function onDrop(event:DragEvent){dragActive.value=false;if(event.dataTransfer?.files.length)acceptFiles(event.dataTransfer.files)}
+function onDrop(event:DragEvent){dragActive.value=false;if(!trashMode.value&&event.dataTransfer?.files.length)acceptFiles(event.dataTransfer.files)}
 function pumpQueue(){while(activeUploads<FILE_CONCURRENCY){const task=tasks.find(t=>t.status==='queued');if(!task)return;activeUploads++;runUpload(task).finally(()=>{activeUploads--;pumpQueue()})}}
 interface BlockSpec { id:string; size:number; offset:number }
 interface RegisteredBlock { id:string; size:number; exists:boolean; url?:string; offset:number }
@@ -413,10 +431,9 @@ function percentage(done:number,total:number){return total===0?100:Math.min(99,M
 async function cancelUpload(task:UploadTask){task.cancelled=true;hashJobs.get(task.id)?.reject(new Error('上传已取消'));task.requests.forEach(x=>x.abort());await abortRemote(task);task.status='cancelled'}
 async function abortRemote(task:UploadTask){if(task.uploadId){try{await api(`/api/uploads/${task.uploadId}`,{method:'DELETE'})}catch{/* stale cleanup retries later */}}}
 async function retry(task:UploadTask){await abortRemote(task);task.status='queued';task.error='';task.uploadId=undefined;task.requests=[];task.cancelled=false;pumpQueue()}
-function clearFinished(){for(let i=tasks.length-1;i>=0;i--)if(['done','cancelled'].includes(tasks[i].status))tasks.splice(i,1);window.clearTimeout(autoClearTimer)}
-// 全部上传结束后自动收起上传面板（失败项保留，供重试）。
-let autoClearTimer=0
-function scheduleAutoClear(){window.clearTimeout(autoClearTimer);if(unfinished.value.length)return;autoClearTimer=window.setTimeout(clearFinished,4000)}
+function clearFinished(){for(let i=tasks.length-1;i>=0;i--)if(['done','cancelled'].includes(tasks[i].status))tasks.splice(i,1);for(let i=downloads.length-1;i>=0;i--)if(downloads[i].status!=='starting')downloads.splice(i,1)}
+// 完成记录保留在传输中心，等用户主动清除。
+function scheduleAutoClear(){}
 onMounted(()=>{const saved=localStorage.getItem('cloud-view-mode');if(saved==='list'||saved==='grid')viewMode.value=saved;window.addEventListener('popstate',handlePopState);checkSession()})
 onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(const job of hashJobs.values())job.reject(new Error('页面已关闭'));hashJobs.clear()})
 </script>
@@ -429,13 +446,14 @@ onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(c
   </main>
 
   <div v-else class="app-shell" @dragover.prevent="dragActive=true" @dragleave.self="dragActive=false" @drop.prevent="onDrop">
-    <AppTopbar :user="user" :has-avatar="hasAvatar" :avatar-url="avatarURL" @home="openFolder(ROOT)" @account="showAccount" @logout="logout" @avatar-error="hasAvatar=false" />
+    <AppTopbar :user="user" :has-avatar="hasAvatar" :avatar-url="avatarURL" :uploads="tasks" :downloads="downloads" @home="openFolder(ROOT)" @trash="openTrash" @account="showAccount" @logout="logout" @avatar-error="hasAvatar=false" @clear-transfers="clearFinished" @cancel-upload="cancelUpload" @retry-upload="retry" />
     <section class="content" @click="clearSelectionFromBlank">
-      <FileBrowserHeader :breadcrumbs="breadcrumbs" :current="current" :can-go-up="currentId!==ROOT&&!!current?.parent_id" :item-count="items.length" :total-bytes="storageStats.total_bytes" :file-count="storageStats.file_count" :view-mode="viewMode" @open-folder="openFolder" @up="goUp" @set-view="setViewMode" @new-document="newDocument" @create-folder="createFolder" @upload="chooseFiles" />
+      <FileBrowserHeader :breadcrumbs="breadcrumbs" :current="current" :can-go-up="currentId!==ROOT&&!!current?.parent_id" :item-count="items.length" :total-bytes="storageStats.total_bytes" :file-count="storageStats.file_count" :view-mode="viewMode" :trash-mode="trashMode" @open-folder="openFolder" @up="goUp" @set-view="setViewMode" @new-document="newDocument" @create-folder="createFolder" @upload="chooseFiles" @leave-trash="openFolder(ROOT)" @empty-trash="emptyTrash" />
       <input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}">
       <div v-if="selectedItems.length&&!modal" class="selection-toolbar" role="toolbar" aria-label="所选项目操作">
         <button class="selection-close" title="取消选择" aria-label="取消选择" @click="clearSelection">×</button><span class="selection-summary"><b>{{ selectedItems.length }} 项</b><small>已选择 {{ formatSize(selectedBytes) }}</small></span>
-        <div class="selection-actions">
+        <div v-if="trashMode" class="selection-actions"><button @click="restoreSelected"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10a8 8 0 1 0 2-4m-2-3v7h7"/></svg><span>恢复</span></button><button class="danger" @click="purgeSelected"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg><span>永久删除</span></button></div>
+        <div v-else class="selection-actions">
           <button @click="selectAll"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z"/><path d="m8 12 3 3 5-6"/></svg><span>{{ selectedItems.length===items.length?'取消全选':'全选' }}</span></button>
           <button v-if="singleSelected&&(singleSelected.kind==='directory'||isEditable(singleSelected)||isMedia(singleSelected)||isBook(singleSelected))" @click="openItem(singleSelected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path v-if="singleSelected.kind==='directory'" d="M3 7h7l2 2h9v9H3z"/><path v-else-if="isEditable(singleSelected)&&!isBook(singleSelected)" d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path v-else-if="isBook(singleSelected)" d="M12 5c-1.7-1.4-4.2-2-8-2v14c3.8 0 6.3.6 8 2 1.7-1.4 4.2-2 8-2V3c-3.8 0-6.3.6-8 2Zm0 0v14"/><path v-else-if="isImage(singleSelected)" d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><path v-else d="M8 5v14l11-7Z"/></svg><span>{{ singleSelected.kind==='directory'?'打开':isBook(singleSelected)?'阅读':isEditable(singleSelected)?'编辑文本':isImage(singleSelected)?'预览':'播放' }}</span></button>
           <button v-if="selectedFiles.length" @click="downloadSelected"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg><span>下载{{ selectedFiles.length>1?` (${selectedFiles.length})`:'' }}</span></button>
@@ -446,13 +464,12 @@ onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(c
         </div>
       </div>
       <div v-if="loading" class="state"><div class="spinner"></div><p>正在读取文件…</p></div>
-      <div v-else-if="!items.length" class="state empty"><div class="empty-icon">⌁</div><h3>这里还是空的</h3><p>拖放文件到这里，或新建一篇文档。</p><div class="empty-actions"><button class="secondary" @click="newDocument">新建文档</button><button class="primary" @click="chooseFiles">上传文件</button></div></div>
-      <FileTable v-else-if="viewMode==='list'" :items="items" :selected-ids="selectedIds" @open="openItem" @select="toggleSelection" @select-all="selectAll" @edit="openEditor" @preview="showPreview" @read="openReader" @download="download" @share="showShare" @rename="showRename" @move="showMove" @remove="removeItem" />
+      <div v-else-if="!items.length" class="state empty"><div class="empty-icon">⌁</div><h3>{{ trashMode?'回收站是空的':'这里还是空的' }}</h3><p>{{ trashMode?'删除的项目会先来到这里。':'拖放文件到这里，或新建一篇文档。' }}</p><div v-if="!trashMode" class="empty-actions"><button class="secondary" @click="newDocument">新建文档</button><button class="primary" @click="chooseFiles">上传文件</button></div></div>
+      <FileTable v-else-if="trashMode||viewMode==='list'" :items="items" :selected-ids="selectedIds" :trash-mode="trashMode" @open="openItem" @select="toggleSelection" @select-all="selectAll" @edit="openEditor" @preview="showPreview" @read="openReader" @download="download" @share="showShare" @rename="showRename" @move="showMove" @remove="removeItem" @restore="restoreItem" @purge="purgeItem" />
       <FileGrid v-else :items="items" :selected-ids="selectedIds" @open="openItem" @select="toggleSelection" />
     </section>
 
-    <div v-if="dragActive" class="drop-zone"><div><span>↓</span><h2>释放以上传到 {{ current?.name || '我的文件' }}</h2><p>文件将按内容块直传 S3，重复内容自动去重</p></div></div>
-    <UploadPanel :tasks="tasks" @clear="clearFinished" @cancel="cancelUpload" @retry="retry" />
+    <div v-if="dragActive&&!trashMode" class="drop-zone"><div><span>↓</span><h2>释放以上传到 {{ current?.name || '我的文件' }}</h2><p>文件将按内容块直传 S3，重复内容自动去重</p></div></div>
 
     <div v-if="modal" class="modal-backdrop" :class="{previewing:modal==='preview',editing:modal==='editor',reading:modal==='reader'}" @click.self="closeBackdrop">
       <section v-if="modal==='rename'" class="modal"><header><div><p class="eyebrow dark">EDIT</p><h2>重命名</h2></div><button @click="closeModal">×</button></header><label>新名称<input v-model="renameValue" maxlength="1024" @keyup.enter="saveRename"></label><footer><button class="secondary" @click="closeModal">取消</button><button class="primary" :disabled="modalBusy" @click="saveRename">保存</button></footer></section>
@@ -486,6 +503,7 @@ onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(c
       <MediaPreview v-else-if="modal==='preview'&&selected" :selected="selected" :items="items" @close="closeModal" @change="selected=$event" @download="download" />
     </div>
     <ReaderView v-if="modal==='reader'&&readerFile" :file="readerFile" @close="closeModal" />
+    <AppDialog v-if="dialog.open" :title="dialog.title" :message="dialog.message" :confirm-label="dialog.confirmLabel" :cancel-label="dialog.cancelLabel" :tone="dialog.tone" :input="dialog.input" :value="dialog.value" :placeholder="dialog.placeholder" @update:value="dialog.value=$event" @confirm="finishDialog(true)" @cancel="finishDialog(false)" />
     <div v-if="toast.text" class="toast" :class="toast.kind">{{ toast.text }}</div>
   </div>
 </template>
