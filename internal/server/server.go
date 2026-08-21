@@ -973,10 +973,11 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "parent directory is invalid")
 		return
 	}
-	// Every file is a block upload now: the browser splits the content
-	// into fixed-size blocks and PUTs them straight to S3 under their
+	// Every file is a block upload now: the browser uses FastCDC to split the
+	// content into variable-size blocks and PUTs them straight to S3 under their
 	// SHA-256 content addresses; the manifest is only written on complete.
 	fileID, uploadID := ids.New(), ids.New()
+	chunkMin, chunkAvg, chunkMax := s.cfg.ChunkSizes()
 	now := time.Now().UTC()
 	expires := now.Add(s.cfg.UploadExpires)
 	tx, err := s.db.BeginTx(r.Context(), nil)
@@ -986,7 +987,10 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	_, err = tx.ExecContext(r.Context(), `INSERT INTO files(id,parent_id,name,kind,size,mime_type,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, fileID, in.ParentID, in.Name, "file", in.Size, in.MimeType, "pending", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 	if err == nil {
-		_, err = tx.ExecContext(r.Context(), `INSERT INTO uploads(id,file_id,block_size,expected_size,status,created_at,expires_at) VALUES(?,?,?,?,'pending',?,?)`, uploadID, fileID, s.cfg.BlockSize, in.Size, now.Format(time.RFC3339Nano), expires.Format(time.RFC3339Nano))
+		// block_size remains the schema's hard per-block limit. The API exposes
+		// the complete FastCDC tuple while old clients can keep using block_size
+		// as a fixed average and still satisfy the variable-list validator.
+		_, err = tx.ExecContext(r.Context(), `INSERT INTO uploads(id,file_id,block_size,expected_size,status,created_at,expires_at) VALUES(?,?,?,?,'pending',?,?)`, uploadID, fileID, chunkMax, in.Size, now.Format(time.RFC3339Nano), expires.Format(time.RFC3339Nano))
 	}
 	if err != nil {
 		tx.Rollback()
@@ -1001,20 +1005,28 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		problem(w, 500, "could not create upload")
 		return
 	}
-	s.log.Info("upload created", "file", in.Name, "size", in.Size, "block_size", s.cfg.BlockSize)
+	s.log.Info("upload created", "file", in.Name, "size", in.Size, "chunking", "fastcdc-v1", "chunk_min", chunkMin, "chunk_avg", chunkAvg, "chunk_max", chunkMax)
 	writeJSON(w, 201, map[string]any{
-		"upload_id":   uploadID,
-		"file_id":     fileID,
-		"mode":        "blocks",
-		"block_size":  s.cfg.BlockSize,
-		"block_count": blockCount(in.Size, s.cfg.BlockSize),
-		"expires_at":  expires.Format(time.RFC3339Nano),
+		"upload_id": uploadID,
+		"file_id":   fileID,
+		"mode":      "blocks",
+		// Legacy fields keep cached fixed-size clients compatible during a
+		// rolling deploy. New clients use chunking below.
+		"block_size":  chunkAvg,
+		"block_count": blockCount(in.Size, chunkAvg),
+		"chunking": map[string]any{
+			"algorithm": "fastcdc-v1",
+			"min_size":  chunkMin,
+			"avg_size":  chunkAvg,
+			"max_size":  chunkMax,
+		},
+		"expires_at": expires.Format(time.RFC3339Nano),
 	})
 }
 
 type uploadRecord struct {
 	ID, FileID, ObjectKey, Status, ExpiresAt string
-	BlockSize, ExpectedSize                  int64
+	MaxBlockSize, ExpectedSize               int64
 }
 
 func (u uploadRecord) expired(now time.Time) bool {
@@ -1024,7 +1036,7 @@ func (u uploadRecord) expired(now time.Time) bool {
 
 func (s *Server) upload(ctx context.Context, id string) (uploadRecord, error) {
 	var u uploadRecord
-	err := s.db.QueryRowContext(ctx, `SELECT u.id,u.file_id,COALESCE(f.object_key,''),u.block_size,u.expected_size,u.status,u.expires_at FROM uploads u JOIN files f ON f.id=u.file_id WHERE u.id=?`, id).Scan(&u.ID, &u.FileID, &u.ObjectKey, &u.BlockSize, &u.ExpectedSize, &u.Status, &u.ExpiresAt)
+	err := s.db.QueryRowContext(ctx, `SELECT u.id,u.file_id,COALESCE(f.object_key,''),u.block_size,u.expected_size,u.status,u.expires_at FROM uploads u JOIN files f ON f.id=u.file_id WHERE u.id=?`, id).Scan(&u.ID, &u.FileID, &u.ObjectKey, &u.MaxBlockSize, &u.ExpectedSize, &u.Status, &u.ExpiresAt)
 	return u, err
 }
 
@@ -1063,7 +1075,7 @@ func (s *Server) uploadBlocks(w http.ResponseWriter, r *http.Request) {
 			problem(w, 400, "invalid block id")
 			return
 		}
-		if b.Size < 1 || b.Size > u.BlockSize {
+		if b.Size < 1 || b.Size > u.MaxBlockSize {
 			problem(w, 400, "invalid block size")
 			return
 		}
@@ -1106,20 +1118,25 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 	if decodeJSONLimit(w, r, &body, maxCompleteBody) != nil {
 		return
 	}
-	total := blockCount(u.ExpectedSize, u.BlockSize)
-	if int64(len(body.Blocks)) != total {
+	if u.ExpectedSize > 0 && len(body.Blocks) == 0 {
 		problem(w, 400, "complete block list is invalid")
 		return
 	}
-	for i, b := range body.Blocks {
+	var total int64
+	for _, b := range body.Blocks {
 		if !storage.ValidBlockID(b.ID) {
 			problem(w, 400, "complete block list is invalid")
 			return
 		}
-		if b.Size != expectedBlockSize(u.ExpectedSize, u.BlockSize, int64(i)) {
+		if b.Size < 1 || b.Size > u.MaxBlockSize || total > u.ExpectedSize-b.Size {
 			problem(w, 400, "complete block list is invalid")
 			return
 		}
+		total += b.Size
+	}
+	if total != u.ExpectedSize {
+		problem(w, 400, "complete block list is invalid")
+		return
 	}
 	// Verify that every block actually exists. Blocks are immutable
 	// (conditional PUTs), so a verified list is a durable list. A crash
@@ -1282,16 +1299,6 @@ func blockCount(size, blockSize int64) int64 {
 		return 0
 	}
 	return (size + blockSize - 1) / blockSize
-}
-
-// expectedBlockSize returns the size the client must report for the
-// index-th block (0-based): every block is full except the last one.
-func expectedBlockSize(size, blockSize, index int64) int64 {
-	total := blockCount(size, blockSize)
-	if index == total-1 {
-		return size - (total-1)*blockSize
-	}
-	return blockSize
 }
 
 // parallel runs fn over every index concurrently, bounded by limit

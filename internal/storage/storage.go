@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/VesperGlow/cloud/internal/config"
+	"github.com/VesperGlow/cloud/internal/fastcdc"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -38,7 +39,7 @@ type ObjectRef struct {
 type Storage interface {
 	Ping(context.Context) error
 
-	// Blocks: fixed-size content-addressed chunks under blocks/xx/<sha256>.
+	// Blocks: variable-size content-addressed chunks under blocks/xx/<sha256>.
 	PresignBlockPut(context.Context, string, time.Duration) (string, error)
 	HeadBlock(context.Context, string) (Block, error)
 	GetBlock(context.Context, string) ([]byte, error)
@@ -69,10 +70,11 @@ type Storage interface {
 }
 
 type S3 struct {
-	client    *s3.Client
-	presign   *s3.PresignClient
-	bucket    string
-	blockSize int64
+	client       *s3.Client
+	presign      *s3.PresignClient
+	bucket       string
+	maxBlockSize int64
+	chunking     fastcdc.Config
 }
 
 func NewS3(ctx context.Context, c config.Config) (*S3, error) {
@@ -98,7 +100,12 @@ func NewS3(ctx context.Context, c config.Config) (*S3, error) {
 			o.BaseEndpoint = aws.String(c.S3PublicEndpoint)
 		}
 	})
-	return &S3{client: client, presign: s3.NewPresignClient(presignClient), bucket: c.S3Bucket, blockSize: c.BlockSize}, nil
+	minimum, average, maximum := c.ChunkSizes()
+	chunking, err := fastcdc.NewConfig(int(minimum), int(average), int(maximum))
+	if err != nil {
+		return nil, fmt.Errorf("configure FastCDC: %w", err)
+	}
+	return &S3{client: client, presign: s3.NewPresignClient(presignClient), bucket: c.S3Bucket, maxBlockSize: maximum, chunking: chunking}, nil
 }
 
 func (s *S3) Ping(ctx context.Context) error {
@@ -138,11 +145,11 @@ func (s *S3) GetBlock(ctx context.Context, id string) ([]byte, error) {
 		return nil, err
 	}
 	defer out.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(out.Body, s.blockSize+1))
+	data, err := io.ReadAll(io.LimitReader(out.Body, s.maxBlockSize+1))
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) > s.blockSize {
+	if int64(len(data)) > s.maxBlockSize {
 		return nil, fmt.Errorf("block %s exceeds configured block size", id)
 	}
 	return data, nil

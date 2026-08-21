@@ -10,6 +10,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/VesperGlow/cloud/internal/fastcdc"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
@@ -22,7 +23,7 @@ const (
 	blockMime      = "application/octet-stream"
 )
 
-// Block is one fixed-size content-addressed chunk. ID is the lowercase
+// Block is one variable-size content-addressed chunk. ID is the lowercase
 // hex SHA-256 of the block content, so equal content always maps to the
 // same block object and deduplication falls out of the addressing scheme.
 type Block struct {
@@ -116,32 +117,26 @@ func blocksSize(blocks []Block) int64 {
 	return total
 }
 
-// Store splits a stream into fixed-size blocks, stores each block under its
+// Store splits a stream with FastCDC, stores each block under its
 // content hash (skipping blocks that already exist), then writes the
 // manifest. It returns the manifest key and the manifest itself.
 func (s *S3) Store(ctx context.Context, r io.Reader) (string, Manifest, error) {
 	m := Manifest{Version: 1}
-	buf := make([]byte, s.blockSize)
+	chunker := fastcdc.New(r, s.chunking)
 	for {
-		n, err := io.ReadFull(r, buf)
-		if n > 0 {
-			chunk := buf[:n]
-			id := hashBytes(chunk)
-			if err := s.putBlockIfMissing(ctx, id, chunk); err != nil {
-				return "", Manifest{}, err
-			}
-			m.Blocks = append(m.Blocks, Block{ID: id, Size: int64(n)})
-			m.Size += int64(n)
-		}
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
+		chunk, err := chunker.Next()
+		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return "", Manifest{}, err
 		}
-		if n == 0 {
-			return "", Manifest{}, errors.New("source reader made no progress")
+		id := hashBytes(chunk)
+		if err := s.putBlockIfMissing(ctx, id, chunk); err != nil {
+			return "", Manifest{}, err
 		}
+		m.Blocks = append(m.Blocks, Block{ID: id, Size: int64(len(chunk))})
+		m.Size += int64(len(chunk))
 	}
 	key, err := s.PutManifest(ctx, m)
 	if err != nil {

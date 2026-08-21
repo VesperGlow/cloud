@@ -1,6 +1,6 @@
 # Cloud
 
-Cloud 是一个轻量、单用户、自托管的私人 S3 网盘，存储层采用 Seafile 式的**内容寻址块存储**：每个文件被切成固定大小的块，块以 SHA-256 内容寻址存入 S3，同一内容跨文件只存一份；块列表写入 JSON 清单（Seafile "fs object" 的等价物），SQLite 里的文件树只保存指向清单的键。Go 服务处理认证、SQLite 元数据和 S3 控制面；浏览器把块直传 S3，单块文件下载仍走短期 Presigned URL 直连，多块文件由服务端流式拼接（支持 Range）。内置**阅读器**：EPUB/TXT 在服务端解析清洗，前端按章分段、按视口分栏分页，支持目录、滑动翻页、进度与字号/明暗偏好。内置**缩略图管线**：图片与 EPUB 封面由服务端重采样、视频由 ffmpeg 抽帧，持久化缓存。内置编辑器读写不超过 1 MiB 的文本文件时会经过应用服务，以便校验 UTF-8、大小和并发修改。
+Cloud 是一个轻量、单用户、自托管的私人 S3 网盘，存储层采用 Seafile 式的**内容寻址块存储**：每个文件由 FastCDC 按内容切成可变大小的块，块以 SHA-256 内容寻址存入 S3，同一内容跨文件或跨版本只存一份；在文件中间插入内容也不会让后续所有块边界整体错位。块列表写入 JSON 清单（Seafile "fs object" 的等价物），SQLite 里的文件树只保存指向清单的键。Go 服务处理认证、SQLite 元数据和 S3 控制面；浏览器在 Worker 中分块、哈希并把块直传 S3，单块文件下载仍走短期 Presigned URL 直连，多块文件由服务端流式拼接（支持 Range）。内置**阅读器**：EPUB/TXT 在服务端解析清洗，前端按章分段、按视口分栏分页，支持目录、滑动翻页、进度与字号/明暗偏好。内置**缩略图管线**：图片与 EPUB 封面由服务端重采样、视频由 ffmpeg 抽帧，持久化缓存。内置编辑器读写不超过 1 MiB 的文本文件时会经过应用服务，以便校验 UTF-8、大小和并发修改。
 
 ## 架构
 
@@ -15,7 +15,7 @@ flowchart LR
 - 用户路径与 S3 Object Key 完全解耦。文件内容以 `blocks/aa/<sha256>` 块对象存储，块列表以 `manifests/bb/<sha256>` 清单对象存储；同一内容（块级或整文件级）在 S3 中只存一份。
 - 块对象使用 `If-None-Match: *` 条件写入，内容寻址对象不可变、不可被并发上传覆盖。
 - 移动和重命名只更新 SQLite，不执行 `CopyObject`。
-- 上传先写入 `pending` 元数据，浏览器按块直传 S3；完成后服务端 `HeadObject` 逐块校验，再写入清单并切换为 `ready`。
+- 上传先写入 `pending` 元数据，浏览器按 FastCDC 的 min/avg/max 参数切块并直传 S3；完成后服务端校验可变块列表的总大小并逐块 `HeadObject`，再写入清单并切换为 `ready`。旧的固定分块清单无需迁移，仍可正常读取。
 - 删除只移除元数据；清单与块由周期垃圾回收器在宽限期（`UPLOAD_EXPIRES + 1h`）后按引用关系回收。
 - 升级前版本遗留的整对象会在启动时自动重新切块迁移，无法读取的遗留对象会标记为 `failed`。
 
@@ -93,7 +93,9 @@ set -a; . ./.env; set +a
 | `S3_SECRET_KEY` | 无 | 仅后端使用 |
 | `S3_PATH_STYLE` | `false` | MinIO 等存储通常设为 `true` |
 | `PRESIGN_EXPIRES` | `15m` | 上传、下载和预览 URL 有效期 |
-| `BLOCK_SIZE` | `4194304` | 内容块大小（字节），默认 4 MiB，范围 1 MiB–1 GiB |
+| `BLOCK_SIZE` | `4194304` | FastCDC 目标平均块大小（字节），默认 4 MiB，范围 1 MiB–1 GiB |
+| `FASTCDC_MIN_SIZE` | `BLOCK_SIZE / 4` | FastCDC 最小块大小，默认 1 MiB，范围 64 KiB–`BLOCK_SIZE` |
+| `FASTCDC_MAX_SIZE` | `BLOCK_SIZE * 4` | FastCDC 强制切块上限，默认 16 MiB，范围 `BLOCK_SIZE`–1 GiB |
 | `UPLOAD_EXPIRES` | `24h` | 未完成上传的清理期限，也决定垃圾回收宽限期下限 |
 | `GC_INTERVAL` | `1h` | 垃圾回收间隔；`0` 表示禁用（回收需手动触发） |
 | `FFMPEG_PATH` | `ffmpeg` | 视频缩略图抽帧使用的 ffmpeg 可执行文件路径 |

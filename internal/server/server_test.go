@@ -292,6 +292,12 @@ type createdUpload struct {
 	Mode       string `json:"mode"`
 	BlockSize  int64  `json:"block_size"`
 	BlockCount int64  `json:"block_count"`
+	Chunking   struct {
+		Algorithm string `json:"algorithm"`
+		MinSize   int64  `json:"min_size"`
+		AvgSize   int64  `json:"avg_size"`
+		MaxSize   int64  `json:"max_size"`
+	} `json:"chunking"`
 }
 
 func (a *testApp) createUpload(t *testing.T, name string, size int64) createdUpload {
@@ -613,7 +619,7 @@ func TestCreateReadAndUpdateDocument(t *testing.T) {
 func TestBlockUploadLifecycle(t *testing.T) {
 	a := newTestApp(t)
 	created := a.createUpload(t, "hello.txt", 12)
-	if created.Mode != "blocks" || created.BlockCount != 1 || created.BlockSize != 4<<20 {
+	if created.Mode != "blocks" || created.BlockCount != 1 || created.BlockSize != 4<<20 || created.Chunking.Algorithm != "fastcdc-v1" || created.Chunking.MinSize != 1<<20 || created.Chunking.AvgSize != 4<<20 || created.Chunking.MaxSize != 16<<20 {
 		t.Fatalf("created upload=%+v", created)
 	}
 	var key sql.NullString
@@ -732,9 +738,9 @@ func TestMultiBlockUploadStreamsWithRangeSupport(t *testing.T) {
 		data []byte
 		size int64
 	}{
-		{content[0:8], 8},
-		{content[8:16], 8},
-		{content[16:20], 4},
+		{content[0:3], 3},
+		{content[3:14], 11},
+		{content[14:20], 6},
 	}
 	regBody := make([]map[string]any, len(blocks))
 	for i, b := range blocks {
@@ -1008,9 +1014,6 @@ func TestLegacyMigrationMarksMissingObjectsFailed(t *testing.T) {
 func TestBlockLayoutHelpers(t *testing.T) {
 	if blockCount(0, 8) != 0 || blockCount(1, 8) != 1 || blockCount(8, 8) != 1 || blockCount(9, 8) != 2 || blockCount(16, 8) != 2 || blockCount(17, 8) != 3 {
 		t.Fatal("blockCount is wrong")
-	}
-	if expectedBlockSize(20, 8, 0) != 8 || expectedBlockSize(20, 8, 1) != 8 || expectedBlockSize(20, 8, 2) != 4 {
-		t.Fatal("expectedBlockSize is wrong")
 	}
 }
 
