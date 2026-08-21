@@ -67,6 +67,15 @@ func (m *mockStorage) PresignBlockPut(_ context.Context, id string, _ time.Durat
 	}
 	return "https://s3.example/put/" + id, nil
 }
+func (m *mockStorage) PutBlock(_ context.Context, id string, data []byte) error {
+	if sha256hex(data) != id {
+		return storage.ErrBlockHashMismatch
+	}
+	if _, ok := m.blocks[id]; !ok {
+		m.blocks[id] = append([]byte(nil), data...)
+	}
+	return nil
+}
 func (m *mockStorage) HeadBlock(_ context.Context, id string) (storage.Block, error) {
 	data, ok := m.blocks[id]
 	if !ok {
@@ -362,6 +371,18 @@ func TestAvatarCanBeUploadedReadAndRemoved(t *testing.T) {
 
 func (a *testApp) request(method, path string, body any, authenticated bool) *httptest.ResponseRecorder {
 	return a.requestH(method, path, body, authenticated, nil)
+}
+func (a *testApp) requestRaw(method, path string, body []byte, authenticated bool) *httptest.ResponseRecorder {
+	a.t.Helper()
+	req := httptest.NewRequest(method, path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Origin", "http://example.test")
+	if authenticated && a.cookie != nil {
+		req.AddCookie(a.cookie)
+	}
+	rr := httptest.NewRecorder()
+	a.handler.ServeHTTP(rr, req)
+	return rr
 }
 func (a *testApp) requestH(method, path string, body any, authenticated bool, headers map[string]string) *httptest.ResponseRecorder {
 	a.t.Helper()
@@ -805,6 +826,47 @@ func TestBlockUploadLifecycle(t *testing.T) {
 	}
 	if _, ok := a.store.blocks[id]; !ok {
 		t.Fatal("deleting a file must not delete shared blocks")
+	}
+}
+
+func TestProxiedBlockUploadLifecycle(t *testing.T) {
+	a := newTestApp(t)
+	a.srv.cfg.ProxyTransfers = true
+	content := []byte("private upcloud block")
+	id := sha256hex(content)
+	created := a.createUpload(t, "private.bin", int64(len(content)))
+	regRR := a.request("POST", "/api/uploads/"+created.UploadID+"/blocks", map[string]any{"blocks": []map[string]any{{"id": id, "size": len(content)}}}, true)
+	if regRR.Code != http.StatusOK {
+		t.Fatalf("register=%d: %s", regRR.Code, regRR.Body.String())
+	}
+	reg := decode[struct {
+		Blocks []struct {
+			URL string `json:"url"`
+		} `json:"blocks"`
+	}](t, regRR)
+	wantURL := "/api/uploads/" + created.UploadID + "/blocks/" + id
+	if len(reg.Blocks) != 1 || reg.Blocks[0].URL != wantURL {
+		t.Fatalf("proxy url=%+v, want %q", reg.Blocks, wantURL)
+	}
+
+	bad := a.requestRaw("PUT", wantURL, []byte("wrong"), true)
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("hash mismatch=%d: %s", bad.Code, bad.Body.String())
+	}
+	put := a.requestRaw("PUT", wantURL, content, true)
+	if put.Code != http.StatusNoContent {
+		t.Fatalf("proxy put=%d: %s", put.Code, put.Body.String())
+	}
+	if got := a.store.blocks[id]; !bytes.Equal(got, content) {
+		t.Fatalf("stored block=%q", got)
+	}
+	done := a.request("POST", "/api/uploads/"+created.UploadID+"/complete", map[string]any{"blocks": []map[string]any{{"id": id, "size": len(content)}}}, true)
+	if done.Code != http.StatusOK {
+		t.Fatalf("complete=%d: %s", done.Code, done.Body.String())
+	}
+	download := a.request("GET", "/api/files/"+created.FileID+"/download", nil, true)
+	if download.Code != http.StatusOK || !bytes.Equal(download.Body.Bytes(), content) {
+		t.Fatalf("proxied download=%d body=%q", download.Code, download.Body.Bytes())
 	}
 }
 

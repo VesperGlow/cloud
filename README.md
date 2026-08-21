@@ -1,6 +1,6 @@
 # revaro
 
-revaro 是一个轻量、单用户、自托管的私人 S3 网盘，存储层采用 Seafile 式的**内容寻址块存储**：每个文件由 FastCDC 按内容切成可变大小的块，块以 SHA-256 内容寻址存入 S3，同一内容跨文件或跨版本只存一份；在文件中间插入内容也不会让后续所有块边界整体错位。块列表写入 JSON 清单（Seafile "fs object" 的等价物），SQLite 里的文件树只保存指向清单的键。Go 服务处理认证、SQLite 元数据和 S3 控制面；浏览器在 Worker 中分块、哈希并把块直传 S3，单块文件下载仍走短期 Presigned URL 直连，多块文件由服务端流式拼接（支持 Range）。内置**阅读器**：EPUB/TXT 在服务端解析清洗，前端按章分段、按视口分栏分页，支持目录、滑动翻页、进度与字号/明暗偏好。内置**缩略图管线**：图片与 EPUB 封面由服务端重采样、视频由 ffmpeg 抽帧，持久化缓存。内置编辑器读写不超过 1 MiB 的文本文件时会经过应用服务，以便校验 UTF-8、大小和并发修改。
+revaro 是一个轻量、单用户、自托管的私人 S3 网盘，存储层采用 Seafile 式的**内容寻址块存储**：每个文件由 FastCDC 按内容切成可变大小的块，块以 SHA-256 内容寻址存入 S3，同一内容跨文件或跨版本只存一份；在文件中间插入内容也不会让后续所有块边界整体错位。块列表写入 JSON 清单（Seafile "fs object" 的等价物），SQLite 里的文件树只保存指向清单的键。Go 服务处理认证、SQLite 元数据和 S3 控制面；浏览器在 Worker 中分块、哈希，通常把块直传 S3；UpCloud endpoint 会自动改为经 Go 服务走私网转存，无需开放对象存储公网访问。UpCloud 下载也经 Go 服务转发；其他存储的单块文件仍走短期 Presigned URL 直连，多块文件由服务端流式拼接（支持 Range）。内置**阅读器**：EPUB/TXT 在服务端解析清洗，前端按章分段、按视口分栏分页，支持目录、滑动翻页、进度与字号/明暗偏好。内置**缩略图管线**：图片与 EPUB 封面由服务端重采样、视频由 ffmpeg 抽帧，持久化缓存。内置编辑器读写不超过 1 MiB 的文本文件时会经过应用服务，以便校验 UTF-8、大小和并发修改。
 
 ## 架构
 
@@ -8,14 +8,14 @@ revaro 是一个轻量、单用户、自托管的私人 S3 网盘，存储层采
 flowchart LR
     B[浏览器] -->|JSON API| G[Go 服务]
     G --> D[(SQLite)]
-    G -->|Presigned URL / S3 控制面| S[(S3 Bucket)]
-    B <==>|内容块直传| S
+    G -->|控制面 / UpCloud 私网传输| S[(S3 Bucket)]
+    B <-.->|其他 S3 的 Presigned 直传| S
 ```
 
 - 用户路径与 S3 Object Key 完全解耦。文件内容以 `blocks/aa/<sha256>` 块对象存储，块列表以 `manifests/bb/<sha256>` 清单对象存储；同一内容（块级或整文件级）在 S3 中只存一份。
 - 块对象使用 `If-None-Match: *` 条件写入，内容寻址对象不可变、不可被并发上传覆盖。
 - 移动和重命名只更新 SQLite，不执行 `CopyObject`。
-- 上传先写入 `pending` 元数据，浏览器按 FastCDC 的 min/avg/max 参数切块并直传 S3；完成后服务端校验可变块列表的总大小并逐块 `HeadObject`，再写入清单并切换为 `ready`。旧的固定分块清单无需迁移，仍可正常读取。
+- 上传先写入 `pending` 元数据，浏览器按 FastCDC 的 min/avg/max 参数切块；默认用 Presigned URL 直传 S3，UpCloud 则自动经 revaro 转存到私网 endpoint。完成后服务端校验可变块列表的总大小并逐块 `HeadObject`，再写入清单并切换为 `ready`。旧的固定分块清单无需迁移，仍可正常读取。
 - 删除会把文件或整棵目录树软删除到回收站；恢复前清单与块仍是活引用。只有永久删除或清空回收站后，无引用内容才由周期垃圾回收器在宽限期（`UPLOAD_EXPIRES + 1h`）后回收。
 - 升级前版本遗留的整对象会在启动时自动重新切块迁移，无法读取的遗留对象会标记为 `failed`。
 
@@ -86,12 +86,13 @@ set -a; . ./.env; set +a
 | `ADMIN_USERNAME` | `admin` | 首次初始化使用的管理员用户名 |
 | `ADMIN_PASSWORD` | 随机生成 | 可选；设置时至少 12 字符，未设置时首次启动生成一次性密码；只保存 Argon2id hash |
 | `S3_ENDPOINT` | AWS 默认 | S3-compatible endpoint；AWS S3 可留空 |
-| `S3_PUBLIC_ENDPOINT` | 与 `S3_ENDPOINT` 相同 | 浏览器可访问的签名 URL endpoint；容器内外主机名不同时设置 |
+| `S3_PUBLIC_ENDPOINT` | 与 `S3_ENDPOINT` 相同 | 直连模式下浏览器可访问的签名 URL endpoint；代理模式无需公网 endpoint |
 | `S3_REGION` | `us-east-1` | Bucket region |
 | `S3_BUCKET` | 无 | Bucket 名称 |
 | `S3_ACCESS_KEY` | 无 | 仅后端使用 |
 | `S3_SECRET_KEY` | 无 | 仅后端使用 |
 | `S3_PATH_STYLE` | `false` | MinIO 等存储通常设为 `true` |
+| `S3_PROXY_TRANSFERS` | UpCloud 为 `true`，其他为 `false` | 上传与下载经 revaro 转发；可关闭对象存储公网访问并免配上传 CORS |
 | `PRESIGN_EXPIRES` | `15m` | 上传、下载和预览 URL 有效期 |
 | `BLOCK_SIZE` | `4194304` | FastCDC 目标平均块大小（字节），默认 4 MiB，范围 1 MiB–1 GiB |
 | `FASTCDC_MIN_SIZE` | `BLOCK_SIZE / 4` | FastCDC 最小块大小，默认 1 MiB，范围 64 KiB–`BLOCK_SIZE` |
@@ -99,6 +100,12 @@ set -a; . ./.env; set +a
 | `UPLOAD_EXPIRES` | `24h` | 未完成上传的清理期限，也决定垃圾回收宽限期下限 |
 | `GC_INTERVAL` | `1h` | 垃圾回收间隔；`0` 表示禁用（回收需手动触发） |
 | `FFMPEG_PATH` | `ffmpeg` | 视频缩略图抽帧使用的 ffmpeg 可执行文件路径 |
+
+### UpCloud 私网模式
+
+当 `S3_ENDPOINT` 的主机名以 `.upcloudobjects.com` 结尾时，revaro 会自动启用 UpCloud 兼容模式：AWS SDK 请求与响应校验切换为 `WHEN_REQUIRED`，文件块上传、下载和预览全部经 revaro 转发到 S3。对象存储可以只连接与 revaro VPS 相同的 SDN Private Network，并在 UpCloud 控制台保持 **Public access disabled**；`S3_PUBLIC_ENDPOINT` 和 Bucket CORS 都不再是必需项。
+
+如需让浏览器恢复 Presigned URL 直传，可显式设置 `S3_PROXY_TRANSFERS=false`，同时启用 UpCloud Public access、配置 `S3_PUBLIC_ENDPOINT` 与下文的 Bucket CORS。
 
 管理员设置只在数据库第一次初始化时读取。之后修改环境变量不会重置已有密码，避免部署配置漂移意外改密。随机密码只在新数据库首次成功启动时打印一次，不会在容器重启时再次显示；可通过右上角头像进入账户设置修改用户名和密码，修改后所有现有会话都会失效。
 
@@ -140,11 +147,11 @@ docker compose start revaro
 }
 ```
 
-Bucket 必须保持私有。浏览器访问对象依赖 Presigned URL，而不是公开读取权限。
+Bucket 必须保持私有。直连模式的浏览器访问依赖 Presigned URL，而不是公开读取权限；UpCloud 代理模式可同时关闭整个对象存储的 Public access。
 
 ## Bucket CORS
 
-浏览器直接 PUT/GET S3 块对象，因此必须配置 CORS。生产环境不要使用 `AllowedOrigins: ["*"]`，应只允许网盘 Origin：
+仅在 `S3_PROXY_TRANSFERS=false` 时，浏览器会直接 PUT/GET S3 块对象，因此必须配置 CORS。UpCloud endpoint 默认启用代理传输，不需要开放公网 endpoint 或为上传配置 Bucket CORS。其他存储的生产环境不要使用 `AllowedOrigins: ["*"]`，应只允许网盘 Origin：
 
 ```json
 [
@@ -239,7 +246,7 @@ Bucket 必须保持私有。浏览器访问对象依赖 Presigned URL，而不�
 - **清单（manifest）**：每个文件的块列表序列化为 JSON，以清单自身的 SHA-256 为键存入 `manifests/…`。`files.object_key` 指向清单，`files.etag` 即清单哈希，天然是内容版本的指纹。
 - **文件树（SQLite）**：名称、目录关系、大小、MIME 与清单键；移动/重命名零 S3 操作。
 
-上传流程：浏览器把文件切成块 → 逐块算 SHA-256 → 批量登记，服务端对已存在的块返回 `exists:true`（去重跳过），对缺失块签发带 `If-None-Match: *` 的 Presigned PUT → 浏览器直传缺失块 → 完成后服务端 `HeadObject` 逐块校验、写入清单并把文件切换为 `ready`。极端竞态下（登记后某块被 GC 回收）完成接口返回 `409 + missing_blocks`，前端自动补传重试。
+上传流程：浏览器把文件切成块 → 逐块算 SHA-256 → 批量登记，服务端对已存在的块返回 `exists:true`（去重跳过）。直连模式会为缺失块签发带 `If-None-Match: *` 的 Presigned PUT；UpCloud 代理模式则返回同源上传 URL，由 revaro 校验块哈希后写入私网 S3。完成后服务端 `HeadObject` 逐块校验、写入清单并把文件切换为 `ready`。极端竞态下（登记后某块被 GC 回收）完成接口返回 `409 + missing_blocks`，前端自动补传重试。
 
 下载流程：单块文件（绝大多数图片、文档、短视频）302 到 Presigned GET 直连 S3；多块文件由服务端按清单流式拼接，`ServeContent` 提供 Range/If-Modified-Since 支持。回收站保留元数据、清单与块引用；永久删除后，垃圾回收器才会在宽限期后按引用关系回收内容，同时清理升级前的 `objects/` 遗留对象。
 

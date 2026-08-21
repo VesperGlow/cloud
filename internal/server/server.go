@@ -126,6 +126,7 @@ func (s *Server) Handler() http.Handler {
 			r.Delete("/trash/{id}", s.purgeTrash)
 			r.Post("/uploads", s.createUpload)
 			r.Post("/uploads/{id}/blocks", s.uploadBlocks)
+			r.Put("/uploads/{id}/blocks/{blockID}", s.putUploadBlock)
 			r.Post("/uploads/{id}/complete", s.completeUpload)
 			r.Delete("/uploads/{id}", s.abortUpload)
 		})
@@ -871,13 +872,17 @@ func (s *Server) streamFile(w http.ResponseWriter, r *http.Request, inline bool)
 	s.serveFileContent(w, r, f, inline)
 }
 
-// serveFileContent delivers one logical file. Single-block files (the
-// common case) still redirect to a presigned URL so content flows
-// browser<->S3 directly; multi-block files stream through the server with
-// Range support, and legacy whole-object keys keep working until the
-// startup migration re-stores them as blocks.
+// serveFileContent delivers one logical file. Direct-upload configurations
+// redirect single-block files to S3; proxy configurations (UpCloud by default)
+// keep reads on the application path so the storage public endpoint can stay
+// disabled. Multi-block files always stream through the server with Range
+// support, and legacy whole-object keys work until startup migration finishes.
 func (s *Server) serveFileContent(w http.ResponseWriter, r *http.Request, f File, inline bool) {
 	if !storage.IsManifestKey(f.objectKey) {
+		if s.cfg.ProxyTransfers {
+			s.serveRawObject(w, r, f, inline)
+			return
+		}
 		u, err := s.storage.PresignGetObject(r.Context(), f.objectKey, f.Name, responseMime(f), inline, s.cfg.PresignExpires)
 		if err != nil {
 			problem(w, 502, "could not create download URL")
@@ -892,7 +897,7 @@ func (s *Server) serveFileContent(w http.ResponseWriter, r *http.Request, f File
 		problem(w, 502, "object storage read failed")
 		return
 	}
-	if len(m.Blocks) == 1 {
+	if len(m.Blocks) == 1 && !s.cfg.ProxyTransfers {
 		u, err := s.storage.PresignGetObject(r.Context(), storage.BlockKey(m.Blocks[0].ID), f.Name, responseMime(f), inline, s.cfg.PresignExpires)
 		if err != nil {
 			problem(w, 502, "could not create download URL")
@@ -919,6 +924,28 @@ func (s *Server) serveFileContent(w http.ResponseWriter, r *http.Request, f File
 		modtime = t
 	}
 	http.ServeContent(w, r, f.Name, modtime, rc)
+}
+
+func (s *Server) serveRawObject(w http.ResponseWriter, r *http.Request, f File, inline bool) {
+	rc, err := s.storage.OpenRaw(r.Context(), f.objectKey)
+	if err != nil {
+		s.log.Error("legacy object open failed", "file", f.ID, "error", err)
+		problem(w, http.StatusBadGateway, "object storage read failed")
+		return
+	}
+	defer rc.Close()
+	w.Header().Set("Content-Type", responseMime(f))
+	disposition := "attachment"
+	if inline {
+		disposition = "inline"
+	}
+	w.Header().Set("Content-Disposition", disposition+"; filename*=UTF-8''"+strings.ReplaceAll(url.PathEscape(f.Name), "+", "%20"))
+	if f.Size >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(f.Size, 10))
+	}
+	if _, err := io.Copy(w, rc); err != nil {
+		s.log.Error("legacy object stream failed", "file", f.ID, "error", err)
+	}
 }
 
 // readContent reads a whole file with a size guard, transparently handling
@@ -1180,9 +1207,10 @@ type uploadBlockResponse struct {
 	URL    string `json:"url,omitempty"`
 }
 
-// uploadBlocks issues conditional presigned PUT URLs for blocks that do
-// not exist yet. The endpoint is stateless: completeUpload independently
-// verifies every block, so registration is purely a client convenience.
+// uploadBlocks returns either conditional presigned PUT URLs or same-origin
+// proxy URLs for blocks that do not exist yet. The endpoint is stateless:
+// completeUpload independently verifies every block, so registration is
+// purely a client convenience.
 func (s *Server) uploadBlocks(w http.ResponseWriter, r *http.Request) {
 	u, err := s.upload(r.Context(), chi.URLParam(r, "id"))
 	if err != nil || u.Status != "pending" || u.expired(time.Now().UTC()) {
@@ -1222,6 +1250,10 @@ func (s *Server) uploadBlocks(w http.ResponseWriter, r *http.Request) {
 		} else if !storage.IsNotFound(e) {
 			return e
 		}
+		if s.cfg.ProxyTransfers {
+			results[i] = uploadBlockResponse{ID: b.ID, Size: b.Size, URL: "/api/uploads/" + u.ID + "/blocks/" + b.ID}
+			return nil
+		}
 		uurl, e := s.storage.PresignBlockPut(r.Context(), b.ID, s.cfg.PresignExpires)
 		if e != nil {
 			return e
@@ -1235,6 +1267,58 @@ func (s *Server) uploadBlocks(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"blocks": results})
 }
+
+// putUploadBlock accepts a same-origin block upload and writes it to S3 from
+// the application server. UpCloud uses this path automatically so its public
+// endpoint can remain disabled and browsers never need bucket CORS access.
+func (s *Server) putUploadBlock(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.ProxyTransfers {
+		problem(w, http.StatusNotFound, "proxied block uploads are disabled")
+		return
+	}
+	u, err := s.upload(r.Context(), chi.URLParam(r, "id"))
+	if err != nil || u.Status != "pending" || u.expired(time.Now().UTC()) {
+		problem(w, http.StatusNotFound, "pending upload not found")
+		return
+	}
+	id := chi.URLParam(r, "blockID")
+	if !storage.ValidBlockID(id) {
+		problem(w, http.StatusBadRequest, "invalid block id")
+		return
+	}
+	// Extend deadlines only for authenticated block transfers; the server-wide
+	// limits remain tight for ordinary API requests and unauthenticated clients.
+	controller := http.NewResponseController(w)
+	deadline := time.Now().Add(15 * time.Minute)
+	_ = controller.SetReadDeadline(deadline)
+	_ = controller.SetWriteDeadline(deadline)
+	r.Body = http.MaxBytesReader(w, r.Body, u.MaxBlockSize)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			problem(w, http.StatusRequestEntityTooLarge, "block exceeds configured block size")
+		} else {
+			problem(w, http.StatusBadRequest, "could not read block")
+		}
+		return
+	}
+	if len(data) == 0 {
+		problem(w, http.StatusBadRequest, "block must not be empty")
+		return
+	}
+	if err := s.storage.PutBlock(r.Context(), id, data); err != nil {
+		if errors.Is(err, storage.ErrBlockHashMismatch) {
+			problem(w, http.StatusBadRequest, "block content hash does not match block id")
+			return
+		}
+		s.log.Error("proxied block write failed", "upload", u.ID, "block", id, "error", err)
+		problem(w, http.StatusBadGateway, "object storage could not write block")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 	u, err := s.upload(r.Context(), chi.URLParam(r, "id"))
 	if err != nil || u.Status != "pending" || u.expired(time.Now().UTC()) {

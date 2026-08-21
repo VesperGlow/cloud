@@ -59,7 +59,11 @@ func main() {
 		log.Error("S3 connection check failed", "bucket", cfg.S3Bucket, "error", err)
 		os.Exit(1)
 	}
-	log.Info("S3 connection ready", "bucket", cfg.S3Bucket)
+	provider := "s3"
+	if cfg.IsUpCloud() {
+		provider = "upcloud"
+	}
+	log.Info("S3 connection ready", "bucket", cfg.S3Bucket, "provider", provider, "proxy_transfers", cfg.ProxyTransfers)
 	app := server.New(db, store, authService, cfg, log)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

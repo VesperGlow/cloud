@@ -20,6 +20,7 @@ import (
 )
 
 var ErrObjectTooLarge = errors.New("object exceeds read limit")
+var ErrBlockHashMismatch = errors.New("block content hash does not match block id")
 
 type ObjectInfo struct {
 	Size int64
@@ -41,6 +42,7 @@ type Storage interface {
 
 	// Blocks: variable-size content-addressed chunks under blocks/xx/<sha256>.
 	PresignBlockPut(context.Context, string, time.Duration) (string, error)
+	PutBlock(context.Context, string, []byte) error
 	HeadBlock(context.Context, string) (Block, error)
 	GetBlock(context.Context, string) ([]byte, error)
 	ListBlocks(context.Context) ([]ObjectRef, error)
@@ -89,6 +91,13 @@ func NewS3(ctx context.Context, c config.Config) (*S3, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
+	// UpCloud currently rejects the AWS SDK v2 flexible-checksum trailer used
+	// by default for PutObject. Limit checksums to operations that require one;
+	// TLS plus revaro's SHA-256 content addressing still protects block writes.
+	if c.IsUpCloud() {
+		awscfg.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		awscfg.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+	}
 	client := s3.NewFromConfig(awscfg, func(o *s3.Options) { o.UsePathStyle = c.S3PathStyle })
 	presignConfig := awscfg
 	if c.S3PublicEndpoint != "" {
@@ -129,6 +138,18 @@ func (s *S3) PresignBlockPut(ctx context.Context, id string, expiry time.Duratio
 		return "", err
 	}
 	return out.URL, nil
+}
+
+// PutBlock stores a block received through the application upload proxy. The
+// body must match the content-addressed key so a client cannot poison a block.
+func (s *S3) PutBlock(ctx context.Context, id string, data []byte) error {
+	if !ValidBlockID(id) || hashBytes(data) != id {
+		return ErrBlockHashMismatch
+	}
+	if int64(len(data)) > s.maxBlockSize {
+		return errors.New("block exceeds configured block size")
+	}
+	return s.putConditional(ctx, BlockKey(id), blockMime, data)
 }
 
 func (s *S3) HeadBlock(ctx context.Context, id string) (Block, error) {

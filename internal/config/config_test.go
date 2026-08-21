@@ -30,6 +30,34 @@ func TestLoadDefaults(t *testing.T) {
 	if c.S3PublicEndpoint != "" {
 		t.Fatalf("public endpoint must default to empty: %q", c.S3PublicEndpoint)
 	}
+	if c.ProxyTransfers {
+		t.Fatal("generic S3 must default to direct block uploads")
+	}
+}
+
+func TestUpCloudDefaultsToProxiedBlockUploads(t *testing.T) {
+	t.Setenv("S3_BUCKET", "bucket")
+	t.Setenv("S3_ACCESS_KEY", "key")
+	t.Setenv("S3_SECRET_KEY", "secret")
+	t.Setenv("S3_ENDPOINT", "https://kj964-private.upcloudobjects.com")
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.IsUpCloud() || !c.ProxyTransfers {
+		t.Fatalf("upcloud compatibility was not enabled: %+v", c)
+	}
+
+	// Operators can still force direct presigned uploads when they expose a
+	// public endpoint and configure bucket CORS themselves.
+	t.Setenv("S3_PROXY_TRANSFERS", "false")
+	c, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ProxyTransfers {
+		t.Fatal("explicit S3_PROXY_TRANSFERS=false was ignored")
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -82,6 +110,7 @@ func TestLoadValidations(t *testing.T) {
 		{"bad upload expires", func() { t.Setenv("UPLOAD_EXPIRES", "0s") }},
 		{"bad gc interval", func() { t.Setenv("GC_INTERVAL", "-1s") }},
 		{"bad bool", func() { t.Setenv("S3_PATH_STYLE", "maybe") }},
+		{"bad proxy bool", func() { t.Setenv("S3_PROXY_TRANSFERS", "maybe") }},
 		{"bad duration", func() { t.Setenv("PRESIGN_EXPIRES", "soon") }},
 		{"bad endpoint", func() { t.Setenv("S3_ENDPOINT", "minio://host") }},
 	}

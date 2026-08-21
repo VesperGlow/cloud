@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"strings"
 	"testing"
@@ -9,6 +10,23 @@ import (
 
 	"github.com/VesperGlow/revaro/internal/config"
 )
+
+func TestPutBlockRejectsHashMismatch(t *testing.T) {
+	store, err := NewS3(context.Background(), config.Config{
+		S3Region:    "us-east-1",
+		S3Bucket:    "revaro",
+		S3AccessKey: "access-key",
+		S3SecretKey: "secret-key",
+		BlockSize:   4 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("ab", 32)
+	if err := store.PutBlock(context.Background(), id, []byte("different content")); !errors.Is(err, ErrBlockHashMismatch) {
+		t.Fatalf("PutBlock error=%v", err)
+	}
+}
 
 func TestPresignBlockPutUsesBrowserEndpointAndConditionalHeader(t *testing.T) {
 	store, err := NewS3(context.Background(), config.Config{

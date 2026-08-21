@@ -24,8 +24,9 @@ type Config struct {
 	S3Bucket         string
 	S3AccessKey      string
 	S3SecretKey      string
-	S3PathStyle      bool
-	PresignExpires   time.Duration
+	S3PathStyle       bool
+	ProxyTransfers    bool
+	PresignExpires    time.Duration
 	// BlockSize is the target average FastCDC chunk size. BlockMinSize and
 	// BlockMaxSize bound the variable-size chunks around that target.
 	BlockMinSize  int64
@@ -59,6 +60,9 @@ func Load() (Config, error) {
 		return c, err
 	}
 	if c.S3PathStyle, err = boolEnv("S3_PATH_STYLE", false); err != nil {
+		return c, err
+	}
+	if c.ProxyTransfers, err = boolEnv("S3_PROXY_TRANSFERS", c.IsUpCloud()); err != nil {
 		return c, err
 	}
 	if c.PresignExpires, err = durationEnv("PRESIGN_EXPIRES", 15*time.Minute); err != nil {
@@ -118,6 +122,17 @@ func Load() (Config, error) {
 }
 
 func (c Config) DatabasePath() string { return filepath.Join(c.DataDir, "revaro.db") }
+
+// IsUpCloud reports whether the configured S3 endpoint belongs to UpCloud.
+// Both public and private Managed Object Storage endpoints use this suffix.
+func (c Config) IsUpCloud() bool {
+	u, err := url.Parse(c.S3Endpoint)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	return host == "upcloudobjects.com" || strings.HasSuffix(host, ".upcloudobjects.com")
+}
 
 // ChunkSizes also supplies useful defaults for tests and embedded callers
 // that construct Config directly instead of using Load.
