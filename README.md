@@ -27,10 +27,10 @@ flowchart LR
 cp .env.example .env
 # 至少修改 S3_SECRET_KEY；ADMIN_PASSWORD 留空会自动生成一次性密码
 docker compose up -d
-docker compose logs cloud
+docker compose logs revaro
 ```
 
-打开 <http://localhost:8080>。如果没有配置 `ADMIN_PASSWORD`，首次成功启动时会在 `cloud` 容器日志中打印一次管理员用户名和随机密码；登录后点击右上角头像进入账户设置并立即修改。MinIO 控制台位于 <http://localhost:9001>。
+打开 <http://localhost:8080>。如果没有配置 `ADMIN_PASSWORD`，首次成功启动时会在 `revaro` 容器日志中打印一次管理员用户名和随机密码；登录后点击右上角头像进入账户设置并立即修改。MinIO 控制台位于 <http://localhost:9001>。
 
 Podman 用户可以运行：
 
@@ -107,9 +107,9 @@ set -a; . ./.env; set +a
 如果已有数据库的管理员凭据丢失，不要删除数据卷。停止服务后运行一次恢复命令，它会保留文件与元数据、撤销已有会话，并在终端打印新的随机凭据：
 
 ```bash
-docker compose stop cloud
-docker compose run --rm --no-deps cloud reset-admin
-docker compose start cloud
+docker compose stop revaro
+docker compose run --rm --no-deps revaro reset-admin
+docker compose start revaro
 ```
 
 可在命令末尾指定新用户名，例如 `revaro reset-admin owner`。恢复密码同样只显示一次，登录后请立即从右上角账户设置中修改。账户设置也支持上传、更换和移除个人头像；头像文件保存在同一个私有 S3 Bucket 中，大小限制为 2 MiB。
@@ -125,7 +125,7 @@ docker compose start cloud
     {
       "Effect": "Allow",
       "Action": ["s3:ListBucket"],
-      "Resource": ["arn:aws:s3:::my-private-cloud"]
+      "Resource": ["arn:aws:s3:::my-private-revaro"]
     },
     {
       "Effect": "Allow",
@@ -134,7 +134,7 @@ docker compose start cloud
         "s3:PutObject",
         "s3:DeleteObject"
       ],
-      "Resource": ["arn:aws:s3:::my-private-cloud/*"]
+      "Resource": ["arn:aws:s3:::my-private-revaro/*"]
     }
   ]
 }
@@ -262,13 +262,13 @@ SQLite 开启 `foreign_keys`、`busy_timeout` 与 WAL。文件名唯一性由数
 最简单且安全的停机备份：
 
 ```bash
-docker compose stop cloud
-docker run --rm -v cloud_cloud-data:/data -v "$PWD/backups:/backup" alpine \
-  cp /data/cloud.db /backup/cloud-$(date +%F).db
-docker compose start cloud
+docker compose stop revaro
+docker run --rm -v revaro_revaro-data:/data -v "$PWD/backups:/backup" alpine \
+  cp /data/revaro.db /backup/revaro-$(date +%F).db
+docker compose start revaro
 ```
 
-不停机备份应使用 SQLite Online Backup API 或 `sqlite3 /data/cloud.db ".backup '/backup/cloud.db'"`，不要只复制运行中的 WAL 主文件。恢复时先停止 revaro，用备份替换 `/data/cloud.db`，确认文件属主可由容器 UID `10001` 读取，再启动服务。S3 对象也必须来自相互匹配的备份时间点。
+不停机备份应使用 SQLite Online Backup API 或 `sqlite3 /data/revaro.db ".backup '/backup/revaro.db'"`，不要只复制运行中的 WAL 主文件。恢复时先停止 revaro，用备份替换 `/data/revaro.db`，确认文件属主可由容器 UID `10001` 读取，再启动服务。S3 对象也必须来自相互匹配的备份时间点。
 
 ## 安全设计
 

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/VesperGlow/cloud/internal/ids"
+	"github.com/VesperGlow/revaro/internal/ids"
 	"golang.org/x/crypto/argon2"
 )
 

@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/VesperGlow/cloud/internal/reader"
-	"github.com/VesperGlow/cloud/internal/storage"
+	"github.com/VesperGlow/revaro/internal/reader"
+	"github.com/VesperGlow/revaro/internal/storage"
 	"github.com/go-chi/chi/v5"
 )
 

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VesperGlow/cloud/internal/config"
+	"github.com/VesperGlow/revaro/internal/config"
 )
 
 func TestPresignBlockPutUsesBrowserEndpointAndConditionalHeader(t *testing.T) {
@@ -15,7 +15,7 @@ func TestPresignBlockPutUsesBrowserEndpointAndConditionalHeader(t *testing.T) {
 		S3Endpoint:       "http://minio:9000",
 		S3PublicEndpoint: "http://localhost:9000",
 		S3Region:         "us-east-1",
-		S3Bucket:         "cloud",
+		S3Bucket:         "revaro",
 		S3AccessKey:      "access-key",
 		S3SecretKey:      "secret-key",
 		S3PathStyle:      true,
@@ -36,7 +36,7 @@ func TestPresignBlockPutUsesBrowserEndpointAndConditionalHeader(t *testing.T) {
 	if u.Host != "localhost:9000" {
 		t.Fatalf("presigned host = %q, want browser endpoint", u.Host)
 	}
-	want := "/cloud/blocks/" + id[:2] + "/" + id[2:]
+	want := "/revaro/blocks/" + id[:2] + "/" + id[2:]
 	if u.Path != want {
 		t.Fatalf("presigned path = %q, want %q", u.Path, want)
 	}

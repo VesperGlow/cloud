@@ -77,7 +77,7 @@ func TestHandlerRejectsTraversal(t *testing.T) {
 		// 不返回错误即可；绝不能返回 go.mod 内容
 		return
 	}
-	if strings.Contains(rr.Body.String(), "module github.com/VesperGlow/cloud") {
+	if strings.Contains(rr.Body.String(), "module github.com/VesperGlow/revaro") {
 		t.Fatal("path traversal leaked file contents")
 	}
 }

@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/VesperGlow/cloud/internal/storage"
+	"github.com/VesperGlow/revaro/internal/storage"
 	"github.com/go-chi/chi/v5"
 	_ "golang.org/x/image/bmp"
 	xdraw "golang.org/x/image/draw"
@@ -150,7 +150,7 @@ func (s *Server) generateVideoThumb(ctx context.Context, f File) ([]byte, bool) 
 		return nil, false
 	}
 	defer rc.Close()
-	tmp, err := os.CreateTemp("", "cloud-thumb-*"+filepath.Ext(f.Name))
+	tmp, err := os.CreateTemp("", "revaro-thumb-*"+filepath.Ext(f.Name))
 	if err != nil {
 		return nil, false
 	}

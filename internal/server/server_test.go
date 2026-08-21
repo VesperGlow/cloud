@@ -22,11 +22,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/VesperGlow/cloud/internal/auth"
-	"github.com/VesperGlow/cloud/internal/config"
-	"github.com/VesperGlow/cloud/internal/database"
-	"github.com/VesperGlow/cloud/internal/ids"
-	"github.com/VesperGlow/cloud/internal/storage"
+	"github.com/VesperGlow/revaro/internal/auth"
+	"github.com/VesperGlow/revaro/internal/config"
+	"github.com/VesperGlow/revaro/internal/database"
+	"github.com/VesperGlow/revaro/internal/ids"
+	"github.com/VesperGlow/revaro/internal/storage"
 	"github.com/aws/smithy-go"
 )
 
@@ -248,7 +248,7 @@ func newTestApp(t *testing.T) *testApp {
 }
 func newTestAppWithBlockSize(t *testing.T, blockSize int64) *testApp {
 	t.Helper()
-	db, err := database.Open(t.TempDir() + "/cloud.db")
+	db, err := database.Open(t.TempDir() + "/revaro.db")
 	if err != nil {
 		t.Fatal(err)
 	}

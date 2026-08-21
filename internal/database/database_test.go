@@ -8,7 +8,7 @@ import (
 
 func TestOpenCreatesSchemaAndMigrations(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "cloud.db"))
+	db, err := Open(filepath.Join(dir, "revaro.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestOpenCreatesSchemaAndMigrations(t *testing.T) {
 
 func TestOpenIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "cloud.db")
+	path := filepath.Join(dir, "revaro.db")
 	db1, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -79,12 +79,12 @@ func TestOpenIsIdempotent(t *testing.T) {
 func TestOpenCreatesDataDirectory(t *testing.T) {
 	dir := t.TempDir()
 	nested := filepath.Join(dir, "a", "b")
-	db, err := Open(filepath.Join(nested, "cloud.db"))
+	db, err := Open(filepath.Join(nested, "revaro.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
-	if _, err := os.Stat(filepath.Join(nested, "cloud.db")); err != nil {
+	if _, err := os.Stat(filepath.Join(nested, "revaro.db")); err != nil {
 		t.Fatal("nested data directory was not created")
 	}
 }

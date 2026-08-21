@@ -12,11 +12,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/VesperGlow/cloud/internal/auth"
-	"github.com/VesperGlow/cloud/internal/config"
-	"github.com/VesperGlow/cloud/internal/database"
-	"github.com/VesperGlow/cloud/internal/server"
-	"github.com/VesperGlow/cloud/internal/storage"
+	"github.com/VesperGlow/revaro/internal/auth"
+	"github.com/VesperGlow/revaro/internal/config"
+	"github.com/VesperGlow/revaro/internal/database"
+	"github.com/VesperGlow/revaro/internal/server"
+	"github.com/VesperGlow/revaro/internal/storage"
 )
 
 func main() {
@@ -132,7 +132,7 @@ func resetAdministrator(log *slog.Logger) {
 	if dataDir == "" {
 		dataDir = "/data"
 	}
-	db, err := database.Open(filepath.Join(dataDir, "cloud.db"))
+	db, err := database.Open(filepath.Join(dataDir, "revaro.db"))
 	if err != nil {
 		log.Error("database startup failed", "error", err)
 		os.Exit(1)

@@ -117,7 +117,7 @@ func Load() (Config, error) {
 	return c, nil
 }
 
-func (c Config) DatabasePath() string { return filepath.Join(c.DataDir, "cloud.db") }
+func (c Config) DatabasePath() string { return filepath.Join(c.DataDir, "revaro.db") }
 
 // ChunkSizes also supplies useful defaults for tests and embedded callers
 // that construct Config directly instead of using Load.

@@ -1,5 +1,5 @@
 .env
-/cloud
+/revaro
 /data/
 *.db
 *.db-shm

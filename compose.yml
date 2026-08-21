@@ -1,5 +1,5 @@
 services:
-  cloud:
+  revaro:
     image: "${REVARO_IMAGE:-ghcr.io/vesperglow/revaro:latest}"
     restart: unless-stopped
     depends_on:
@@ -17,7 +17,7 @@ services:
       S3_ENDPOINT: http://minio:9000
       S3_PUBLIC_ENDPOINT: "${S3_PUBLIC_ENDPOINT:-http://localhost:9000}"
       S3_REGION: "${S3_REGION:-us-east-1}"
-      S3_BUCKET: "${S3_BUCKET:-cloud}"
+      S3_BUCKET: "${S3_BUCKET:-revaro}"
       S3_ACCESS_KEY: "${S3_ACCESS_KEY:-minioadmin}"
       S3_SECRET_KEY: "${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}"
       S3_PATH_STYLE: "true"
@@ -28,7 +28,7 @@ services:
       UPLOAD_EXPIRES: "${UPLOAD_EXPIRES:-24h}"
       GC_INTERVAL: "${GC_INTERVAL:-1h}"
     volumes:
-      - cloud-data:/data
+      - revaro-data:/data
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
       interval: 15s
@@ -57,7 +57,7 @@ services:
     environment:
       S3_ACCESS_KEY: "${S3_ACCESS_KEY:-minioadmin}"
       S3_SECRET_KEY: "${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}"
-      S3_BUCKET: "${S3_BUCKET:-cloud}"
+      S3_BUCKET: "${S3_BUCKET:-revaro}"
     volumes:
       - ./deploy/minio-cors.json:/cors.json:ro
     entrypoint: ["/bin/sh", "-c"]
@@ -69,5 +69,5 @@ services:
         mc cors set "local/$${S3_BUCKET}" /cors.json
 
 volumes:
-  cloud-data:
+  revaro-data:
   minio-data:
