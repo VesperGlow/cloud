@@ -11,7 +11,7 @@ COPY web/public ./web/public
 COPY internal/webui ./internal/webui
 RUN cd web && npm run build
 
-FROM golang:1.25.8-alpine3.22 AS backend
+FROM golang:1.25.13-alpine3.22 AS backend
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
