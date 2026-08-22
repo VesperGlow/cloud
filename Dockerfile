@@ -19,7 +19,7 @@ COPY . .
 COPY --from=web /src/internal/webui/dist ./internal/webui/dist
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/revaro ./cmd/server
 
-FROM alpine:3.22
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates tzdata ffmpeg \
     && addgroup -S -g 10001 revaro \
     && adduser -S -D -H -u 10001 -G revaro revaro \
