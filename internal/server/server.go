@@ -1463,11 +1463,10 @@ type uploadBlockRequest struct {
 	Size int64  `json:"size"`
 }
 type uploadBlockResponse struct {
-	ID             string `json:"id"`
-	Size           int64  `json:"size"`
-	Exists         bool   `json:"exists"`
-	URL            string `json:"url,omitempty"`
-	ChecksumSHA256 string `json:"checksum_sha256,omitempty"`
+	ID     string `json:"id"`
+	Size   int64  `json:"size"`
+	Exists bool   `json:"exists"`
+	URL    string `json:"url,omitempty"`
 }
 
 // uploadBlocks returns either conditional presigned PUT URLs or same-origin
@@ -1521,11 +1520,7 @@ func (s *Server) uploadBlocks(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			return e
 		}
-		checksum, e := storage.BlockChecksumSHA256(b.ID)
-		if e != nil {
-			return e
-		}
-		results[i] = uploadBlockResponse{ID: b.ID, Size: b.Size, URL: uurl, ChecksumSHA256: checksum}
+		results[i] = uploadBlockResponse{ID: b.ID, Size: b.Size, URL: uurl}
 		return nil
 	}); err != nil {
 		s.log.Error("block registration failed", "upload", u.ID, "error", err)

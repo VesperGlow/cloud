@@ -122,10 +122,11 @@ func (s *S3) Ping(ctx context.Context) error {
 	return err
 }
 
-// PresignBlockPut issues a conditional PUT URL for one block. The URL is
-// bound to If-None-Match: *, so an existing content-addressed block can
-// never be overwritten and concurrent identical uploads race harmlessly
-// (the loser receives 412 Precondition Failed).
+// PresignBlockPut issues a conditional PUT URL for one block. The URL binds
+// If-None-Match: * as a signed header and the SHA-256 checksum as a signed
+// query parameter (AWS SigV4 hoists eligible x-amz-* headers). Existing
+// content-addressed blocks therefore cannot be overwritten, and S3 rejects
+// payloads whose checksum does not match their key.
 func (s *S3) PresignBlockPut(ctx context.Context, id string, expiry time.Duration) (string, error) {
 	checksum, err := BlockChecksumSHA256(id)
 	if err != nil {

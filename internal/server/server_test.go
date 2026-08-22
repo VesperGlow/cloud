@@ -1552,8 +1552,16 @@ func TestThumbnails(t *testing.T) {
 	if put := a.rawRequest("PUT", "/api/files/"+video.ID+"/thumbnail", thumb, true); put.Code != http.StatusNoContent {
 		t.Fatalf("put thumb=%d: %s", put.Code, put.Body.String())
 	}
-	if got := a.request("GET", "/api/files/"+video.ID+"/thumbnail", nil, true); got.Code != http.StatusOK || !bytes.Equal(got.Body.Bytes(), thumb) {
-		t.Fatalf("stored video thumb=%d", got.Code)
+	got := a.request("GET", "/api/files/"+video.ID+"/thumbnail", nil, true)
+	if got.Code != http.StatusOK || got.Header().Get("Content-Type") != "image/jpeg" {
+		t.Fatalf("stored video thumb=%d type=%q", got.Code, got.Header().Get("Content-Type"))
+	}
+	decoded, format, err := image.Decode(bytes.NewReader(got.Body.Bytes()))
+	if err != nil || format != "jpeg" {
+		t.Fatalf("stored video thumb is not a valid JPEG: format=%q err=%v", format, err)
+	}
+	if bounds := decoded.Bounds(); bounds.Dx() != 48 || bounds.Dy() != 27 {
+		t.Fatalf("stored video thumb size=%dx%d", bounds.Dx(), bounds.Dy())
 	}
 	if bad := a.rawRequest("PUT", "/api/files/"+video.ID+"/thumbnail", []byte("not-a-jpeg"), true); bad.Code != http.StatusBadRequest {
 		t.Fatalf("bad thumb accepted: %d", bad.Code)

@@ -28,7 +28,7 @@ func TestPutBlockRejectsHashMismatch(t *testing.T) {
 	}
 }
 
-func TestPresignBlockPutUsesBrowserEndpointAndConditionalHeader(t *testing.T) {
+func TestPresignBlockPutBindsEndpointConditionalWriteAndChecksum(t *testing.T) {
 	store, err := NewS3(context.Background(), config.Config{
 		S3Endpoint:       "http://minio:9000",
 		S3PublicEndpoint: "http://localhost:9000",
@@ -63,8 +63,18 @@ func TestPresignBlockPutUsesBrowserEndpointAndConditionalHeader(t *testing.T) {
 	for _, h := range strings.Split(signedHeaders, ";") {
 		headers[h] = true
 	}
-	if !headers["if-none-match"] || !headers["x-amz-checksum-sha256"] {
-		t.Fatalf("signed headers %q do not bind conditional write and checksum", signedHeaders)
+	if !headers["if-none-match"] {
+		t.Fatalf("signed headers %q do not bind conditional write", signedHeaders)
+	}
+	checksum, err := BlockChecksumSHA256(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// SigV4 intentionally hoists eligible x-amz-* headers into the signed
+	// query string for presigned requests. The browser must not duplicate this
+	// value as a header; S3 still validates it against the uploaded payload.
+	if got := u.Query().Get("X-Amz-Checksum-Sha256"); got != checksum {
+		t.Fatalf("presigned checksum = %q, want %q", got, checksum)
 	}
 }
 

@@ -164,7 +164,7 @@ Bucket 必须保持私有。直连模式的浏览器访问依赖 Presigned URL�
 ]
 ```
 
-`AllowedHeaders` 必须覆盖 `If-None-Match` 与 `x-amz-checksum-sha256`：块上传的 Presigned URL 同时绑定条件写入和块 SHA-256，浏览器必须原样携带这两个签名头。若块已存在，S3 返回 `412 Precondition Failed`，前端把它视为“内容相同的块已存在”并继续——这正是内容寻址去重的正常路径。不再需要 `ExposeHeaders: ["ETag"]`。
+`AllowedHeaders` 必须覆盖 `If-None-Match`。块上传的 Presigned URL 会把条件写入绑定为签名头，并把块 SHA-256 绑定为签名查询参数；浏览器无需再发送额外的校验和请求头。若块已存在，S3 返回 `412 Precondition Failed`，前端把它视为“内容相同的块已存在”并继续——这正是内容寻址去重的正常路径。不再需要 `ExposeHeaders: ["ETag"]`。
 
 ## API
 
@@ -246,7 +246,7 @@ Bucket 必须保持私有。直连模式的浏览器访问依赖 Presigned URL�
 - **清单（manifest）**：每个文件的块列表序列化为 JSON，以清单自身的 SHA-256 为键存入 `manifests/…`。`files.object_key` 指向清单，`files.etag` 即清单哈希，天然是内容版本的指纹。
 - **文件树（SQLite）**：名称、目录关系、大小、MIME 与清单键；移动/重命名零 S3 操作。
 
-上传流程：浏览器把文件切成块 → 逐块算 SHA-256 → 批量登记，服务端对已存在的块返回 `exists:true`（去重跳过）。直连模式会为缺失块签发同时绑定 `If-None-Match: *` 与 `x-amz-checksum-sha256` 的 Presigned PUT；UpCloud 代理模式则返回同源上传 URL，由 revaro 校验块哈希后写入私网 S3。完成后服务端 `HeadObject` 逐块校验、写入清单并把文件切换为 `ready`。极端竞态下（登记后某块被 GC 回收）完成接口返回 `409 + missing_blocks`，前端自动补传重试。
+上传流程：浏览器把文件切成块 → 逐块算 SHA-256 → 批量登记，服务端对已存在的块返回 `exists:true`（去重跳过）。直连模式会为缺失块签发同时绑定 `If-None-Match: *` 签名头与 SHA-256 签名查询参数的 Presigned PUT；UpCloud 代理模式则返回同源上传 URL，由 revaro 校验块哈希后写入私网 S3。完成后服务端 `HeadObject` 逐块校验、写入清单并把文件切换为 `ready`。极端竞态下（登记后某块被 GC 回收）完成接口返回 `409 + missing_blocks`，前端自动补传重试。
 
 下载流程：单块文件（绝大多数图片、文档、短视频）302 到 Presigned GET 直连 S3；多块文件由服务端按清单流式拼接，`ServeContent` 提供 Range/If-Modified-Since 支持。回收站保留元数据、清单与块引用；永久删除后，垃圾回收器才会在宽限期后按引用关系回收内容，同时清理升级前的 `objects/` 遗留对象。
 

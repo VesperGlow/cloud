@@ -3,8 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -44,7 +47,7 @@ jobs:
         run: CGO_ENABLED=0 go build -trimpath ./cmd/server
 
   publish:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: test
     runs-on: ubuntu-latest
     permissions:
@@ -66,9 +69,7 @@ jobs:
         with:
           images: ghcr.io/vesperglow/revaro
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-            type=sha,format=long
-            type=ref,event=tag
+            type=raw,value=latest
           labels: |
             org.opencontainers.image.title=revaro
             org.opencontainers.image.description=Lightweight private S3 file manager
