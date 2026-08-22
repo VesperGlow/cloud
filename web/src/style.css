@@ -394,3 +394,45 @@ button img,.ui-image{pointer-events:none;-webkit-touch-callout:none;-webkit-user
   .card-preview{height:104px}
   .card-info{padding:11px 11px 12px}
 }
+
+/* ===== Flat, content-first file tiles inspired by desktop file managers ===== */
+.file-grid{grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:8px;align-items:start}
+.file-card{position:relative;min-width:0;overflow:hidden;border:1px solid #dfe4ea;border-radius:4px;background:#fff;box-shadow:none;outline:0;transition:border-color .14s,background-color .14s;touch-action:manipulation}
+.file-card:hover{border-color:#b8c4d1;box-shadow:none;transform:none}
+.file-card:focus-visible{border-color:#6e93d9;box-shadow:0 0 0 3px #4f80d426}
+.file-card.selected{border-color:#3972d2;background:#f8fbff;box-shadow:0 0 0 1px #3972d2;transform:none}
+.file-card.selected:hover{border-color:#2563eb;box-shadow:0 0 0 1px #2563eb}
+.card-preview{position:relative;display:grid;place-items:center;width:100%;height:auto;aspect-ratio:8/5;padding:0;overflow:hidden;border:0;border-bottom:1px solid #e7ebf0;background:#fbfcfd;cursor:pointer}
+.card-preview.cannot-open{cursor:default}
+.card-preview img,.card-preview .video-thumb{width:100%;height:100%}
+.card-preview img{display:block;object-fit:cover}
+.file-card.selected .card-preview:after{position:absolute;z-index:2;inset:0;content:"";background:#2563eb0a;pointer-events:none}
+.card-info{display:flex;align-items:center;flex-direction:column;gap:5px;min-width:0;padding:13px 12px 14px;text-align:center}
+.card-info strong{width:100%;overflow:hidden;color:#273444;font-size:13px;font-weight:650;line-height:1.35;text-overflow:ellipsis;white-space:nowrap}
+.card-info small{width:100%;overflow:hidden;color:#7f8b99;font-size:10px;line-height:1.3;text-overflow:ellipsis;white-space:nowrap}
+.card-select{position:absolute;z-index:4;top:0;left:0;display:block;width:48px;height:48px;padding:0;border:0;border-radius:0;background:#fffffff2;color:#5f6b78;opacity:0;clip-path:polygon(0 0,100% 0,0 100%);box-shadow:none;transition:opacity .12s,color .12s}
+.card-select svg{position:absolute;top:5px;left:5px;width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.file-card:hover .card-select,.card-select:focus-visible,.card-select.active{opacity:1}
+.card-select:hover,.card-select.active{border:0;background:#fff;color:#2563eb}
+.file-type-icon{width:88px;height:88px;fill:#fff;stroke:#647282;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.folder-type-icon{fill:#fff7df;stroke:#c68b20}
+.document-type-icon{fill:#f4f7fd;stroke:#4e6fae}
+.book-type-icon{fill:#f5f7fc;stroke:#556f9f}
+.audio-type-icon{fill:#f8f5fd;stroke:#7056a0}
+.generic-type-icon{fill:#fbfcfd;stroke:#6c7885}
+.large-video{display:grid;place-items:center;width:72px;height:72px;border:2px solid #fff;border-radius:50%;background:#17203380;color:#fff;box-shadow:0 5px 20px #0004;backdrop-filter:blur(5px)}
+.large-video svg{width:34px;height:34px;fill:currentColor;stroke:none}
+
+@media(hover:none),(pointer:coarse){.card-select{opacity:1}}
+@media(max-width:850px){
+  .file-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+  .file-card{border-radius:5px}
+  .card-preview{height:auto;aspect-ratio:4/3}
+  .card-info{padding:11px 9px 12px}
+  .card-info strong{font-size:12px}
+  .file-type-icon{width:68px;height:68px}
+  .large-video{width:58px;height:58px}
+  .large-video svg{width:28px;height:28px}
+  .card-select{width:44px;height:44px}
+  .card-select svg{top:4px;left:4px;width:18px;height:18px}
+}
