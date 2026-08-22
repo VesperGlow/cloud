@@ -126,6 +126,6 @@ async function persist(dataURL: string){
 <template>
   <div ref="rootEl" class="video-thumb">
     <span class="thumb-fallback" :class="{ hidden: loaded && !failed }"><slot /></span>
-    <img v-if="!failed && !erroring" :src="src" alt="" loading="lazy" @load="loaded = true" @error="onError">
+    <img v-if="!failed && !erroring" class="ui-image" :src="src" alt="" loading="lazy" draggable="false" @load="loaded = true" @error="onError">
   </div>
 </template>

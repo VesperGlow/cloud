@@ -34,7 +34,7 @@ defineEmits<{
       </button>
       <button class="account-button" title="打开账户设置" @click="$emit('account')">
         <span class="avatar-badge">
-          <img v-if="hasAvatar" :src="avatarUrl" alt="个人头像" @error="$emit('avatarError')">
+          <img v-if="hasAvatar" class="ui-image" :src="avatarUrl" alt="个人头像" draggable="false" @error="$emit('avatarError')">
           <template v-else>{{ user.slice(0,1).toUpperCase() }}</template>
         </span>
         <span class="account-copy"><b>{{ user }}</b><small>账户设置</small></span>

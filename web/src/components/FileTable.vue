@@ -41,9 +41,9 @@ function thumbFallback(event:Event,item:DriveFile){
         <button class="row-select" :class="{active:selectedIds.has(item.id)}" :title="selectedIds.has(item.id)?'取消选择':'选择项目'" :aria-label="selectedIds.has(item.id)?'取消选择':'选择项目'" :aria-pressed="selectedIds.has(item.id)" @click.stop="$emit('select',item)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg></button>
         <button class="file-icon" :class="{directory:item.kind==='directory',image:isImage(item),document:isEditable(item),video:isVideo(item),audio:isAudio(item)}" :disabled="trashMode&&item.kind==='directory'" :title="trashMode&&item.kind==='directory'?'恢复后可打开文件夹':isBook(item)?'阅读':trashMode&&isEditable(item)?'只读查看':isEditable(item)?'编辑文档':isImage(item)?'预览图片':isVideo(item)?'播放视频':isAudio(item)?'播放音频':item.kind==='directory'?'打开文件夹':'文件'" @click="(!trashMode||item.kind==='file')&&$emit('open',item)">
           <span v-if="item.kind==='directory'" class="folder-glyph">▰</span>
-          <img v-else-if="isImage(item)" :src="thumbSRC(item)" :alt="item.name" loading="lazy" @error="thumbFallback($event,item)">
+          <img v-else-if="isImage(item)" class="ui-image" :src="thumbSRC(item)" :alt="item.name" loading="lazy" draggable="false" @error="thumbFallback($event,item)">
           <VideoThumb v-else-if="isVideo(item)" :file="item"><span>▶</span></VideoThumb>
-          <img v-else-if="isEpub(item)&&!coverBroken[item.id]" :src="thumbSRC(item)" :alt="item.name" loading="lazy" @error="coverBroken[item.id]=true">
+          <img v-else-if="isEpub(item)&&!coverBroken[item.id]" class="ui-image" :src="thumbSRC(item)" :alt="item.name" loading="lazy" draggable="false" @error="coverBroken[item.id]=true">
           <span v-else-if="isEpub(item)||isEditable(item)">▤</span><span v-else-if="isAudio(item)">♫</span><span v-else>◇</span>
         </button>
         <div><strong>{{ item.name }}</strong><small v-if="trashMode">删除于 {{ formatDate(item.deleted_at||item.updated_at) }}</small><small v-else-if="item.status!=='ready'">{{ item.status }}</small><small v-else>{{ item.kind==='directory'?'文件夹':item.mime_type||'文件' }}</small></div>

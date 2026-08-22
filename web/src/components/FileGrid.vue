@@ -26,9 +26,9 @@ function thumbFallback(event:Event,item:DriveFile){
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>
       </button>
       <button class="card-preview" :disabled="trashMode&&item.kind==='directory'" :title="trashMode&&item.kind==='directory'?'恢复后可打开文件夹':isBook(item)?'阅读':trashMode&&isEditable(item)?'只读查看':item.kind==='directory'?'打开文件夹':isEditable(item)?'编辑文档':isImage(item)?'预览图片':isVideo(item)?'播放视频':isAudio(item)?'播放音频':'文件'" @click="(!trashMode||item.kind==='file')&&$emit('open',item)">
-        <img v-if="isImage(item)" :src="thumbSRC(item)" :alt="item.name" loading="lazy" @error="thumbFallback($event,item)">
+        <img v-if="isImage(item)" class="ui-image" :src="thumbSRC(item)" :alt="item.name" loading="lazy" draggable="false" @error="thumbFallback($event,item)">
         <VideoThumb v-else-if="isVideo(item)" :file="item"><span class="large-video">▶</span></VideoThumb>
-        <img v-else-if="isEpub(item)&&!coverBroken[item.id]" :src="thumbSRC(item)" :alt="item.name" loading="lazy" @error="coverBroken[item.id]=true">
+        <img v-else-if="isEpub(item)&&!coverBroken[item.id]" class="ui-image" :src="thumbSRC(item)" :alt="item.name" loading="lazy" draggable="false" @error="coverBroken[item.id]=true">
         <span v-else-if="isEpub(item)" class="large-document">▤</span>
         <span v-else-if="item.kind==='directory'" class="large-folder">▰</span>
         <span v-else-if="isEditable(item)" class="large-document">▤</span>

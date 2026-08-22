@@ -547,12 +547,12 @@ onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(c
 </script>
 
 <template>
-  <div v-if="checking" class="splash"><div class="brand-mark"><img src="/logo.png" alt=""></div><div class="spinner"></div></div>
+  <div v-if="checking" class="splash"><div class="brand-mark"><img class="ui-image" src="/logo.png" alt="" draggable="false"></div><div class="spinner"></div></div>
   <main v-else-if="!user" class="login-page">
     <section class="login-visual"><div class="glow glow-a"></div><div class="glow glow-b"></div><div class="visual-copy"><span class="eyebrow">PRIVATE · DIRECT · YOURS</span><h1>你的文件，<br>安静地待在云上。</h1><p>轻量、自托管，文件按内容块直传你的 S3。</p></div><div class="revaro-card"><span>☁</span><div><strong>Seafile 式块存储</strong><small>内容寻址 · 跨文件去重</small></div></div></section>
     <section class="login-panel">
       <form class="login-form" @submit.prevent="submitLogin">
-        <div class="logo"><span class="brand-mark small"><img src="/logo.png" alt=""></span><span>revaro</span></div>
+        <div class="logo"><span class="brand-mark small"><img class="ui-image" src="/logo.png" alt="" draggable="false"></span><span>revaro</span></div>
         <div><p class="eyebrow dark">WELCOME BACK</p><h2>登录私人空间</h2><p class="muted">首次启动的随机凭据可在容器日志中查看</p></div>
         <label>用户名<input v-model="login.username" autocomplete="username" maxlength="128" required></label>
         <label>密码<input v-model="login.password" type="password" autocomplete="current-password" maxlength="1024" required></label>
@@ -596,7 +596,7 @@ onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(c
         <header><div><p class="eyebrow dark">PROFILE & SECURITY</p><h2>账户设置</h2></div><button @click="closeModal">×</button></header>
         <div class="account-layout">
           <section class="avatar-settings">
-            <div class="avatar-large"><img v-if="hasAvatar" :src="avatarURL" alt="个人头像"><span v-else>{{ user.slice(0,1).toUpperCase() }}</span></div>
+            <div class="avatar-large"><img v-if="hasAvatar" class="ui-image" :src="avatarURL" alt="个人头像" draggable="false"><span v-else>{{ user.slice(0,1).toUpperCase() }}</span></div>
             <h3>个人头像</h3><p>支持 JPG、PNG、GIF 和 WebP，最大 2 MiB。</p>
             <div class="avatar-actions"><button type="button" class="secondary" :disabled="avatar.busy" @click="chooseAvatar">{{ avatar.busy?'处理中…':hasAvatar?'更换头像':'上传头像' }}</button><button v-if="hasAvatar" type="button" class="danger-text" :disabled="avatar.busy" @click="removeAvatar">移除</button></div>
             <input ref="avatarInput" hidden type="file" accept="image/jpeg,image/png,image/gif,image/webp" @change="e=>{const el=e.target as HTMLInputElement;if(el.files?.[0])uploadAvatar(el.files[0]);el.value=''}"><p v-if="avatar.error" class="form-error">{{ avatar.error }}</p>
