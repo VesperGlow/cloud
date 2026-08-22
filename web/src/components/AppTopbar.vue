@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { DownloadTask, UploadTask } from '../types'
+import type { UploadTask } from '../types'
 import TransferCenter from './TransferCenter.vue'
 
 defineProps<{
@@ -7,7 +7,6 @@ defineProps<{
   hasAvatar:boolean
   avatarUrl:string
   uploads:UploadTask[]
-  downloads:DownloadTask[]
 }>()
 
 defineEmits<{
@@ -16,7 +15,7 @@ defineEmits<{
   account:[]
   logout:[]
   avatarError:[]
-  clearTransfers:[]
+  clearUploads:[]
   cancelUpload:[task:UploadTask]
   retryUpload:[task:UploadTask]
 }>()
@@ -28,7 +27,7 @@ defineEmits<{
       <span>revaro</span>
     </button>
     <div class="top-actions">
-      <TransferCenter :uploads="uploads" :downloads="downloads" @clear="$emit('clearTransfers')" @cancel="$emit('cancelUpload',$event)" @retry="$emit('retryUpload',$event)" />
+      <TransferCenter :uploads="uploads" @clear="$emit('clearUploads')" @cancel="$emit('cancelUpload',$event)" @retry="$emit('retryUpload',$event)" />
       <button class="trash-button" title="回收站" aria-label="打开回收站" @click="$emit('trash')">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg>
       </button>

@@ -13,7 +13,7 @@ import MediaPreview from './components/MediaPreview.vue'
 import { isBook, isEditable, isImage, isMedia } from './fileTypes'
 import { formatDate, formatSize } from './format'
 import ReaderView from './Reader.vue'
-import type { DownloadTask, FolderOption, ProfileResponse, ShareResponse, StorageStats, TOTPRecoveryResponse, TOTPSetupResponse, TOTPStatusResponse, UploadTask } from './types'
+import type { FolderOption, ProfileResponse, ShareResponse, StorageStats, TOTPRecoveryResponse, TOTPSetupResponse, TOTPStatusResponse, UploadTask } from './types'
 
 const ROOT = '00000000-0000-0000-0000-000000000000'
 const FILE_CONCURRENCY = 3
@@ -34,7 +34,6 @@ const loading = ref(false)
 const dragActive = ref(false)
 const toast = reactive({ text:'', kind:'error' as 'error'|'success' })
 const tasks = reactive<UploadTask[]>([])
-const downloads = reactive<DownloadTask[]>([])
 const trashMode = ref(false)
 const selected = ref<DriveFile|null>(null)
 const selectedIds = ref<Set<string>>(new Set())
@@ -128,7 +127,7 @@ async function submitLogin() {
   }
   finally{login.busy=false}
 }
-async function logout(){await api('/api/auth/logout',{method:'POST'});user.value=null;hasAvatar.value=false;items.value=[];tasks.splice(0);downloads.splice(0)}
+async function logout(){await api('/api/auth/logout',{method:'POST'});user.value=null;hasAvatar.value=false;items.value=[];tasks.splice(0)}
 function showAccount(){account.username=user.value||'';account.currentPassword='';account.password='';account.confirmPassword='';account.error='';accountPanel.value=null;usernameEditing.value=false;usernameSaving.value=false;usernameError.value='';avatar.error='';resetTwoFactor();openModal('account');loadTwoFactorStatus()}
 async function startUsernameEdit(){
   if(usernameSaving.value)return
@@ -185,7 +184,7 @@ async function savePassword(){
   modalBusy.value=true
   try{
     await api('/api/auth/password',{method:'PATCH',body:JSON.stringify({current_password:account.currentPassword,password:account.password})})
-    accountPanel.value=null;closeModal();login.username=account.username;login.password='';login.notice='密码已更新，请重新登录';user.value=null;items.value=[];tasks.splice(0);downloads.splice(0)
+    accountPanel.value=null;closeModal();login.username=account.username;login.password='';login.notice='密码已更新，请重新登录';user.value=null;items.value=[];tasks.splice(0)
   }catch(e){account.error=(e as Error).message}
   finally{modalBusy.value=false}
 }
@@ -400,15 +399,12 @@ function clearSelectionFromBlank(event:MouseEvent){
   if(!(target instanceof Element)||target.closest('button,a,input,textarea,select,[role="toolbar"],.file-card,.file-row'))return
   clearSelection()
 }
-function startDownload(item:DriveFile){
-  const task:DownloadTask={id:crypto.randomUUID(),name:item.name,size:item.size,status:'starting',error:''};downloads.unshift(task)
-  try{const link=document.createElement('a');link.href=`/api/files/${item.id}/download`;link.download=item.name;link.hidden=true;document.body.appendChild(link);link.click();link.remove();window.setTimeout(()=>task.status='handed-off',500)}
-  catch(e){task.status='failed';task.error=(e as Error).message}
+function download(item:DriveFile){
+  const link=document.createElement('a');link.href=`/api/files/${item.id}/download`;link.download=item.name;link.hidden=true;document.body.appendChild(link);link.click();link.remove()
 }
-function download(item:DriveFile){startDownload(item)}
 function downloadSelected(){
   const files=[...selectedFiles.value]
-  files.forEach((item,index)=>window.setTimeout(()=>startDownload(item),index*180))
+  files.forEach((item,index)=>window.setTimeout(()=>download(item),index*180))
 }
 
 function chooseFiles(){fileInput.value?.click()}
@@ -539,8 +535,8 @@ function percentage(done:number,total:number){return total===0?100:Math.min(99,M
 async function cancelUpload(task:UploadTask){task.cancelled=true;hashJobs.get(task.id)?.reject(new Error('上传已取消'));task.requests.forEach(x=>x.abort());await abortRemote(task);task.status='cancelled'}
 async function abortRemote(task:UploadTask){if(task.uploadId){try{await api(`/api/uploads/${task.uploadId}`,{method:'DELETE'})}catch{/* stale cleanup retries later */}}}
 async function retry(task:UploadTask){await abortRemote(task);task.status='queued';task.error='';task.uploadId=undefined;task.requests=[];task.cancelled=false;pumpQueue()}
-function clearFinished(){for(let i=tasks.length-1;i>=0;i--)if(['done','cancelled'].includes(tasks[i].status))tasks.splice(i,1);for(let i=downloads.length-1;i>=0;i--)if(downloads[i].status!=='starting')downloads.splice(i,1)}
-// 完成记录保留在传输中心，等用户主动清除。
+function clearFinished(){for(let i=tasks.length-1;i>=0;i--)if(['done','cancelled'].includes(tasks[i].status))tasks.splice(i,1)}
+// 完成记录保留在上传进度中，等用户主动清除。
 function scheduleAutoClear(){}
 onMounted(()=>{const saved=localStorage.getItem('revaro-view-mode');if(saved==='list'||saved==='grid')viewMode.value=saved;window.addEventListener('popstate',handlePopState);checkSession()})
 onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(const job of hashJobs.values())job.reject(new Error('页面已关闭'));hashJobs.clear()})
@@ -564,13 +560,13 @@ onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(c
   </main>
 
   <div v-else class="app-shell" @dragover.prevent="dragActive=true" @dragleave.self="dragActive=false" @drop.prevent="onDrop">
-    <AppTopbar :user="user" :has-avatar="hasAvatar" :avatar-url="avatarURL" :uploads="tasks" :downloads="downloads" @home="openFolder(ROOT)" @trash="openTrash" @account="showAccount" @logout="logout" @avatar-error="hasAvatar=false" @clear-transfers="clearFinished" @cancel-upload="cancelUpload" @retry-upload="retry" />
+    <AppTopbar :user="user" :has-avatar="hasAvatar" :avatar-url="avatarURL" :uploads="tasks" @home="openFolder(ROOT)" @trash="openTrash" @account="showAccount" @logout="logout" @avatar-error="hasAvatar=false" @clear-uploads="clearFinished" @cancel-upload="cancelUpload" @retry-upload="retry" />
     <section class="content" @click="clearSelectionFromBlank">
       <FileBrowserHeader :breadcrumbs="breadcrumbs" :current="current" :can-go-up="currentId!==ROOT&&!!current?.parent_id" :item-count="items.length" :total-bytes="storageStats.total_bytes" :file-count="storageStats.file_count" :view-mode="viewMode" :trash-mode="trashMode" @open-folder="openFolder" @up="goUp" @set-view="setViewMode" @new-document="newDocument" @create-folder="createFolder" @upload="chooseFiles" @leave-trash="openFolder(ROOT)" @empty-trash="emptyTrash" />
       <input ref="fileInput" hidden type="file" multiple @change="e=>{const el=e.target as HTMLInputElement;if(el.files)acceptFiles(el.files);el.value=''}">
       <div v-if="selectedItems.length&&!modal" class="selection-toolbar" role="toolbar" aria-label="所选项目操作">
         <button class="selection-close" title="取消选择" aria-label="取消选择" @click="clearSelection">×</button><span class="selection-summary"><b>{{ selectedItems.length }} 项</b><small>已选择 {{ formatSize(selectedBytes) }}</small></span>
-        <div v-if="trashMode" class="selection-actions"><button @click="restoreSelected"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10a8 8 0 1 0 2-4m-2-3v7h7"/></svg><span>恢复</span></button><button class="danger" @click="purgeSelected"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg><span>永久删除</span></button></div>
+        <div v-if="trashMode" class="selection-actions"><button @click="restoreSelected"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg><span>恢复</span></button><button class="danger" @click="purgeSelected"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg><span>永久删除</span></button></div>
         <div v-else class="selection-actions">
           <button @click="selectAll"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4z"/><path d="m8 12 3 3 5-6"/></svg><span>{{ selectedItems.length===items.length?'取消全选':'全选' }}</span></button>
           <button v-if="singleSelected&&(singleSelected.kind==='directory'||isEditable(singleSelected)||isMedia(singleSelected)||isBook(singleSelected))" @click="openItem(singleSelected)"><svg viewBox="0 0 24 24" aria-hidden="true"><path v-if="singleSelected.kind==='directory'" d="M3 7h7l2 2h9v9H3z"/><path v-else-if="isEditable(singleSelected)&&!isBook(singleSelected)" d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/><path v-else-if="isBook(singleSelected)" d="M12 5c-1.7-1.4-4.2-2-8-2v14c3.8 0 6.3.6 8 2 1.7-1.4 4.2-2 8-2V3c-3.8 0-6.3.6-8 2Zm0 0v14"/><path v-else-if="isImage(singleSelected)" d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><path v-else d="M8 5v14l11-7Z"/></svg><span>{{ singleSelected.kind==='directory'?'打开':isBook(singleSelected)?'阅读':isEditable(singleSelected)?'编辑文本':isImage(singleSelected)?'预览':'播放' }}</span></button>
@@ -584,7 +580,7 @@ onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(c
       <div v-if="loading" class="state"><div class="spinner"></div><p>正在读取文件…</p></div>
       <div v-else-if="!items.length" class="state empty"><div class="empty-icon">⌁</div><h3>{{ trashMode?'回收站是空的':'这里还是空的' }}</h3><p>{{ trashMode?'删除的项目会先来到这里。':'拖放文件到这里，或新建一篇文档。' }}</p><div v-if="!trashMode" class="empty-actions"><button class="secondary" @click="newDocument">新建文档</button><button class="primary" @click="chooseFiles">上传文件</button></div></div>
       <FileTable v-else-if="viewMode==='list'" :items="items" :selected-ids="selectedIds" :trash-mode="trashMode" @open="openItem" @select="toggleSelection" @select-all="selectAll" @edit="openEditor" @preview="showPreview" @read="openReader" @download="download" @share="showShare" @rename="showRename" @move="showMove" @remove="removeItem" @restore="restoreItem" @purge="purgeItem" />
-      <FileGrid v-else :items="items" :selected-ids="selectedIds" :trash-mode="trashMode" @open="openItem" @select="toggleSelection" @restore="restoreItem" @purge="purgeItem" />
+      <FileGrid v-else :items="items" :selected-ids="selectedIds" :trash-mode="trashMode" @open="openItem" @select="toggleSelection" />
     </section>
 
     <div v-if="dragActive&&!trashMode" class="drop-zone"><div><span>↓</span><h2>释放以上传到 {{ current?.name || '我的文件' }}</h2><p>文件将按内容块直传 S3，重复内容自动去重</p></div></div>

@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { reactive } from 'vue'
 import type { DriveFile } from '../api'
-import { isAudio, isBook, isEditable, isEpub, isImage, isMedia, isVideo, previewURL, thumbSRC } from '../fileTypes'
+import { isAudio, isBook, isEditable, isEpub, isImage, isVideo, previewURL, thumbSRC } from '../fileTypes'
 import { formatDate, formatSize } from '../format'
 import VideoThumb from '../VideoThumb.vue'
 
 defineProps<{items:DriveFile[];selectedIds:Set<string>;trashMode?:boolean}>()
-defineEmits<{open:[item:DriveFile];select:[item:DriveFile];restore:[item:DriveFile];purge:[item:DriveFile]}>()
+defineEmits<{open:[item:DriveFile];select:[item:DriveFile]}>()
 
 const thumbFallbackTried=reactive<Record<string,boolean>>({})
 const coverBroken=reactive<Record<string,boolean>>({})
@@ -36,7 +36,6 @@ function thumbFallback(event:Event,item:DriveFile){
         <span v-else class="large-file">◇</span>
       </button>
       <div class="card-info"><strong :title="item.name">{{ item.name }}</strong><small v-if="trashMode">{{ item.kind==='directory'?'文件夹':formatSize(item.size) }} · 删除于 {{ formatDate(item.deleted_at||item.updated_at) }}</small><small v-else>{{ item.kind==='directory'?'文件夹':formatSize(item.size) }} · {{ formatDate(item.updated_at) }}</small></div>
-      <div v-if="trashMode" class="card-actions"><button v-if="isBook(item)||isEditable(item)||isMedia(item)" :title="isBook(item)?'阅读':isImage(item)?'预览':isMedia(item)?'播放':'只读查看'" @click="$emit('open',item)">查看</button><button title="恢复" class="restore-action" @click="$emit('restore',item)">恢复</button><button title="永久删除" class="danger" @click="$emit('purge',item)">删除</button></div>
     </article>
   </div>
 </template>
