@@ -45,13 +45,13 @@ const maxManifestBlocks = 262144
 const maxLogicalFileSize = 1 << 40 // 1 TiB
 
 type Server struct {
-	db       *sql.DB
-	storage  storage.Storage
-	auth     *auth.Service
-	cfg      config.Config
-	log      *slog.Logger
-	limiter  *loginLimiter
-	s3Origin string // S3_PUBLIC_ENDPOINT 的 scheme://host，用于收窄 CSP
+	db               *sql.DB
+	storage          storage.Storage
+	auth             *auth.Service
+	cfg              config.Config
+	log              *slog.Logger
+	limiter          *loginLimiter
+	s3Origin         string // S3_PUBLIC_ENDPOINT 的 scheme://host，用于收窄 CSP
 	shareSlots       chan struct{}
 	blockUploadSlots chan struct{}
 }
@@ -1086,6 +1086,48 @@ func (s *Server) emptyTrash(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// CleanupExpiredTrash permanently removes complete trash trees whose root has
+// exceeded the configured retention period. It only removes metadata; the
+// caller should request a garbage-collection pass when the return value is
+// non-zero so the now-unreferenced S3 objects are reclaimed as well.
+func (s *Server) CleanupExpiredTrash(ctx context.Context) int64 {
+	if s.cfg.TrashRetention == 0 {
+		return 0
+	}
+	cutoff := time.Now().UTC().Add(-s.cfg.TrashRetention).Format(time.RFC3339Nano)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		s.log.Error("open expired trash cleanup failed", "error", err)
+		return 0
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `PRAGMA defer_foreign_keys=ON`); err != nil {
+		s.log.Error("configure expired trash cleanup failed", "error", err)
+		return 0
+	}
+	var roots int64
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM files WHERE deleted_at IS NOT NULL AND trash_root_id=id AND deleted_at<=?`, cutoff).Scan(&roots); err != nil {
+		s.log.Error("scan expired trash failed", "error", err)
+		return 0
+	}
+	if roots == 0 {
+		return 0
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM files WHERE trash_root_id IN (SELECT id FROM files WHERE deleted_at IS NOT NULL AND trash_root_id=id AND deleted_at<=?)`, cutoff)
+	if err != nil {
+		s.log.Error("expired trash cleanup failed", "error", err)
+		return 0
+	}
+	items, _ := result.RowsAffected()
+	if err = tx.Commit(); err != nil {
+		s.log.Error("commit expired trash cleanup failed", "error", err)
+		return 0
+	}
+	s.log.Info("expired trash permanently deleted", "roots", roots, "items", items, "retention", s.cfg.TrashRetention)
+	return roots
+}
+
 func (s *Server) download(w http.ResponseWriter, r *http.Request) { s.streamFile(w, r, false) }
 func (s *Server) preview(w http.ResponseWriter, r *http.Request)  { s.streamFile(w, r, true) }
 func (s *Server) streamFile(w http.ResponseWriter, r *http.Request, inline bool) {
@@ -1838,23 +1880,30 @@ func blockIDFromKey(key string) string {
 	return id
 }
 
-// referencedObjectKeys returns every object key the metadata still points
-// at, across all file states.
-func (s *Server) referencedObjectKeys(ctx context.Context) (map[string]bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT object_key FROM files WHERE object_key IS NOT NULL AND object_key <> ''`)
+// referencedStorageKeys returns every content object and derived thumbnail the
+// metadata can still reach, across active and trashed file states.
+func (s *Server) referencedStorageKeys(ctx context.Context) (map[string]bool, map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT object_key,name FROM files WHERE kind='file' AND object_key IS NOT NULL AND object_key <> ''`)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
-	out := map[string]bool{}
+	objects := map[string]bool{}
+	thumbnails := map[string]bool{}
 	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			return nil, err
+		var key, name string
+		if err := rows.Scan(&key, &name); err != nil {
+			return nil, nil, err
 		}
-		out[key] = true
+		objects[key] = true
+		if canHaveThumbnail(name) {
+			thumbnails[thumbnailKey(key)] = true
+		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return objects, thumbnails, nil
 }
 
 // CollectGarbage deletes manifests that no metadata references and blocks
@@ -1865,7 +1914,7 @@ func (s *Server) referencedObjectKeys(ctx context.Context) (map[string]bool, err
 func (s *Server) CollectGarbage(ctx context.Context) {
 	grace := s.cfg.UploadExpires + time.Hour
 	cutoff := time.Now().UTC().Add(-grace)
-	referenced, err := s.referencedObjectKeys(ctx)
+	referenced, referencedThumbnails, err := s.referencedStorageKeys(ctx)
 	if err != nil {
 		s.log.Error("GC metadata scan failed", "error", err)
 		return
@@ -1902,7 +1951,7 @@ func (s *Server) CollectGarbage(ctx context.Context) {
 			continue
 		}
 	}
-	var deletedManifests, deletedBlocks, deletedLegacy int
+	var deletedManifests, deletedBlocks, deletedLegacy, deletedThumbnails int
 	for _, key := range doomedManifests {
 		if err := s.storage.DeleteObject(ctx, key); err != nil {
 			s.log.Warn("GC manifest delete failed", "key", key, "error", err)
@@ -1945,8 +1994,23 @@ func (s *Server) CollectGarbage(ctx context.Context) {
 			deletedLegacy++
 		}
 	}
-	if deletedManifests+deletedBlocks+deletedLegacy > 0 {
-		s.log.Info("garbage collection finished", "manifests", deletedManifests, "blocks", deletedBlocks, "legacy_objects", deletedLegacy)
+	thumbnails, err := s.storage.ListPrefix(ctx, "thumbs/")
+	if err != nil {
+		s.log.Warn("GC thumbnail listing failed", "error", err)
+	} else {
+		for _, ref := range thumbnails {
+			if referencedThumbnails[ref.Key] || !ref.LastModified.Before(cutoff) {
+				continue
+			}
+			if err := s.storage.DeleteObject(ctx, ref.Key); err != nil {
+				s.log.Warn("GC thumbnail delete failed", "key", ref.Key, "error", err)
+				continue
+			}
+			deletedThumbnails++
+		}
+	}
+	if deletedManifests+deletedBlocks+deletedLegacy+deletedThumbnails > 0 {
+		s.log.Info("garbage collection finished", "manifests", deletedManifests, "blocks", deletedBlocks, "legacy_objects", deletedLegacy, "thumbnails", deletedThumbnails)
 	}
 }
 

@@ -49,11 +49,20 @@ var videoExts = map[string]bool{
 var videoThumbSlots = make(chan struct{}, 1)
 var imageThumbSlots = make(chan struct{}, 2)
 
-// thumbKey 由清单键（内容哈希）派生，内容不变则缩略图键不变。
-func (s *Server) thumbKey(f File) string {
-	sum := sha256.Sum256([]byte(f.objectKey + "|thumb-v2"))
+// thumbnailKey 由清单键（内容哈希）派生，内容不变则缩略图键不变。
+// GC 也使用这个纯函数从数据库引用重建可达缩略图集合。
+func thumbnailKey(objectKey string) string {
+	sum := sha256.Sum256([]byte(objectKey + "|thumb-v2"))
 	id := hex.EncodeToString(sum[:])
 	return "thumbs/" + id[:2] + "/" + id[2:] + ".jpg"
+}
+
+func (s *Server) thumbKey(f File) string { return thumbnailKey(f.objectKey) }
+
+func canHaveThumbnail(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	return ext == ".epub" || ext == ".jpg" || ext == ".jpeg" || ext == ".png" ||
+		ext == ".gif" || ext == ".webp" || ext == ".bmp" || videoExts[ext]
 }
 
 func serveThumb(w http.ResponseWriter, r *http.Request, data []byte) {

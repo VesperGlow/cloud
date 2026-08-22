@@ -16,7 +16,7 @@ flowchart LR
 - 块对象使用 `If-None-Match: *` 条件写入，内容寻址对象不可变、不可被并发上传覆盖。
 - 移动和重命名只更新 SQLite，不执行 `CopyObject`。
 - 上传先写入 `pending` 元数据，浏览器按 FastCDC 的 min/avg/max 参数切块；默认用 Presigned URL 直传 S3，UpCloud 则自动经 revaro 转存到私网 endpoint。完成后服务端校验可变块列表的总大小并逐块 `HeadObject`，再写入清单并切换为 `ready`。旧的固定分块清单无需迁移，仍可正常读取。
-- 删除会把文件或整棵目录树软删除到回收站；恢复前清单与块仍是活引用。只有永久删除或清空回收站后，无引用内容才由周期垃圾回收器在宽限期（`UPLOAD_EXPIRES + 1h`）后回收。
+- 删除会把文件或整棵目录树软删除到回收站；恢复前清单、块与缩略图仍是活引用。项目默认保留 30 天，过期后自动永久删除；手动永久删除、清空或到期清理产生的无引用内容由垃圾回收器安全释放。
 - 升级前版本遗留的整对象会在启动时自动重新切块迁移，无法读取的遗留对象会标记为 `failed`。
 
 ## 快速开始（Docker / Podman）
@@ -98,7 +98,8 @@ set -a; . ./.env; set +a
 | `FASTCDC_MIN_SIZE` | `BLOCK_SIZE / 4` | FastCDC 最小块大小，默认 1 MiB，范围 64 KiB–`BLOCK_SIZE` |
 | `FASTCDC_MAX_SIZE` | `BLOCK_SIZE * 4` | FastCDC 强制切块上限，默认 16 MiB，范围 `BLOCK_SIZE`–1 GiB；代理传输模式最多 64 MiB |
 | `UPLOAD_EXPIRES` | `24h` | 未完成上传的清理期限，也决定垃圾回收宽限期下限 |
-| `GC_INTERVAL` | `1h` | 垃圾回收间隔；`0` 表示禁用（回收需手动触发） |
+| `TRASH_RETENTION` | `720h` | 回收站保留期限（30 天）；到期后自动永久删除，`0` 表示禁用自动清理 |
+| `GC_INTERVAL` | `1h` | 周期孤儿对象回收间隔；`0` 表示禁用周期扫描（回收站到期删除仍会触发一次回收） |
 | `FFMPEG_PATH` | `ffmpeg` | 视频缩略图抽帧使用的 ffmpeg 可执行文件路径 |
 
 ### UpCloud 私网模式
@@ -248,7 +249,7 @@ Bucket 必须保持私有。直连模式的浏览器访问依赖 Presigned URL�
 
 上传流程：浏览器把文件切成块 → 逐块算 SHA-256 → 批量登记，服务端对已存在的块返回 `exists:true`（去重跳过）。直连模式会为缺失块签发同时绑定 `If-None-Match: *` 签名头与 SHA-256 签名查询参数的 Presigned PUT；UpCloud 代理模式则返回同源上传 URL，由 revaro 校验块哈希后写入私网 S3。完成后服务端 `HeadObject` 逐块校验、写入清单并把文件切换为 `ready`。极端竞态下（登记后某块被 GC 回收）完成接口返回 `409 + missing_blocks`，前端自动补传重试。
 
-下载流程：单块文件（绝大多数图片、文档、短视频）302 到 Presigned GET 直连 S3；多块文件由服务端按清单流式拼接，`ServeContent` 提供 Range/If-Modified-Since 支持。回收站保留元数据、清单与块引用；永久删除后，垃圾回收器才会在宽限期后按引用关系回收内容，同时清理升级前的 `objects/` 遗留对象。
+下载流程：单块文件（绝大多数图片、文档、短视频）302 到 Presigned GET 直连 S3；多块文件由服务端按清单流式拼接，`ServeContent` 提供 Range/If-Modified-Since 支持。回收站保留元数据、清单、块与缩略图引用；永久删除后，垃圾回收器才会在宽限期后按引用关系回收内容，并同时清理失去引用的 `thumbs/` 缓存和升级前的 `objects/` 遗留对象。
 
 ## 数据模型与一致性
 
@@ -260,7 +261,7 @@ Bucket 必须保持私有。直连模式的浏览器访问依赖 Presigned URL�
 
 SQLite 开启 `foreign_keys`、`busy_timeout` 与 WAL。文件名唯一性由数据库索引保证；目录移动通过 recursive CTE 阻止自环和移动到子孙目录。
 
-启动后每 15 分钟扫描过期上传并清理 `pending` 元数据；每 `GC_INTERVAL`（默认 1 小时）运行一次垃圾回收：收集无引用的清单与块，宽限期为 `UPLOAD_EXPIRES + 1h`，保证进行中上传的块（自身即"无引用"状态）绝不会被提前回收。应用崩溃无法提供跨 SQLite/S3 的分布式事务；失败状态会保留元数据以避免静默丢失，块与清单的孤儿由回收器兜底。
+启动时及之后每 15 分钟扫描过期上传和回收站：`deleted_at` 超过 `TRASH_RETENTION`（默认 30 天）的整棵回收站目录树会在一个 SQLite 事务中永久删除，并立即请求一次对象垃圾回收；即使 `GC_INTERVAL=0`，到期清理产生的内容也会释放。周期 GC 默认每小时运行，收集无引用的清单、块、缩略图和旧版整对象，宽限期为 `UPLOAD_EXPIRES + 1h`，保证进行中上传的块（自身即"无引用"状态）绝不会被提前回收。应用崩溃无法提供跨 SQLite/S3 的分布式事务；失败状态会保留元数据以避免静默丢失，孤儿对象由回收器兜底。
 
 ## 备份与恢复
 
@@ -308,4 +309,4 @@ go build ./...
 docker build -t revaro:test .
 ```
 
-前端有 ESLint（`npm run lint`）与 `vue-tsc` 类型检查（构建时自动执行）。测试覆盖登录、Session、Session 过期、密码盐、头像生命周期、媒体预览与空间统计、文本编辑（含过期 ETag 保存冲突 409）、公开分享（单块跳转与多块流式 Range）、回收站（目录树软删除、分享隔离、恢复、重名冲突、永久删除、清空与 GC 引用保护）、同目录名称冲突、root 保护、目录循环、写请求 Origin 校验（无 Origin / 跨源拒绝）、未知 API 路径返回 JSON 404、过期上传无法完成、块上传 `pending → ready`、块登记、缺失块修复响应、布局校验、多块下载 Range、去重共享、空文件、垃圾回收（含被引用清单读取失败时中止回收）、遗留对象迁移、缩略图（图片重采样与缓存头、EPUB 封面、视频上传/命中/非法拒绝、ffmpeg 抽帧）、阅读器（EPUB 解包/目录/白名单清洗/图片重写/解压炸弹拒绝、TXT 编码与章节偏移、进度存取、接口鉴权），以及 config（默认值/覆盖/校验）、ids（UUID 格式）、database（迁移幂等、WAL、外键）、webui（SPA 回退、路径穿越）单元测试。GitHub Actions 会对每次 push / PR 重复执行这些检查。
+前端有 ESLint（`npm run lint`）与 `vue-tsc` 类型检查（构建时自动执行）。测试覆盖登录、Session、Session 过期、密码盐、头像生命周期、媒体预览与空间统计、文本编辑（含过期 ETag 保存冲突 409）、公开分享（单块跳转与多块流式 Range）、回收站（目录树软删除、分享隔离、恢复、重名冲突、永久删除、清空、30 天到期清理与 GC 引用保护）、同目录名称冲突、root 保护、目录循环、写请求 Origin 校验（无 Origin / 跨源拒绝）、未知 API 路径返回 JSON 404、过期上传无法完成、块上传 `pending → ready`、块登记、缺失块修复响应、布局校验、多块下载 Range、去重共享、空文件、垃圾回收（含缩略图回收、共享引用保护、被引用清单读取失败时中止回收）、遗留对象迁移、缩略图（图片重采样与缓存头、EPUB 封面、视频上传/命中/非法拒绝、ffmpeg 抽帧）、阅读器（EPUB 解包/目录/白名单清洗/图片重写/解压炸弹拒绝、TXT 编码与章节偏移、进度存取、接口鉴权），以及 config（默认值/覆盖/校验）、ids（UUID 格式）、database（迁移幂等、WAL、外键）、webui（SPA 回退、路径穿越）单元测试。GitHub Actions 会对每次 push / PR 重复执行这些检查。

@@ -73,6 +73,45 @@ func main() {
 	} else if migrated > 0 {
 		log.Info("legacy objects re-stored as content-addressed blocks", "files", migrated)
 	}
+	gcRequests := make(chan struct{}, 1)
+	requestGC := func() {
+		select {
+		case gcRequests <- struct{}{}:
+		default: // a pending request already guarantees another pass
+		}
+	}
+	go func() {
+		var ticker *time.Ticker
+		var ticks <-chan time.Time
+		if cfg.GCInterval > 0 {
+			ticker = time.NewTicker(cfg.GCInterval)
+			ticks = ticker.C
+			defer ticker.Stop()
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticks:
+				app.CollectGarbage(context.Background())
+			case <-gcRequests:
+				app.CollectGarbage(context.Background())
+			}
+		}
+	}()
+	runHousekeeping := func() {
+		app.CleanupExpiredUploads(context.Background())
+		if app.CleanupExpiredTrash(context.Background()) > 0 {
+			// Expired trash must release its content even when periodic orphan
+			// collection is disabled with GC_INTERVAL=0.
+			requestGC()
+		}
+		authService.Cleanup(context.Background())
+	}
+	runHousekeeping()
+	if cfg.GCInterval > 0 {
+		requestGC() // one initial pass, then the configured interval
+	}
 	go func() {
 		ticker := time.NewTicker(15 * time.Minute)
 		defer ticker.Stop()
@@ -81,28 +120,10 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				app.CleanupExpiredUploads(context.Background())
-				authService.Cleanup(context.Background())
+				runHousekeeping()
 			}
 		}
 	}()
-	if cfg.GCInterval > 0 {
-		go func() {
-			app.CollectGarbage(context.Background())
-			ticker := time.NewTicker(cfg.GCInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					app.CollectGarbage(context.Background())
-				}
-			}
-		}()
-	}
-	app.CleanupExpiredUploads(context.Background())
-	authService.Cleanup(context.Background())
 	// Streaming downloads can legitimately run for much longer than a fixed
 	// response deadline. Upload/read deadlines are enforced at the handler and
 	// body-limit layers instead.

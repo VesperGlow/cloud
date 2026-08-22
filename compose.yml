@@ -26,6 +26,7 @@ services:
       FASTCDC_MIN_SIZE: "${FASTCDC_MIN_SIZE:-1048576}"
       FASTCDC_MAX_SIZE: "${FASTCDC_MAX_SIZE:-16777216}"
       UPLOAD_EXPIRES: "${UPLOAD_EXPIRES:-24h}"
+      TRASH_RETENTION: "${TRASH_RETENTION:-720h}"
       GC_INTERVAL: "${GC_INTERVAL:-1h}"
     volumes:
       - revaro-data:/data

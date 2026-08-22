@@ -38,14 +38,14 @@ func notFoundError() error {
 
 // mockStorage emulates the block store in memory.
 type mockStorage struct {
-	blocks         map[string][]byte // by block id
-	manifests      map[string]storage.Manifest
-	raw            map[string][]byte // raw object key -> content
-	modified       map[string]time.Time
-	blockSize      int64
-	presignErr     error
-	putManifestErr error
-	getManifestErr error
+	blocks           map[string][]byte // by block id
+	manifests        map[string]storage.Manifest
+	raw              map[string][]byte // raw object key -> content
+	modified         map[string]time.Time
+	blockSize        int64
+	presignErr       error
+	putManifestErr   error
+	getManifestErr   error
 	omitManifestList bool
 }
 
@@ -271,7 +271,7 @@ func newTestAppWithBlockSize(t *testing.T, blockSize int64) *testApp {
 		t.Fatal(err)
 	}
 	store := newMockStorage(blockSize)
-	cfg := config.Config{BaseURL: "http://example.test", BlockSize: blockSize, PresignExpires: time.Minute, UploadExpires: time.Hour, FFmpegPath: "ffmpeg"}
+	cfg := config.Config{BaseURL: "http://example.test", BlockSize: blockSize, PresignExpires: time.Minute, UploadExpires: time.Hour, TrashRetention: 30 * 24 * time.Hour, FFmpegPath: "ffmpeg"}
 	app := &testApp{t: t, db: db, store: store}
 	app.srv = New(db, store, a, cfg, nil)
 	app.handler = app.srv.Handler()
@@ -698,6 +698,44 @@ func TestEmptyTrashRemovesEveryDeletedTree(t *testing.T) {
 	}](t, trash)
 	if len(items.Items) != 0 {
 		t.Fatalf("trash is not empty: %+v", items.Items)
+	}
+}
+
+func TestExpiredTrashCleanupRemovesOnlyExpiredTrees(t *testing.T) {
+	a := newTestApp(t)
+	parentRR := a.request("POST", "/api/directories", map[string]any{"parent_id": RootID, "name": "Expired"}, true)
+	parent := decode[File](t, parentRR)
+	child := a.readyFile(t, "child.txt", []byte("expired content"))
+	if rr := a.request("PATCH", "/api/files/"+child.ID, map[string]any{"parent_id": parent.ID}, true); rr.Code != http.StatusOK {
+		t.Fatalf("move child=%d: %s", rr.Code, rr.Body.String())
+	}
+	recent := a.readyFile(t, "recent.txt", []byte("recent content"))
+	for _, id := range []string{parent.ID, recent.ID} {
+		if rr := a.request("DELETE", "/api/files/"+id, nil, true); rr.Code != http.StatusNoContent {
+			t.Fatalf("trash %s=%d: %s", id, rr.Code, rr.Body.String())
+		}
+	}
+	old := time.Now().UTC().Add(-31 * 24 * time.Hour).Format(time.RFC3339Nano)
+	if _, err := a.db.Exec(`UPDATE files SET deleted_at=? WHERE trash_root_id=?`, old, parent.ID); err != nil {
+		t.Fatal(err)
+	}
+	if roots := a.srv.CleanupExpiredTrash(context.Background()); roots != 1 {
+		t.Fatalf("expired roots=%d, want 1", roots)
+	}
+	var expiredItems int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM files WHERE id IN (?,?)`, parent.ID, child.ID).Scan(&expiredItems); err != nil || expiredItems != 0 {
+		t.Fatalf("expired tree remains: count=%d err=%v", expiredItems, err)
+	}
+	var recentItems int
+	if err := a.db.QueryRow(`SELECT COUNT(*) FROM files WHERE id=? AND deleted_at IS NOT NULL`, recent.ID).Scan(&recentItems); err != nil || recentItems != 1 {
+		t.Fatalf("recent trash was deleted: count=%d err=%v", recentItems, err)
+	}
+	a.srv.CollectGarbage(context.Background())
+	if _, ok := a.store.manifests[child.objectKey]; ok {
+		t.Fatal("content of expired trash was not reclaimed")
+	}
+	if roots := a.srv.CleanupExpiredTrash(context.Background()); roots != 0 {
+		t.Fatalf("second cleanup removed %d roots", roots)
 	}
 }
 
@@ -1227,6 +1265,62 @@ func TestGarbageCollectorKeepsBlocksWhenListingOmitsReferencedManifest(t *testin
 		if _, ok := a.store.blocks[block.ID]; !ok {
 			t.Fatalf("referenced block %s deleted after incomplete listing", block.ID)
 		}
+	}
+}
+
+func TestGarbageCollectorReclaimsOrphanedThumbnails(t *testing.T) {
+	a := newTestApp(t)
+	content := realPNG(t, 320, 180)
+	first := a.readyFile(t, "first.png", content)
+	second := a.readyFile(t, "second.png", content)
+	if rr := a.request("GET", "/api/files/"+first.ID+"/thumbnail", nil, true); rr.Code != http.StatusOK {
+		t.Fatalf("thumbnail=%d: %s", rr.Code, rr.Body.String())
+	}
+	key := a.srv.thumbKey(first)
+	if _, ok := a.store.raw[key]; !ok {
+		t.Fatal("generated thumbnail was not stored")
+	}
+	oldOrphan := "thumbs/aa/orphan.jpg"
+	youngOrphan := "thumbs/bb/young.jpg"
+	a.store.raw[oldOrphan] = []byte("old")
+	a.store.raw[youngOrphan] = []byte("young")
+	a.store.age(oldOrphan, time.Now().Add(-48*time.Hour))
+	a.store.age(youngOrphan, time.Now())
+	a.srv.CollectGarbage(context.Background())
+	if _, ok := a.store.raw[key]; !ok {
+		t.Fatal("referenced thumbnail was collected")
+	}
+	if _, ok := a.store.raw[oldOrphan]; ok {
+		t.Fatal("old orphaned thumbnail was not collected")
+	}
+	if _, ok := a.store.raw[youngOrphan]; !ok {
+		t.Fatal("young orphaned thumbnail was collected")
+	}
+
+	if rr := a.request("DELETE", "/api/files/"+first.ID, nil, true); rr.Code != http.StatusNoContent {
+		t.Fatalf("trash first=%d", rr.Code)
+	}
+	if rr := a.request("DELETE", "/api/trash/"+first.ID, nil, true); rr.Code != http.StatusNoContent {
+		t.Fatalf("purge first=%d", rr.Code)
+	}
+	a.srv.CollectGarbage(context.Background())
+	if _, ok := a.store.raw[key]; !ok {
+		t.Fatal("thumbnail shared by a live file was collected")
+	}
+	if rr := a.request("DELETE", "/api/files/"+second.ID, nil, true); rr.Code != http.StatusNoContent {
+		t.Fatalf("trash second=%d", rr.Code)
+	}
+	a.srv.CollectGarbage(context.Background())
+	if _, ok := a.store.raw[key]; !ok {
+		t.Fatal("thumbnail referenced by trash was collected")
+	}
+	if rr := a.request("DELETE", "/api/trash/"+second.ID, nil, true); rr.Code != http.StatusNoContent {
+		t.Fatalf("purge second=%d", rr.Code)
+	}
+	a.store.age(key, time.Now().Add(-48*time.Hour))
+	a.srv.CollectGarbage(context.Background())
+	if _, ok := a.store.raw[key]; ok {
+		t.Fatal("orphaned shared thumbnail was not collected")
 	}
 }
 

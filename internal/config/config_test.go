@@ -18,7 +18,7 @@ func TestLoadDefaults(t *testing.T) {
 	if c.Addr != ":8080" || c.DataDir != "/data" || c.BaseURL != "http://localhost:8080" {
 		t.Fatalf("defaults: %+v", c)
 	}
-	if c.S3Region != "us-east-1" || c.S3PathStyle || c.PresignExpires != 15*time.Minute || c.UploadExpires != 24*time.Hour || c.GCInterval != time.Hour || c.BlockMinSize != 1<<20 || c.BlockSize != 4<<20 || c.BlockMaxSize != 16<<20 {
+	if c.S3Region != "us-east-1" || c.S3PathStyle || c.PresignExpires != 15*time.Minute || c.UploadExpires != 24*time.Hour || c.TrashRetention != 30*24*time.Hour || c.GCInterval != time.Hour || c.BlockMinSize != 1<<20 || c.BlockSize != 4<<20 || c.BlockMaxSize != 16<<20 {
 		t.Fatalf("defaults: %+v", c)
 	}
 	if c.FFmpegPath != "ffmpeg" {
@@ -73,6 +73,7 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("COOKIE_SECURE", "true")
 	t.Setenv("FFMPEG_PATH", "/usr/bin/ffmpeg")
 	t.Setenv("S3_PUBLIC_ENDPOINT", "https://minio-public.example.com")
+	t.Setenv("TRASH_RETENTION", "168h")
 	c, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +81,7 @@ func TestLoadOverrides(t *testing.T) {
 	if c.BaseURL != "https://drive.example.com" {
 		t.Fatalf("base url must be trimmed: %q", c.BaseURL)
 	}
-	if !c.CookieSecure || !c.S3PathStyle || c.BlockMinSize != 2<<20 || c.BlockSize != 8<<20 || c.BlockMaxSize != 32<<20 || c.FFmpegPath != "/usr/bin/ffmpeg" {
+	if !c.CookieSecure || !c.S3PathStyle || c.BlockMinSize != 2<<20 || c.BlockSize != 8<<20 || c.BlockMaxSize != 32<<20 || c.TrashRetention != 7*24*time.Hour || c.FFmpegPath != "/usr/bin/ffmpeg" {
 		t.Fatalf("overrides: %+v", c)
 	}
 	if c.S3PublicEndpoint != "https://minio-public.example.com" {
@@ -95,6 +96,11 @@ func TestLoadOverrides(t *testing.T) {
 	if c2.S3PublicEndpoint != "https://minio.example.com" {
 		t.Fatalf("public endpoint fallback: %q", c2.S3PublicEndpoint)
 	}
+	t.Setenv("TRASH_RETENTION", "0")
+	c3, err := Load()
+	if err != nil || c3.TrashRetention != 0 {
+		t.Fatalf("disabled trash retention=%s err=%v", c3.TrashRetention, err)
+	}
 }
 
 func TestLoadValidations(t *testing.T) {
@@ -108,6 +114,7 @@ func TestLoadValidations(t *testing.T) {
 		{"bad fastcdc max", func(t *testing.T) { t.Setenv("FASTCDC_MAX_SIZE", "1024") }},
 		{"bad base url", func(t *testing.T) { t.Setenv("APP_BASE_URL", "not-a-url") }},
 		{"bad upload expires", func(t *testing.T) { t.Setenv("UPLOAD_EXPIRES", "0s") }},
+		{"bad trash retention", func(t *testing.T) { t.Setenv("TRASH_RETENTION", "-1s") }},
 		{"bad gc interval", func(t *testing.T) { t.Setenv("GC_INTERVAL", "-1s") }},
 		{"bad bool", func(t *testing.T) { t.Setenv("S3_PATH_STYLE", "maybe") }},
 		{"bad proxy bool", func(t *testing.T) { t.Setenv("S3_PROXY_TRANSFERS", "maybe") }},
@@ -128,6 +135,7 @@ func TestLoadValidations(t *testing.T) {
 			t.Setenv("FASTCDC_MIN_SIZE", "1048576")
 			t.Setenv("FASTCDC_MAX_SIZE", "16777216")
 			t.Setenv("UPLOAD_EXPIRES", "24h")
+			t.Setenv("TRASH_RETENTION", "720h")
 			t.Setenv("GC_INTERVAL", "1h")
 			t.Setenv("S3_PATH_STYLE", "false")
 			t.Setenv("S3_PROXY_TRANSFERS", "false")

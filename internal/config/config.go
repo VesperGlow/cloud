@@ -24,17 +24,18 @@ type Config struct {
 	S3Bucket         string
 	S3AccessKey      string
 	S3SecretKey      string
-	S3PathStyle       bool
-	ProxyTransfers    bool
-	PresignExpires    time.Duration
+	S3PathStyle      bool
+	ProxyTransfers   bool
+	PresignExpires   time.Duration
 	// BlockSize is the target average FastCDC chunk size. BlockMinSize and
 	// BlockMaxSize bound the variable-size chunks around that target.
-	BlockMinSize  int64
-	BlockSize     int64
-	BlockMaxSize  int64
-	UploadExpires time.Duration
-	GCInterval    time.Duration
-	FFmpegPath    string
+	BlockMinSize   int64
+	BlockSize      int64
+	BlockMaxSize   int64
+	UploadExpires  time.Duration
+	TrashRetention time.Duration
+	GCInterval     time.Duration
+	FFmpegPath     string
 }
 
 func Load() (Config, error) {
@@ -71,6 +72,9 @@ func Load() (Config, error) {
 	if c.UploadExpires, err = durationEnv("UPLOAD_EXPIRES", 24*time.Hour); err != nil {
 		return c, err
 	}
+	if c.TrashRetention, err = durationEnv("TRASH_RETENTION", 30*24*time.Hour); err != nil {
+		return c, err
+	}
 	if c.GCInterval, err = durationEnv("GC_INTERVAL", time.Hour); err != nil {
 		return c, err
 	}
@@ -98,6 +102,9 @@ func Load() (Config, error) {
 	}
 	if c.UploadExpires <= 0 {
 		return c, errors.New("UPLOAD_EXPIRES must be positive")
+	}
+	if c.TrashRetention < 0 {
+		return c, errors.New("TRASH_RETENTION must not be negative")
 	}
 	if c.GCInterval < 0 {
 		return c, errors.New("GC_INTERVAL must not be negative")
