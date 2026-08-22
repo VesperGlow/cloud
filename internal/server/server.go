@@ -97,6 +97,7 @@ func (s *Server) Handler() http.Handler {
 			r.Post("/auth/logout", s.logout)
 			r.Get("/auth/me", s.me)
 			r.Patch("/auth/credentials", s.changeCredentials)
+			r.Patch("/auth/password", s.changePassword)
 			r.Get("/auth/totp", s.totpStatus)
 			r.Post("/auth/totp/setup", s.beginTOTPSetup)
 			r.Post("/auth/totp/enable", s.enableTOTP)
@@ -105,6 +106,7 @@ func (s *Server) Handler() http.Handler {
 			r.Get("/profile/avatar", s.getAvatar)
 			r.Put("/profile/avatar", s.updateAvatar)
 			r.Delete("/profile/avatar", s.deleteAvatar)
+			r.Patch("/profile/username", s.changeUsername)
 			r.Get("/storage/stats", s.storageStats)
 			r.Get("/files/{id}", s.getFile)
 			r.Get("/files/{id}/children", s.children)
@@ -501,6 +503,55 @@ func (s *Server) changeCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 	s.clearSessionCookie(w)
 	s.log.Info("administrator credentials changed", "previous_user", currentUsername, "user", in.Username)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		CurrentPassword string `json:"current_password"`
+		Password        string `json:"password"`
+	}
+	if err := decodeJSON(w, r, &in); err != nil {
+		return
+	}
+	if len(in.Password) < 12 || len(in.Password) > 1024 || len(in.CurrentPassword) > 1024 {
+		problem(w, http.StatusBadRequest, "password must be between 12 and 1024 characters")
+		return
+	}
+	username := r.Context().Value(userKey{}).(string)
+	if err := s.auth.ChangeCredentials(r.Context(), username, in.CurrentPassword, username, in.Password); err != nil {
+		if errors.Is(err, auth.ErrInvalidCredentials) {
+			problem(w, http.StatusUnauthorized, "current password is incorrect")
+			return
+		}
+		s.log.Error("password change failed", "error", err)
+		problem(w, http.StatusInternalServerError, "could not update password")
+		return
+	}
+	s.clearSessionCookie(w)
+	s.log.Info("administrator password changed", "user", username)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) changeUsername(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Username string `json:"username"`
+	}
+	if err := decodeJSON(w, r, &in); err != nil {
+		return
+	}
+	in.Username = strings.TrimSpace(in.Username)
+	if in.Username == "" || len(in.Username) > 128 {
+		problem(w, http.StatusBadRequest, "username must be between 1 and 128 characters")
+		return
+	}
+	previous := r.Context().Value(userKey{}).(string)
+	if err := s.auth.ChangeUsername(r.Context(), in.Username); err != nil {
+		s.log.Error("username change failed", "error", err)
+		problem(w, http.StatusInternalServerError, "could not update username")
+		return
+	}
+	s.log.Info("administrator username changed", "previous_user", previous, "user", in.Username)
 	w.WriteHeader(http.StatusNoContent)
 }
 

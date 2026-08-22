@@ -23,22 +23,22 @@
 }
 
 .account-modal {
-  width: min(880px, 100%);
+  width: min(780px, 100%);
   max-height: calc(100vh - 40px);
   overflow: auto;
 }
 
 .account-layout {
   display: grid;
-  grid-template-columns: 220px minmax(0, 1fr);
-  gap: 26px;
+  grid-template-columns: 190px minmax(0, 1fr);
+  gap: 18px;
 }
 
 .avatar-settings {
   display: flex;
   align-items: center;
   flex-direction: column;
-  padding: 24px 18px;
+  padding: 22px 14px;
   border: 1px solid #e1e7ef;
   border-radius: 15px;
   background: #f8fafc;
@@ -114,6 +114,149 @@
   color: #64748b;
   font-size: 12px;
   line-height: 1.55;
+}
+
+.account-overview {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.account-setting-row {
+  display: flex;
+  min-height: 98px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 18px 20px;
+  border: 1px solid #e1e7ef;
+  border-radius: 15px;
+  background: #fff;
+}
+
+.account-setting-row.security-row {
+  background: #f8fafc;
+}
+
+.setting-copy {
+  min-width: 0;
+}
+
+.setting-label {
+  color: #25364a;
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.setting-title,
+.username-line {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.username-line {
+  min-height: 32px;
+  margin-top: 4px;
+}
+
+.username-line strong {
+  overflow: hidden;
+  max-width: 260px;
+  color: #17263a;
+  font-size: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.edit-username {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.edit-username:hover {
+  background: #eaf1fe;
+  color: #2563eb;
+}
+
+.edit-username svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.account-modal .username-input {
+  width: min(260px, 100%);
+  padding: 7px 9px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.username-line small {
+  flex: 0 0 auto;
+  color: #7b899a;
+  font-size: 10px;
+}
+
+.username-error {
+  margin-top: 5px !important;
+}
+
+.password-entry {
+  flex: 0 0 auto;
+}
+
+.security-row .setting-copy p {
+  margin: 7px 0 0;
+  color: #718096;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.account-subdialog-backdrop {
+  position: fixed;
+  z-index: 42;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: #0f172a70;
+  backdrop-filter: blur(5px);
+}
+
+.account-subdialog {
+  max-height: calc(100vh - 40px);
+  overflow: auto;
+  box-shadow: 0 30px 90px #0f172a55;
+}
+
+.password-dialog {
+  width: min(440px, 100%);
+}
+
+.totp-dialog {
+  width: min(720px, 100%);
+}
+
+.subdialog-hint {
+  margin: 7px 0 0;
+  color: #718096;
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .login-totp-hint {
@@ -321,6 +464,11 @@
     grid-template-columns: 1fr;
   }
 
+  .account-setting-row {
+    min-height: 88px;
+    padding: 15px 14px;
+  }
+
   .avatar-settings {
     display: grid;
     grid-template-columns: 70px minmax(0, 1fr);
@@ -369,5 +517,33 @@
   .two-factor-actions button,
   .recovery-actions button {
     width: 100%;
+  }
+
+  .account-subdialog-backdrop {
+    padding: 10px;
+  }
+
+  .account-subdialog {
+    max-height: calc(100vh - 20px);
+  }
+}
+
+@media (max-width: 460px) {
+  .account-modal {
+    padding: 19px 16px;
+  }
+
+  .account-setting-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .account-setting-row > button {
+    width: 100%;
+  }
+
+  .username-line strong {
+    max-width: calc(100vw - 120px);
   }
 }

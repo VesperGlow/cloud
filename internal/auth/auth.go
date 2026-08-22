@@ -181,6 +181,28 @@ func (s *Service) ChangeCredentials(ctx context.Context, currentUsername, curren
 	return tx.Commit()
 }
 
+// ChangeUsername updates the administrator's display/login name without
+// invalidating existing sessions. Authentication is enforced by the HTTP
+// handler before this method is called.
+func (s *Service) ChangeUsername(ctx context.Context, newUsername string) error {
+	newUsername = strings.TrimSpace(newUsername)
+	if newUsername == "" || len(newUsername) > 128 {
+		return errors.New("administrator username length is invalid")
+	}
+	result, err := s.DB.ExecContext(ctx, `UPDATE settings SET value=?,updated_at=? WHERE key='admin_username'`, newUsername, time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return errors.New("administrator username is not initialized")
+	}
+	return nil
+}
+
 func (s *Service) ResetCredentials(ctx context.Context, username string) (InitialCredentials, error) {
 	if username == "" {
 		username = "admin"

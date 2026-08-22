@@ -343,6 +343,33 @@ func TestChangeCredentialsRequiresCurrentPasswordAndRevokesSession(t *testing.T)
 	}
 }
 
+func TestAccountFieldEndpoints(t *testing.T) {
+	a := newTestApp(t)
+	rename := a.request("PATCH", "/api/profile/username", map[string]any{"username": " owner "}, true)
+	if rename.Code != http.StatusNoContent {
+		t.Fatalf("rename status=%d: %s", rename.Code, rename.Body.String())
+	}
+	me := a.request("GET", "/api/auth/me", nil, true)
+	if me.Code != http.StatusOK || !strings.Contains(me.Body.String(), `"username":"owner"`) {
+		t.Fatalf("renamed session status=%d: %s", me.Code, me.Body.String())
+	}
+	wrong := a.request("PATCH", "/api/auth/password", map[string]any{"current_password": "wrong-password", "password": "a-new-secure-password"}, true)
+	if wrong.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong password status=%d: %s", wrong.Code, wrong.Body.String())
+	}
+	changed := a.request("PATCH", "/api/auth/password", map[string]any{"current_password": "a-secure-test-password", "password": "a-new-secure-password"}, true)
+	if changed.Code != http.StatusNoContent {
+		t.Fatalf("password change status=%d: %s", changed.Code, changed.Body.String())
+	}
+	if me = a.request("GET", "/api/auth/me", nil, true); me.Code != http.StatusUnauthorized {
+		t.Fatalf("password change kept old session: %d", me.Code)
+	}
+	login := a.request("POST", "/api/auth/login", map[string]any{"username": "owner", "password": "a-new-secure-password"}, false)
+	if login.Code != http.StatusOK {
+		t.Fatalf("new password login status=%d: %s", login.Code, login.Body.String())
+	}
+}
+
 func TestTOTPAPISetupLoginRecoveryAndDisable(t *testing.T) {
 	a := newTestApp(t)
 	now := time.Date(2026, 8, 22, 1, 0, 0, 0, time.UTC)

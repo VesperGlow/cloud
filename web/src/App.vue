@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api } from './api'
 import type { ApiError, DriveFile } from './api'
 import AppDialog from './components/AppDialog.vue'
@@ -46,6 +46,11 @@ const renameValue = ref('')
 const folders = ref<FolderOption[]>([])
 const modalBusy = ref(false)
 const account = reactive({ username:'', currentPassword:'', password:'', confirmPassword:'', error:'' })
+const accountPanel = ref<null|'password'|'totp'>(null)
+const usernameEditing = ref(false)
+const usernameSaving = ref(false)
+const usernameError = ref('')
+const usernameInput = ref<HTMLInputElement|null>(null)
 const avatar = reactive({ busy:false, error:'' })
 const twoFactor = reactive({ enabled:false, recoveryRemaining:0, loading:false, busy:false, stage:'idle' as 'idle'|'setup', currentPassword:'', code:'', secret:'', uri:'', qrDataURL:'', recoveryCodes:[] as string[], copied:false, error:'' })
 const share = reactive({ active:false, url:'', createdAt:'', busy:false, error:'', copied:false })
@@ -124,7 +129,36 @@ async function submitLogin() {
   finally{login.busy=false}
 }
 async function logout(){await api('/api/auth/logout',{method:'POST'});user.value=null;hasAvatar.value=false;items.value=[];tasks.splice(0);downloads.splice(0)}
-function showAccount(){account.username=user.value||'';account.currentPassword='';account.password='';account.confirmPassword='';account.error='';avatar.error='';resetTwoFactor();openModal('account');loadTwoFactorStatus()}
+function showAccount(){account.username=user.value||'';account.currentPassword='';account.password='';account.confirmPassword='';account.error='';accountPanel.value=null;usernameEditing.value=false;usernameSaving.value=false;usernameError.value='';avatar.error='';resetTwoFactor();openModal('account');loadTwoFactorStatus()}
+async function startUsernameEdit(){
+  if(usernameSaving.value)return
+  account.username=user.value||'';usernameError.value='';usernameEditing.value=true
+  await nextTick();usernameInput.value?.focus();usernameInput.value?.select()
+}
+function cancelUsernameEdit(){account.username=user.value||'';usernameError.value='';usernameEditing.value=false}
+async function saveUsername(){
+  if(!usernameEditing.value||usernameSaving.value)return
+  const username=account.username.trim()
+  if(!username){usernameError.value='用户名不能为空';await nextTick();usernameInput.value?.focus();return}
+  if(username===user.value){account.username=username;usernameEditing.value=false;usernameError.value='';return}
+  usernameSaving.value=true;usernameError.value=''
+  let failed=false
+  try{
+    await api('/api/profile/username',{method:'PATCH',body:JSON.stringify({username})})
+    account.username=username;user.value=username;login.username=username;usernameEditing.value=false;notify('用户名已保存','success')
+  }catch(e){usernameError.value=(e as Error).message;failed=true}
+  finally{usernameSaving.value=false}
+  if(failed){await nextTick();usernameInput.value?.focus()}
+}
+function openAccountPanel(panel:'password'|'totp'){
+  accountPanel.value=panel
+  if(panel==='password'){account.currentPassword='';account.password='';account.confirmPassword='';account.error=''}
+  else{twoFactor.currentPassword='';twoFactor.code='';twoFactor.error='';twoFactor.recoveryCodes=[];twoFactor.copied=false;twoFactor.stage='idle'}
+}
+function closeAccountPanel(){
+  if(accountPanel.value==='totp'){cancelTwoFactorSetup();twoFactor.currentPassword='';twoFactor.recoveryCodes=[];twoFactor.copied=false}
+  account.currentPassword='';account.password='';account.confirmPassword='';account.error='';accountPanel.value=null
+}
 function chooseAvatar(){avatarInput.value?.click()}
 async function uploadAvatar(file:File){
   avatar.error=''
@@ -144,14 +178,14 @@ async function removeAvatar(){
   catch(e){avatar.error=(e as Error).message}
   finally{avatar.busy=false}
 }
-async function saveAccount(){
+async function savePassword(){
   account.error=''
   if(account.password.length<12){account.error='新密码至少需要 12 个字符';return}
   if(account.password!==account.confirmPassword){account.error='两次输入的新密码不一致';return}
   modalBusy.value=true
   try{
-    await api('/api/auth/credentials',{method:'PATCH',body:JSON.stringify({current_password:account.currentPassword,username:account.username,password:account.password})})
-    closeModal();login.username=account.username;login.password='';login.notice='账户已更新，请使用新凭据重新登录';user.value=null;items.value=[];tasks.splice(0);downloads.splice(0)
+    await api('/api/auth/password',{method:'PATCH',body:JSON.stringify({current_password:account.currentPassword,password:account.password})})
+    accountPanel.value=null;closeModal();login.username=account.username;login.password='';login.notice='密码已更新，请重新登录';user.value=null;items.value=[];tasks.splice(0);downloads.splice(0)
   }catch(e){account.error=(e as Error).message}
   finally{modalBusy.value=false}
 }
@@ -567,54 +601,76 @@ onBeforeUnmount(()=>{window.removeEventListener('popstate',handlePopState);for(c
             <div class="avatar-actions"><button type="button" class="secondary" :disabled="avatar.busy" @click="chooseAvatar">{{ avatar.busy?'处理中…':hasAvatar?'更换头像':'上传头像' }}</button><button v-if="hasAvatar" type="button" class="danger-text" :disabled="avatar.busy" @click="removeAvatar">移除</button></div>
             <input ref="avatarInput" hidden type="file" accept="image/jpeg,image/png,image/gif,image/webp" @change="e=>{const el=e.target as HTMLInputElement;if(el.files?.[0])uploadAvatar(el.files[0]);el.value=''}"><p v-if="avatar.error" class="form-error">{{ avatar.error }}</p>
           </section>
-          <form @submit.prevent="saveAccount">
-            <div><h3>登录凭据</h3><p class="modal-hint">修改后会退出所有已登录设备，请使用新凭据重新登录。</p></div>
-            <label>管理员用户名<input v-model="account.username" autocomplete="username" maxlength="128" required></label>
-            <label>当前密码<input v-model="account.currentPassword" type="password" autocomplete="current-password" maxlength="1024" required></label>
-            <div class="account-passwords"><label>新密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label><label>确认新密码<input v-model="account.confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label></div>
-            <p v-if="account.error" class="form-error">{{ account.error }}</p>
-            <footer><button type="button" class="secondary" @click="closeModal">取消</button><button class="primary" :disabled="modalBusy">{{ modalBusy?'正在保存…':'更新并退出' }}</button></footer>
-          </form>
-        </div>
-
-        <section class="two-factor-settings">
-          <div class="two-factor-head">
-            <div><h3>两步验证</h3><p>使用兼容 TOTP 的身份验证器，为管理员登录增加一次性验证码。</p></div>
-            <span class="security-badge" :class="{enabled:twoFactor.enabled}">{{ twoFactor.enabled?'已启用':'未启用' }}</span>
-          </div>
-          <div v-if="twoFactor.loading" class="two-factor-loading"><div class="spinner"></div><span>正在读取安全设置…</span></div>
-          <template v-else>
-            <section v-if="twoFactor.recoveryCodes.length" class="recovery-panel">
-              <div><strong>立即保存恢复码</strong><p>每枚恢复码只能使用一次。离开此页面后将无法再次查看。</p></div>
-              <div class="recovery-grid"><code v-for="code in twoFactor.recoveryCodes" :key="code">{{ code }}</code></div>
-              <div class="recovery-actions"><button type="button" class="secondary" @click="copyRecoveryCodes">{{ twoFactor.copied?'已复制':'复制恢复码' }}</button><button type="button" class="secondary" @click="downloadRecoveryCodes">下载文本</button></div>
+          <div class="account-overview">
+            <section class="account-setting-row identity-row">
+              <div class="setting-copy">
+                <span class="setting-label">用户名</span>
+                <div class="username-line">
+                  <template v-if="usernameEditing">
+                    <input ref="usernameInput" v-model="account.username" class="username-input" autocomplete="username" maxlength="128" aria-label="用户名" :disabled="usernameSaving" @focusout="saveUsername" @keydown.enter.prevent="($event.target as HTMLInputElement).blur()" @keydown.escape.prevent="cancelUsernameEdit">
+                    <small v-if="usernameSaving">保存中…</small>
+                  </template>
+                  <template v-else><strong>{{ account.username }}</strong><button type="button" class="edit-username" aria-label="编辑用户名" @click="startUsernameEdit"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.8 4 4-.8L18.5 7.9l-3.2-3.2L4 16Z"/></svg><span>编辑</span></button></template>
+                </div>
+                <p v-if="usernameError" class="form-error username-error">{{ usernameError }}</p>
+              </div>
+              <button type="button" class="secondary password-entry" @click="openAccountPanel('password')">修改密码</button>
             </section>
 
-            <template v-if="!twoFactor.enabled">
-              <div v-if="twoFactor.stage==='idle'" class="two-factor-idle">
-                <p>启用后，登录时除密码外还需输入身份验证器生成的 6 位验证码。</p>
-                <label>当前密码<input v-model="twoFactor.currentPassword" type="password" autocomplete="current-password" maxlength="1024" placeholder="确认是你本人"></label>
-                <button type="button" class="primary" :disabled="twoFactor.busy" @click="beginTwoFactorSetup">{{ twoFactor.busy?'正在生成…':'设置两步验证' }}</button>
-              </div>
-              <div v-else class="totp-enroll">
-                <div class="totp-qr"><img :src="twoFactor.qrDataURL" alt="两步验证二维码"></div>
-                <div class="totp-instructions">
-                  <h4>扫描二维码</h4><p>用身份验证器扫描二维码，然后输入应用中显示的验证码完成绑定。</p>
-                  <p class="manual-secret">无法扫码？手动输入密钥 <code>{{ twoFactor.secret }}</code></p>
-                  <label>6 位验证码<input v-model="twoFactor.code" autocomplete="one-time-code" inputmode="numeric" maxlength="8" placeholder="000000"></label>
-                  <div class="two-factor-actions"><button type="button" class="secondary" :disabled="twoFactor.busy" @click="cancelTwoFactorSetup">取消</button><button type="button" class="primary" :disabled="twoFactor.busy" @click="enableTwoFactor">{{ twoFactor.busy?'正在验证…':'启用并生成恢复码' }}</button></div>
+            <section class="account-setting-row security-row">
+              <div class="setting-copy"><div class="setting-title"><span class="setting-label">两步验证</span><span class="security-badge" :class="{enabled:twoFactor.enabled}">{{ twoFactor.enabled?'已启用':'未启用' }}</span></div><p>{{ twoFactor.enabled?`身份验证器已启用，剩余 ${twoFactor.recoveryRemaining} 枚恢复码。`:'使用 TOTP 验证码保护管理员登录。' }}</p></div>
+              <button type="button" class="secondary" :disabled="twoFactor.loading" @click="openAccountPanel('totp')">{{ twoFactor.loading?'读取中…':twoFactor.enabled?'管理':'设置' }}</button>
+            </section>
+            <p v-if="twoFactor.error&&!accountPanel" class="form-error">{{ twoFactor.error }}</p>
+          </div>
+        </div>
+
+        <div v-if="accountPanel" class="account-subdialog-backdrop" @click.self="closeAccountPanel">
+          <section v-if="accountPanel==='password'" class="modal account-subdialog password-dialog">
+            <header><div><p class="eyebrow dark">SECURITY</p><h2>修改密码</h2><p class="subdialog-hint">修改成功后，所有设备都需要使用新密码重新登录。</p></div><button type="button" aria-label="关闭" @click="closeAccountPanel">×</button></header>
+            <form @submit.prevent="savePassword">
+              <label>当前密码<input v-model="account.currentPassword" type="password" autocomplete="current-password" maxlength="1024" autofocus required></label>
+              <label>新密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label>
+              <label>确认新密码<input v-model="account.confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label>
+              <p v-if="account.error" class="form-error">{{ account.error }}</p>
+              <footer><button type="button" class="secondary" @click="closeAccountPanel">取消</button><button class="primary" :disabled="modalBusy">{{ modalBusy?'正在修改…':'修改密码' }}</button></footer>
+            </form>
+          </section>
+
+          <section v-else class="modal account-subdialog totp-dialog">
+            <header><div><p class="eyebrow dark">SECURITY</p><h2>两步验证</h2><p class="subdialog-hint">使用兼容 TOTP 的身份验证器保护管理员登录。</p></div><button type="button" aria-label="关闭" @click="closeAccountPanel">×</button></header>
+            <div v-if="twoFactor.loading" class="two-factor-loading"><div class="spinner"></div><span>正在读取安全设置…</span></div>
+            <template v-else>
+              <section v-if="twoFactor.recoveryCodes.length" class="recovery-panel">
+                <div><strong>立即保存恢复码</strong><p>每枚恢复码只能使用一次。关闭窗口后将无法再次查看。</p></div>
+                <div class="recovery-grid"><code v-for="code in twoFactor.recoveryCodes" :key="code">{{ code }}</code></div>
+                <div class="recovery-actions"><button type="button" class="secondary" @click="copyRecoveryCodes">{{ twoFactor.copied?'已复制':'复制恢复码' }}</button><button type="button" class="secondary" @click="downloadRecoveryCodes">下载文本</button></div>
+              </section>
+              <template v-if="!twoFactor.enabled">
+                <div v-if="twoFactor.stage==='idle'" class="two-factor-idle">
+                  <p>启用后，登录时除密码外还需输入身份验证器生成的 6 位验证码。</p>
+                  <label>当前密码<input v-model="twoFactor.currentPassword" type="password" autocomplete="current-password" maxlength="1024" placeholder="确认是你本人"></label>
+                  <button type="button" class="primary" :disabled="twoFactor.busy" @click="beginTwoFactorSetup">{{ twoFactor.busy?'正在生成…':'开始设置' }}</button>
                 </div>
+                <div v-else class="totp-enroll">
+                  <div class="totp-qr"><img :src="twoFactor.qrDataURL" alt="两步验证二维码"></div>
+                  <div class="totp-instructions">
+                    <h4>扫描二维码</h4><p>用身份验证器扫描二维码，然后输入应用中显示的验证码完成绑定。</p>
+                    <p class="manual-secret">无法扫码？手动输入密钥 <code>{{ twoFactor.secret }}</code></p>
+                    <label>6 位验证码<input v-model="twoFactor.code" autocomplete="one-time-code" inputmode="numeric" maxlength="8" placeholder="000000"></label>
+                    <div class="two-factor-actions"><button type="button" class="secondary" :disabled="twoFactor.busy" @click="cancelTwoFactorSetup">返回</button><button type="button" class="primary" :disabled="twoFactor.busy" @click="enableTwoFactor">{{ twoFactor.busy?'正在验证…':'启用并生成恢复码' }}</button></div>
+                  </div>
+                </div>
+              </template>
+              <div v-else class="two-factor-enabled">
+                <p>剩余 <strong>{{ twoFactor.recoveryRemaining }}</strong> 枚恢复码。重新生成或关闭验证前，需要再次确认当前密码和验证码。</p>
+                <div class="two-factor-fields"><label>当前密码<input v-model="twoFactor.currentPassword" type="password" autocomplete="current-password" maxlength="1024"></label><label>验证码或恢复码<input v-model="twoFactor.code" autocomplete="one-time-code" maxlength="128"></label></div>
+                <div class="two-factor-actions"><button type="button" class="secondary" :disabled="twoFactor.busy" @click="regenerateRecoveryCodes">重新生成恢复码</button><button type="button" class="danger-button" :disabled="twoFactor.busy" @click="disableTwoFactor">关闭两步验证</button></div>
               </div>
             </template>
-
-            <div v-else class="two-factor-enabled">
-              <p>剩余 <strong>{{ twoFactor.recoveryRemaining }}</strong> 枚恢复码。重新生成或关闭验证前，需要再次确认当前密码和验证码。</p>
-              <div class="two-factor-fields"><label>当前密码<input v-model="twoFactor.currentPassword" type="password" autocomplete="current-password" maxlength="1024"></label><label>验证码或恢复码<input v-model="twoFactor.code" autocomplete="one-time-code" maxlength="128"></label></div>
-              <div class="two-factor-actions"><button type="button" class="secondary" :disabled="twoFactor.busy" @click="regenerateRecoveryCodes">重新生成恢复码</button><button type="button" class="danger-button" :disabled="twoFactor.busy" @click="disableTwoFactor">关闭两步验证</button></div>
-            </div>
-          </template>
-          <p v-if="twoFactor.error" class="form-error two-factor-error">{{ twoFactor.error }}</p>
-        </section>
+            <p v-if="twoFactor.error" class="form-error two-factor-error">{{ twoFactor.error }}</p>
+          </section>
+        </div>
       </section>
       <section v-else-if="modal==='editor'" class="document-editor">
         <header class="editor-header">

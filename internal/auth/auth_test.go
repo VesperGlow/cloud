@@ -94,6 +94,31 @@ func TestChangeCredentialsRevokesSessions(t *testing.T) {
 	}
 }
 
+func TestChangeUsernameKeepsSessionAndPassword(t *testing.T) {
+	db, err := database.Open(t.TempDir() + "/revaro.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	svc := &Service{DB: db, Params: testParams}
+	if _, err := svc.Initialize(context.Background(), "admin", "a-secure-test-password"); err != nil {
+		t.Fatal(err)
+	}
+	token, _, err := svc.Login(context.Background(), "admin", "a-secure-test-password", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ChangeUsername(context.Background(), " owner "); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := svc.Authenticate(context.Background(), token); err != nil || got != "owner" {
+		t.Fatalf("renamed session authenticate = %q, %v", got, err)
+	}
+	if _, _, err := svc.Login(context.Background(), "owner", "a-secure-test-password", ""); err != nil {
+		t.Fatalf("renamed login was rejected: %v", err)
+	}
+}
+
 func TestResetCredentialsRecoversExistingDatabase(t *testing.T) {
 	db, err := database.Open(t.TempDir() + "/revaro.db")
 	if err != nil {
