@@ -28,7 +28,7 @@ jobs:
       - name: Audit production web dependencies
         working-directory: web
         run: npm audit --omit=dev --audit-level=moderate
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
