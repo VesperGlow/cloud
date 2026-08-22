@@ -22,6 +22,11 @@ const sessionLifetime = 30 * 24 * time.Hour
 
 var ErrInvalidCredentials = errors.New("invalid credentials")
 
+// Argon2 deliberately consumes a large amount of memory. Keep all
+// request-triggered password operations inside a small global pool so a burst
+// of concurrent logins or credential changes cannot exhaust the process.
+var kdfSlots = make(chan struct{}, 2)
+
 type InitialCredentials struct {
 	Created   bool
 	Generated bool
@@ -65,7 +70,7 @@ func (s *Service) Initialize(ctx context.Context, username, password string) (In
 	if len(username) > 128 || len(password) < 12 || len(password) > 1024 {
 		return InitialCredentials{}, errors.New("administrator username/password length is invalid (password minimum is 12 characters)")
 	}
-	hash, err := HashPassword(password, s.params())
+	hash, err := s.hashPassword(ctx, password)
 	if err != nil {
 		return InitialCredentials{}, err
 	}
@@ -135,11 +140,11 @@ func (s *Service) ChangeCredentials(ctx context.Context, currentUsername, curren
 		if err := json.Unmarshal([]byte(rawSecret), &encrypted); err != nil {
 			return fmt.Errorf("decode TOTP secret: %w", err)
 		}
-		secret, err := decryptSecret(currentPassword, encrypted)
+		secret, err := s.decryptSecret(ctx, currentPassword, encrypted)
 		if err != nil {
 			return fmt.Errorf("decrypt TOTP secret: %w", err)
 		}
-		next, err := encryptSecret(newPassword, secret, s.params())
+		next, err := s.encryptSecret(ctx, newPassword, secret)
 		if err != nil {
 			return err
 		}
@@ -147,7 +152,7 @@ func (s *Service) ChangeCredentials(ctx context.Context, currentUsername, curren
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	newHash, err := HashPassword(newPassword, s.params())
+	newHash, err := s.hashPassword(ctx, newPassword)
 	if err != nil {
 		return err
 	}
@@ -211,7 +216,7 @@ func (s *Service) ResetCredentials(ctx context.Context, username string) (Initia
 		return InitialCredentials{}, errors.New("administrator username length is invalid")
 	}
 	password := rand.Text()
-	hash, err := HashPassword(password, s.params())
+	hash, err := s.hashPassword(ctx, password)
 	if err != nil {
 		return InitialCredentials{}, err
 	}
@@ -286,11 +291,53 @@ func (s *Service) verifyCredentials(ctx context.Context, username, password stri
 	if err := s.DB.QueryRowContext(ctx, `SELECT value FROM settings WHERE key='admin_password_hash'`).Scan(&savedHash); err != nil {
 		return err
 	}
-	valid, err := VerifyPassword(password, savedHash)
+	var valid bool
+	err := withKDF(ctx, func() error {
+		var verifyErr error
+		valid, verifyErr = VerifyPassword(password, savedHash)
+		return verifyErr
+	})
 	if err != nil || subtle.ConstantTimeCompare([]byte(username), []byte(savedUser)) != 1 || !valid {
 		return ErrInvalidCredentials
 	}
 	return nil
+}
+
+func withKDF(ctx context.Context, fn func() error) error {
+	select {
+	case kdfSlots <- struct{}{}:
+		defer func() { <-kdfSlots }()
+		return fn()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Service) hashPassword(ctx context.Context, password string) (hash string, err error) {
+	err = withKDF(ctx, func() error {
+		var hashErr error
+		hash, hashErr = HashPassword(password, s.params())
+		return hashErr
+	})
+	return hash, err
+}
+
+func (s *Service) encryptSecret(ctx context.Context, password, secret string) (encrypted encryptedSecret, err error) {
+	err = withKDF(ctx, func() error {
+		var encryptErr error
+		encrypted, encryptErr = encryptSecret(password, secret, s.params())
+		return encryptErr
+	})
+	return encrypted, err
+}
+
+func (s *Service) decryptSecret(ctx context.Context, password string, encrypted encryptedSecret) (secret string, err error) {
+	err = withKDF(ctx, func() error {
+		var decryptErr error
+		secret, decryptErr = decryptSecret(password, encrypted)
+		return decryptErr
+	})
+	return secret, err
 }
 func TokenHash(token string) string {
 	sum := sha256.Sum256([]byte(token))

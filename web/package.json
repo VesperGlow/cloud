@@ -10,7 +10,7 @@
     "lint": "eslint ."
   },
   "dependencies": {
-    "dompurify": "3.3.3",
+    "dompurify": "3.4.14",
     "marked": "17.0.5",
     "vue": "3.5.41"
   },

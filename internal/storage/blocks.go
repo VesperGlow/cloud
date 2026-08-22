@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -54,6 +55,16 @@ func ValidBlockID(id string) bool {
 	return hex.EncodeToString(raw) == id
 }
 
+// BlockChecksumSHA256 converts the canonical hex block id into the checksum
+// representation required by S3's x-amz-checksum-sha256 header.
+func BlockChecksumSHA256(id string) (string, error) {
+	if !ValidBlockID(id) {
+		return "", errors.New("invalid block id")
+	}
+	raw, _ := hex.DecodeString(id)
+	return base64.StdEncoding.EncodeToString(raw), nil
+}
+
 func BlockKey(id string) string     { return blockPrefix + id[:2] + "/" + id[2:] }
 func ManifestKey(id string) string  { return manifestPrefix + id[:2] + "/" + id[2:] }
 func IsManifestKey(key string) bool { return strings.HasPrefix(key, manifestPrefix) }
@@ -80,8 +91,8 @@ func (s *S3) PutManifest(ctx context.Context, m Manifest) (string, error) {
 	if m.Version == 0 {
 		m.Version = 1
 	}
-	if m.Size != blocksSize(m.Blocks) {
-		return "", errors.New("manifest size does not match its blocks")
+	if err := validateManifest(m); err != nil {
+		return "", err
 	}
 	key := m.Key()
 	if err := s.putConditional(ctx, key, manifestMime, m.bytes()); err != nil {
@@ -100,21 +111,36 @@ func (s *S3) GetManifest(ctx context.Context, key string) (Manifest, error) {
 	if err := json.NewDecoder(out.Body).Decode(&m); err != nil {
 		return Manifest{}, fmt.Errorf("decode manifest %s: %w", key, err)
 	}
-	if m.Version != 1 {
-		return Manifest{}, fmt.Errorf("manifest %s has unsupported version %d", key, m.Version)
+	if err := validateManifest(m); err != nil {
+		return Manifest{}, fmt.Errorf("manifest %s is invalid: %w", key, err)
 	}
-	if m.Size != blocksSize(m.Blocks) {
-		return Manifest{}, fmt.Errorf("manifest %s size does not match its blocks", key)
+	if key != m.Key() {
+		return Manifest{}, fmt.Errorf("manifest %s content hash does not match its key", key)
 	}
 	return m, nil
 }
 
-func blocksSize(blocks []Block) int64 {
+func validateManifest(m Manifest) error {
+	if m.Version != 1 {
+		return fmt.Errorf("unsupported version %d", m.Version)
+	}
+	if m.Size < 0 {
+		return errors.New("negative size")
+	}
 	var total int64
-	for _, b := range blocks {
+	for _, b := range m.Blocks {
+		if !ValidBlockID(b.ID) || b.Size <= 0 {
+			return errors.New("invalid block entry")
+		}
+		if total > m.Size-b.Size {
+			return errors.New("block sizes overflow or exceed manifest size")
+		}
 		total += b.Size
 	}
-	return total
+	if total != m.Size {
+		return errors.New("size does not match blocks")
+	}
+	return nil
 }
 
 // Store splits a stream with FastCDC, stores each block under its

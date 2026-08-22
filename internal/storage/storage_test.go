@@ -59,12 +59,13 @@ func TestPresignBlockPutUsesBrowserEndpointAndConditionalHeader(t *testing.T) {
 		t.Fatalf("presigned path = %q, want %q", u.Path, want)
 	}
 	signedHeaders := u.Query().Get("X-Amz-SignedHeaders")
+	headers := map[string]bool{}
 	for _, h := range strings.Split(signedHeaders, ";") {
-		if h == "if-none-match" {
-			return
-		}
+		headers[h] = true
 	}
-	t.Fatalf("signed headers %q do not include if-none-match", signedHeaders)
+	if !headers["if-none-match"] || !headers["x-amz-checksum-sha256"] {
+		t.Fatalf("signed headers %q do not bind conditional write and checksum", signedHeaders)
+	}
 }
 
 func TestManifestIDAndKeyAreContentAddressed(t *testing.T) {
@@ -84,6 +85,25 @@ func TestManifestIDAndKeyAreContentAddressed(t *testing.T) {
 	other := Manifest{Version: 1, Size: 7, Blocks: []Block{{ID: block.ID, Size: 7}}}
 	if other.ID() == id {
 		t.Fatal("different manifests share an id")
+	}
+}
+
+func TestManifestValidationRejectsInvalidBlocksAndSizes(t *testing.T) {
+	validID := strings.Repeat("01", 32)
+	for name, manifest := range map[string]Manifest{
+		"version": {Version: 2},
+		"block id": {Version: 1, Size: 1, Blocks: []Block{{ID: "bad", Size: 1}}},
+		"block size": {Version: 1, Size: 0, Blocks: []Block{{ID: validID, Size: 0}}},
+		"total": {Version: 1, Size: 2, Blocks: []Block{{ID: validID, Size: 1}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateManifest(manifest); err == nil {
+				t.Fatal("invalid manifest was accepted")
+			}
+		})
+	}
+	if err := validateManifest(Manifest{Version: 1}); err != nil {
+		t.Fatalf("empty file manifest rejected: %v", err)
 	}
 }
 

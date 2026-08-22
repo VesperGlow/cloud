@@ -40,7 +40,9 @@ const maxDocumentBytes = 1 << 20
 const maxAvatarBytes = 2 << 20
 const avatarObjectKey = "profile/avatar"
 const maxBlocksPerRequest = 1000
-const maxCompleteBody = 256 << 20
+const maxCompleteBody = 32 << 20
+const maxManifestBlocks = 262144
+const maxLogicalFileSize = 1 << 40 // 1 TiB
 
 type Server struct {
 	db       *sql.DB
@@ -50,6 +52,8 @@ type Server struct {
 	log      *slog.Logger
 	limiter  *loginLimiter
 	s3Origin string // S3_PUBLIC_ENDPOINT 的 scheme://host，用于收窄 CSP
+	shareSlots       chan struct{}
+	blockUploadSlots chan struct{}
 }
 
 type File struct {
@@ -76,12 +80,16 @@ func New(db *sql.DB, store storage.Storage, a *auth.Service, cfg config.Config, 
 	if u, err := url.Parse(cfg.S3PublicEndpoint); err == nil && u.Host != "" {
 		s3Origin = u.Scheme + "://" + u.Host
 	}
-	return &Server{db: db, storage: store, auth: a, cfg: cfg, log: logger, limiter: newLoginLimiter(), s3Origin: s3Origin}
+	return &Server{
+		db: db, storage: store, auth: a, cfg: cfg, log: logger,
+		limiter: newLoginLimiter(), s3Origin: s3Origin,
+		shareSlots: make(chan struct{}, 8), blockUploadSlots: make(chan struct{}, 4),
+	}
 }
 
 func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, s.securityHeaders, s.originGuard)
+	r.Use(middleware.RequestID, middleware.Recoverer, s.securityHeaders, s.originGuard)
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -164,14 +172,18 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		mediaSrc += " https: http:"
 		connectSrc += " https: http:"
 	}
-	csp := "default-src 'self'; img-src " + imgSrc + "; media-src " + mediaSrc +
+	csp := "default-src 'self'; script-src 'self'; img-src " + imgSrc + "; media-src " + mediaSrc +
 		"; style-src 'self' 'unsafe-inline'; connect-src " + connectSrc +
-		"; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+		"; object-src 'none'; base-uri 'self'; form-action 'self'; frame-src 'none'; frame-ancestors 'none'"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "same-origin")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
 		w.Header().Set("Content-Security-Policy", csp)
+		if strings.HasPrefix(s.cfg.BaseURL, "https://") {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
@@ -206,6 +218,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		ip = r.RemoteAddr
 	}
 	if !s.limiter.allow(ip) {
+		w.Header().Set("Retry-After", "60")
 		problem(w, http.StatusTooManyRequests, "too many login attempts; try again later")
 		return
 	}
@@ -222,6 +235,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
+	if !s.limiter.acquire() {
+		w.Header().Set("Retry-After", "2")
+		problem(w, http.StatusTooManyRequests, "login verification is busy; try again shortly")
+		return
+	}
+	defer s.limiter.release()
 	token, expires, err := s.auth.Login(r.Context(), in.Username, in.Password, in.SecondFactor)
 	if err != nil {
 		switch {
@@ -1088,12 +1107,16 @@ func (s *Server) streamFile(w http.ResponseWriter, r *http.Request, inline bool)
 // disabled. Multi-block files always stream through the server with Range
 // support, and legacy whole-object keys work until startup migration finishes.
 func (s *Server) serveFileContent(w http.ResponseWriter, r *http.Request, f File, inline bool) {
+	mimeType := safeDeliveryMime(responseMime(f))
+	if mimeType == "application/octet-stream" {
+		inline = false
+	}
 	if !storage.IsManifestKey(f.objectKey) {
 		if s.cfg.ProxyTransfers {
 			s.serveRawObject(w, r, f, inline)
 			return
 		}
-		u, err := s.storage.PresignGetObject(r.Context(), f.objectKey, f.Name, responseMime(f), inline, s.cfg.PresignExpires)
+		u, err := s.storage.PresignGetObject(r.Context(), f.objectKey, f.Name, mimeType, inline, s.cfg.PresignExpires)
 		if err != nil {
 			problem(w, 502, "could not create download URL")
 			return
@@ -1108,7 +1131,7 @@ func (s *Server) serveFileContent(w http.ResponseWriter, r *http.Request, f File
 		return
 	}
 	if len(m.Blocks) == 1 && !s.cfg.ProxyTransfers {
-		u, err := s.storage.PresignGetObject(r.Context(), storage.BlockKey(m.Blocks[0].ID), f.Name, responseMime(f), inline, s.cfg.PresignExpires)
+		u, err := s.storage.PresignGetObject(r.Context(), storage.BlockKey(m.Blocks[0].ID), f.Name, mimeType, inline, s.cfg.PresignExpires)
 		if err != nil {
 			problem(w, 502, "could not create download URL")
 			return
@@ -1123,7 +1146,7 @@ func (s *Server) serveFileContent(w http.ResponseWriter, r *http.Request, f File
 		return
 	}
 	defer rc.Close()
-	w.Header().Set("Content-Type", responseMime(f))
+	w.Header().Set("Content-Type", mimeType)
 	disposition := "attachment"
 	if inline {
 		disposition = "inline"
@@ -1137,6 +1160,10 @@ func (s *Server) serveFileContent(w http.ResponseWriter, r *http.Request, f File
 }
 
 func (s *Server) serveRawObject(w http.ResponseWriter, r *http.Request, f File, inline bool) {
+	mimeType := safeDeliveryMime(responseMime(f))
+	if mimeType == "application/octet-stream" {
+		inline = false
+	}
 	rc, err := s.storage.OpenRaw(r.Context(), f.objectKey)
 	if err != nil {
 		s.log.Error("legacy object open failed", "file", f.ID, "error", err)
@@ -1144,7 +1171,7 @@ func (s *Server) serveRawObject(w http.ResponseWriter, r *http.Request, f File, 
 		return
 	}
 	defer rc.Close()
-	w.Header().Set("Content-Type", responseMime(f))
+	w.Header().Set("Content-Type", mimeType)
 	disposition := "attachment"
 	if inline {
 		disposition = "inline"
@@ -1218,6 +1245,22 @@ func responseMime(f File) string {
 		return "text/plain; charset=utf-8"
 	default:
 		return f.MimeType
+	}
+}
+
+// Active web formats must never be served with an executable MIME type from
+// the application origin. They remain downloadable as opaque bytes.
+func safeDeliveryMime(value string) string {
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		return "application/octet-stream"
+	}
+	switch strings.ToLower(mediaType) {
+	case "text/html", "application/xhtml+xml", "image/svg+xml", "application/xml", "text/xml",
+		"application/javascript", "text/javascript", "application/ecmascript", "text/ecmascript":
+		return "application/octet-stream"
+	default:
+		return value
 	}
 }
 
@@ -1297,10 +1340,19 @@ func (s *Server) publicShare(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Robots-Tag", "noindex, nofollow, noarchive")
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'")
+	select {
+	case s.shareSlots <- struct{}{}:
+		defer func() { <-s.shareSlots }()
+	default:
+		w.Header().Set("Retry-After", "5")
+		problem(w, http.StatusTooManyRequests, "public downloads are busy; try again shortly")
+		return
+	}
 	// 分享 URL 等同于访问凭据，记录每次访问（token 只记前缀掩码），
 	// 便于发现泄露后定位访问来源。
 	s.log.Info("public share served", "file_id", f.ID, "file", f.Name, "token_prefix", token[:min(len(token), 8)])
-	s.serveFileContent(w, r, f, true)
+	s.serveFileContent(w, r, f, isPreviewable(f))
 }
 
 type createUploadInput struct {
@@ -1319,7 +1371,7 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, err.Error())
 		return
 	}
-	if in.Size < 0 || in.Size > 5*1024*1024*1024*1024 {
+	if in.Size < 0 || in.Size > maxLogicalFileSize {
 		problem(w, 400, "invalid file size")
 		return
 	}
@@ -1411,10 +1463,11 @@ type uploadBlockRequest struct {
 	Size int64  `json:"size"`
 }
 type uploadBlockResponse struct {
-	ID     string `json:"id"`
-	Size   int64  `json:"size"`
-	Exists bool   `json:"exists"`
-	URL    string `json:"url,omitempty"`
+	ID             string `json:"id"`
+	Size           int64  `json:"size"`
+	Exists         bool   `json:"exists"`
+	URL            string `json:"url,omitempty"`
+	ChecksumSHA256 string `json:"checksum_sha256,omitempty"`
 }
 
 // uploadBlocks returns either conditional presigned PUT URLs or same-origin
@@ -1468,7 +1521,11 @@ func (s *Server) uploadBlocks(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			return e
 		}
-		results[i] = uploadBlockResponse{ID: b.ID, Size: b.Size, URL: uurl}
+		checksum, e := storage.BlockChecksumSHA256(b.ID)
+		if e != nil {
+			return e
+		}
+		results[i] = uploadBlockResponse{ID: b.ID, Size: b.Size, URL: uurl, ChecksumSHA256: checksum}
 		return nil
 	}); err != nil {
 		s.log.Error("block registration failed", "upload", u.ID, "error", err)
@@ -1502,6 +1559,12 @@ func (s *Server) putUploadBlock(w http.ResponseWriter, r *http.Request) {
 	deadline := time.Now().Add(15 * time.Minute)
 	_ = controller.SetReadDeadline(deadline)
 	_ = controller.SetWriteDeadline(deadline)
+	select {
+	case s.blockUploadSlots <- struct{}{}:
+		defer func() { <-s.blockUploadSlots }()
+	case <-r.Context().Done():
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, u.MaxBlockSize)
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -1539,6 +1602,10 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 		Blocks []storage.Block `json:"blocks"`
 	}
 	if decodeJSONLimit(w, r, &body, maxCompleteBody) != nil {
+		return
+	}
+	if len(body.Blocks) > maxManifestBlocks {
+		problem(w, 400, "complete block list is too large")
 		return
 	}
 	if u.ExpectedSize > 0 && len(body.Blocks) == 0 {
@@ -1808,12 +1875,28 @@ func (s *Server) CollectGarbage(ctx context.Context) {
 		s.log.Error("GC metadata scan failed", "error", err)
 		return
 	}
+	// Resolve every referenced manifest directly from metadata before relying
+	// on an eventually-consistent object listing. If even one cannot be read,
+	// its block set is unknown and deleting any block would be unsafe.
+	keepBlocks := map[string]bool{}
+	for key := range referenced {
+		if !storage.IsManifestKey(key) {
+			continue
+		}
+		m, err := s.storage.GetManifest(ctx, key)
+		if err != nil {
+			s.log.Error("GC aborted: referenced manifest unreadable", "key", key, "error", err)
+			return
+		}
+		for _, b := range m.Blocks {
+			keepBlocks[b.ID] = true
+		}
+	}
 	manifests, err := s.storage.ListManifests(ctx)
 	if err != nil {
 		s.log.Error("GC manifest listing failed", "error", err)
 		return
 	}
-	keepBlocks := map[string]bool{}
 	var doomedManifests []string
 	for _, ref := range manifests {
 		// 未被任何元数据引用的清单无需解析内容：年龄超过宽限期即可回收。
@@ -1822,17 +1905,6 @@ func (s *Server) CollectGarbage(ctx context.Context) {
 				doomedManifests = append(doomedManifests, ref.Key)
 			}
 			continue
-		}
-		// 被引用的清单必须解析出块列表才能安全回收孤儿块；读取失败时
-		// 中止本轮 GC——其块集合未知，绝不能按孤儿处理（否则瞬时 S3
-		// 错误会演变成被引用文件的内容块被误删）。
-		m, err := s.storage.GetManifest(ctx, ref.Key)
-		if err != nil {
-			s.log.Error("GC aborted: referenced manifest unreadable", "key", ref.Key, "error", err)
-			return
-		}
-		for _, b := range m.Blocks {
-			keepBlocks[b.ID] = true
 		}
 	}
 	var deletedManifests, deletedBlocks, deletedLegacy int
@@ -2014,14 +2086,25 @@ type loginAttempt struct {
 type loginLimiter struct {
 	mu       sync.Mutex
 	attempts map[string]loginAttempt
+	global   loginAttempt
+	slots    chan struct{}
 }
 
-func newLoginLimiter() *loginLimiter { return &loginLimiter{attempts: map[string]loginAttempt{}} }
+func newLoginLimiter() *loginLimiter {
+	return &loginLimiter{attempts: map[string]loginAttempt{}, slots: make(chan struct{}, 2)}
+}
 func (l *loginLimiter) allow(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := time.Now()
+	if now.After(l.global.reset) {
+		l.global = loginAttempt{}
+	}
+	if l.global.count >= 30 {
+		return false
+	}
 	a := l.attempts[ip]
-	if time.Now().After(a.reset) {
+	if now.After(a.reset) {
 		delete(l.attempts, ip)
 		return true
 	}
@@ -2030,11 +2113,25 @@ func (l *loginLimiter) allow(ip string) bool {
 func (l *loginLimiter) fail(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := time.Now()
 	a := l.attempts[ip]
-	if time.Now().After(a.reset) {
-		a = loginAttempt{reset: time.Now().Add(15 * time.Minute)}
+	if now.After(a.reset) {
+		a = loginAttempt{reset: now.Add(15 * time.Minute)}
 	}
 	a.count++
 	l.attempts[ip] = a
+	if now.After(l.global.reset) {
+		l.global = loginAttempt{reset: now.Add(15 * time.Minute)}
+	}
+	l.global.count++
 }
 func (l *loginLimiter) success(ip string) { l.mu.Lock(); delete(l.attempts, ip); l.mu.Unlock() }
+func (l *loginLimiter) acquire() bool {
+	select {
+	case l.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+func (l *loginLimiter) release() { <-l.slots }

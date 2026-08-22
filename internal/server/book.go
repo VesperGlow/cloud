@@ -93,7 +93,7 @@ func (s *Server) bookContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if book.Format == "epub" {
-		writeJSON(w, http.StatusOK, map[string]any{"kind": "epub", "html": book.HTML, "chapters": book.Chapters, "toc": book.TOC})
+		writeJSON(w, http.StatusOK, map[string]any{"kind": "epub", "chapters": book.Chapters, "toc": book.TOC})
 	} else {
 		writeJSON(w, http.StatusOK, map[string]any{"kind": "txt", "text": book.Text, "toc": book.TOC})
 	}
@@ -115,7 +115,7 @@ func (s *Server) bookAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	asset := book.Assets[idx]
-	w.Header().Set("Content-Type", asset.ContentType)
+	w.Header().Set("Content-Type", safeDeliveryMime(asset.ContentType))
 	w.Header().Set("Content-Length", strconv.Itoa(len(asset.Data)))
 	// 资产内容由清单键（内容哈希）派生，天然不可变，可长期缓存
 	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
@@ -137,7 +137,11 @@ func (s *Server) bookCover(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusNotFound, "这本书没有内嵌封面")
 		return
 	}
-	w.Header().Set("Content-Type", reader.AssetContentType(book.CoverExt))
+	coverType := safeDeliveryMime(reader.AssetContentType(book.CoverExt))
+	w.Header().Set("Content-Type", coverType)
+	if coverType == "application/octet-stream" {
+		w.Header().Set("Content-Disposition", "attachment")
+	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(book.Cover)))
 	// 封面 URL 不带版本参数，不能 immutable；短缓存即可
 	w.Header().Set("Cache-Control", "private, max-age=3600")

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"strings"
 	"testing"
+	unicodeutf16 "unicode/utf16"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 )
@@ -64,10 +65,10 @@ func TestParseEPUBPipeline(t *testing.T) {
 	if entry.Label != "第一章" || entry.Path != "OEBPS/ch1.xhtml" || entry.Fragment != "sec1" || entry.Depth != 0 {
 		t.Fatalf("toc entry=%+v", entry)
 	}
-	htmlOut := book.HTML
 	if len(book.Chapters) != 1 || !strings.Contains(book.Chapters[0].HTML, "你好世界") {
 		t.Fatalf("chapters=%+v", book.Chapters)
 	}
+	htmlOut := book.Chapters[0].HTML
 	for _, want := range []string{"你好世界", "第一章 开始", `data-source-path="OEBPS/ch1.xhtml"`, `alt="插图"`} {
 		if !strings.Contains(htmlOut, want) {
 			t.Fatalf("html missing %q:\n%s", want, htmlOut)
@@ -114,7 +115,7 @@ func TestParseTXTTocAndOffsets(t *testing.T) {
 func utf16Len(s string) int64 {
 	total := 0
 	for _, r := range s {
-		total += len(string(r))
+		total += unicodeutf16.RuneLen(r)
 	}
 	return int64(total)
 }
@@ -194,6 +195,14 @@ func TestCacheEviction(t *testing.T) {
 	}
 	if cache.Get("a") == nil || cache.Get("c") == nil {
 		t.Fatal("recent entries should survive")
+	}
+}
+
+func TestCacheDoesNotRetainOversizedBook(t *testing.T) {
+	cache := NewCache(2, 100)
+	cache.Put("large", &Book{Format: "txt", Text: strings.Repeat("x", 101)})
+	if cache.Get("large") != nil {
+		t.Fatal("oversized book must not be cached")
 	}
 }
 

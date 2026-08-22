@@ -416,7 +416,7 @@ function acceptFiles(list:FileList|File[]){for(const file of Array.from(list)){t
 function onDrop(event:DragEvent){dragActive.value=false;if(!trashMode.value&&event.dataTransfer?.files.length)acceptFiles(event.dataTransfer.files)}
 function pumpQueue(){while(activeUploads<FILE_CONCURRENCY){const task=tasks.find(t=>t.status==='queued');if(!task)return;activeUploads++;runUpload(task).finally(()=>{activeUploads--;pumpQueue()})}}
 interface BlockSpec { id:string; size:number; offset:number }
-interface RegisteredBlock { id:string; size:number; exists:boolean; url?:string; offset:number }
+interface RegisteredBlock { id:string; size:number; exists:boolean; url?:string; checksum_sha256?:string; offset:number }
 interface ChunkingSpec { algorithm:'fastcdc-v1'; min_size:number; avg_size:number; max_size:number }
 interface CreatedUpload { upload_id:string; mode:'blocks'; block_size:number; block_count:number; chunking?:ChunkingSpec }
 interface HashJob { worker:Worker; reject:(reason?:unknown)=>void }
@@ -471,7 +471,7 @@ async function registerBlocks(task:UploadTask,uploadId:string,blocks:BlockSpec[]
   const out:RegisteredBlock[]=[]
   for(let from=0;from<blocks.length;from+=BLOCK_REGISTER_BATCH){
     const page=blocks.slice(from,from+BLOCK_REGISTER_BATCH)
-    const data=await api<{blocks:{id:string;size:number;exists:boolean;url?:string}[]}>(`/api/uploads/${uploadId}/blocks`,{method:'POST',body:JSON.stringify({blocks:page.map(b=>({id:b.id,size:b.size}))})})
+    const data=await api<{blocks:{id:string;size:number;exists:boolean;url?:string;checksum_sha256?:string}[]}>(`/api/uploads/${uploadId}/blocks`,{method:'POST',body:JSON.stringify({blocks:page.map(b=>({id:b.id,size:b.size}))})})
     // 服务端按顺序回显；把文件偏移重新挂回每个块。
     data.blocks.forEach((b,i)=>out.push({...b,offset:page[i].offset}))
   }
@@ -489,7 +489,7 @@ async function uploadBlocks(task:UploadTask,blocks:RegisteredBlock[]){
       if(task.cancelled)throw new Error('上传已取消')
       const b=blocks[idx]
       const blob=task.file.slice(b.offset,b.offset+b.size)
-      await xhrPutBlock(b.url!,blob,task,(loaded)=>{sent[idx]=loaded;task.progress=35+Math.floor(percentage(sent.reduce((a,x)=>a+x,0),total)*0.64)})
+      await xhrPutBlock(b.url!,blob,b.checksum_sha256,task,(loaded)=>{sent[idx]=loaded;task.progress=35+Math.floor(percentage(sent.reduce((a,x)=>a+x,0),total)*0.64)})
     }
   }
   await Promise.all(Array.from({length:Math.min(BLOCK_PUT_CONCURRENCY,blocks.length)},worker))
@@ -515,7 +515,7 @@ async function completeWithRepair(task:UploadTask,uploadId:string,blocks:BlockSp
   throw new Error('无法完成块校验，请重试')
 }
 
-function xhrPutBlock(url:string,body:Blob,task:UploadTask,onProgress:(n:number)=>void):Promise<void>{
+function xhrPutBlock(url:string,body:Blob,checksum:string|undefined,task:UploadTask,onProgress:(n:number)=>void):Promise<void>{
   return new Promise((resolve,reject)=>{
     const xhr=new XMLHttpRequest()
     const detach=()=>{task.requests=task.requests.filter(request=>request!==xhr)}
@@ -523,6 +523,7 @@ function xhrPutBlock(url:string,body:Blob,task:UploadTask,onProgress:(n:number)=
     xhr.open('PUT',url)
     xhr.setRequestHeader('Content-Type','application/octet-stream')
     xhr.setRequestHeader('If-None-Match','*')
+    if(checksum)xhr.setRequestHeader('x-amz-checksum-sha256',checksum)
     xhr.upload.onprogress=e=>{if(e.lengthComputable)onProgress(e.loaded)}
     xhr.onload=()=>{
       detach()

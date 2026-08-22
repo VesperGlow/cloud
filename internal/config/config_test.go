@@ -111,6 +111,10 @@ func TestLoadValidations(t *testing.T) {
 		{"bad gc interval", func(t *testing.T) { t.Setenv("GC_INTERVAL", "-1s") }},
 		{"bad bool", func(t *testing.T) { t.Setenv("S3_PATH_STYLE", "maybe") }},
 		{"bad proxy bool", func(t *testing.T) { t.Setenv("S3_PROXY_TRANSFERS", "maybe") }},
+		{"oversized proxied block", func(t *testing.T) {
+			t.Setenv("S3_PROXY_TRANSFERS", "true")
+			t.Setenv("FASTCDC_MAX_SIZE", "134217728")
+		}},
 		{"bad duration", func(t *testing.T) { t.Setenv("PRESIGN_EXPIRES", "soon") }},
 		{"bad endpoint", func(t *testing.T) { t.Setenv("S3_ENDPOINT", "minio://host") }},
 	}

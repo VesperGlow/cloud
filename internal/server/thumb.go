@@ -31,7 +31,7 @@ import (
 
 const maxThumbBytes = 512 << 10 // 缩略图对象上限
 const maxThumbSource = 64 << 20 // 生成缩略图时允许读取的源文件上限
-const maxThumbVideo = 2 << 30   // ffmpeg 抽帧的视频大小上限（2 GiB）
+const maxThumbVideo = 512 << 20 // ffmpeg 抽帧的视频大小上限（512 MiB）
 const thumbMaxDim = 480         // 缩略图最长边
 
 // maxThumbPixels caps the pixel dimensions of sources we decode: a small
@@ -46,11 +46,12 @@ var videoExts = map[string]bool{
 }
 
 // ffmpeg 抽帧全局并发上限：目录里多个视频首次生成时不至于打满 CPU/磁盘。
-var videoThumbSlots = make(chan struct{}, 2)
+var videoThumbSlots = make(chan struct{}, 1)
+var imageThumbSlots = make(chan struct{}, 2)
 
 // thumbKey 由清单键（内容哈希）派生，内容不变则缩略图键不变。
 func (s *Server) thumbKey(f File) string {
-	sum := sha256.Sum256([]byte(f.objectKey + "|thumb"))
+	sum := sha256.Sum256([]byte(f.objectKey + "|thumb-v2"))
 	id := hex.EncodeToString(sum[:])
 	return "thumbs/" + id[:2] + "/" + id[2:] + ".jpg"
 }
@@ -98,6 +99,10 @@ func (s *Server) generateThumb(ctx context.Context, f File) ([]byte, bool) {
 	ext := strings.ToLower(filepath.Ext(f.Name))
 	switch {
 	case ext == ".epub":
+		if !acquireThumbSlot(ctx, imageThumbSlots) {
+			return nil, false
+		}
+		defer func() { <-imageThumbSlots }()
 		book, err := s.loadBook(ctx, f)
 		if err != nil || len(book.Cover) == 0 {
 			return nil, false
@@ -105,9 +110,12 @@ func (s *Server) generateThumb(ctx context.Context, f File) ([]byte, bool) {
 		if resized, err := resizeToJPEG(book.Cover, thumbMaxDim); err == nil {
 			return resized, true
 		}
-		// 封面解码不了（如 SVG）就直接用原始字节，至少是可缓存的稳定 URL
-		return book.Cover, true
+		return nil, false
 	case ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif" || ext == ".webp" || ext == ".bmp":
+		if !acquireThumbSlot(ctx, imageThumbSlots) {
+			return nil, false
+		}
+		defer func() { <-imageThumbSlots }()
 		var raw []byte
 		var err error
 		if storage.IsManifestKey(f.objectKey) {
@@ -129,6 +137,15 @@ func (s *Server) generateThumb(ctx context.Context, f File) ([]byte, bool) {
 	return nil, false
 }
 
+func acquireThumbSlot(ctx context.Context, slots chan struct{}) bool {
+	select {
+	case slots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // generateVideoThumb 用 ffmpeg 在视频第 1 秒处抽一帧缩略 JPEG。视频会
 // 先流式落到临时文件（保证 moov 在文件尾的 MP4 也能正常 seek），抽帧后
 // 立即删除；生成结果持久化到 thumbs/，每个内容只付一次下载成本。
@@ -145,7 +162,9 @@ func (s *Server) generateVideoThumb(ctx context.Context, f File) ([]byte, bool) 
 	case <-ctx.Done():
 		return nil, false
 	}
-	rc, err := s.storage.Open(ctx, f.objectKey)
+	genCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	rc, err := s.storage.Open(genCtx, f.objectKey)
 	if err != nil {
 		return nil, false
 	}
@@ -156,14 +175,13 @@ func (s *Server) generateVideoThumb(ctx context.Context, f File) ([]byte, bool) 
 	}
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
-	if _, err := io.Copy(tmp, rc); err != nil {
+	n, err := io.Copy(tmp, io.LimitReader(rc, maxThumbVideo+1))
+	if err != nil || n > maxThumbVideo {
 		return nil, false
 	}
 	if err := tmp.Close(); err != nil {
 		return nil, false
 	}
-	genCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
 	cmd := exec.CommandContext(genCtx, s.cfg.FFmpegPath,
 		"-hide_banner", "-loglevel", "error",
 		"-ss", "1", "-i", tmp.Name(),
@@ -193,7 +211,7 @@ func (s *Server) generateVideoThumb(ctx context.Context, f File) ([]byte, bool) 
 	if err := cmd.Wait(); err != nil {
 		return nil, false
 	}
-	if len(data) == 0 || data[0] != 0xFF || data[1] != 0xD8 {
+	if len(data) < 2 || data[0] != 0xFF || data[1] != 0xD8 {
 		return nil, false
 	}
 	return data, true
@@ -220,7 +238,12 @@ func (s *Server) saveThumbnail(w http.ResponseWriter, r *http.Request) {
 		problem(w, http.StatusBadRequest, "thumbnail must be a JPEG image")
 		return
 	}
-	if err := s.storage.PutImmutable(r.Context(), s.thumbKey(f), "image/jpeg", data); err != nil {
+	normalized, err := resizeToJPEG(data, thumbMaxDim)
+	if err != nil || len(normalized) > maxThumbBytes {
+		problem(w, http.StatusBadRequest, "thumbnail data is invalid")
+		return
+	}
+	if err := s.storage.PutImmutable(r.Context(), s.thumbKey(f), "image/jpeg", normalized); err != nil {
 		s.log.Warn("thumbnail upload failed", "file", f.ID, "error", err)
 		problem(w, http.StatusBadGateway, "could not store thumbnail")
 		return

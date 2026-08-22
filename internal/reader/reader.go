@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	unicodeutf16 "unicode/utf16"
 	"unicode/utf8"
 
 	"golang.org/x/net/html"
@@ -35,6 +36,9 @@ const (
 	// 128 MiB compressed, but a pathological archive (zip bomb) can expand
 	// to many times that; without this cap parsing would exhaust memory.
 	maxDecompressedTotal = 256 << 20
+	maxDecompressedEntry = 64 << 20
+	maxRenderedHTML      = 64 << 20
+	maxArchiveEntries    = 10000
 )
 
 // budget tracks the total decompressed bytes consumed so far and rejects
@@ -73,7 +77,6 @@ type Chapter struct {
 type Book struct {
 	Format   string     // "epub" | "txt"
 	Title    string     // epub 书名；txt 为文件名
-	HTML     string     // epub 清洗后的全部正文（Chapters 拼接）
 	Chapters []Chapter  // epub 逐章正文
 	Text     string     // txt 全文（UTF-8）
 	TOC      []TocEntry // epub 目录或 txt 章节（UTF-16 偏移）
@@ -87,7 +90,10 @@ func (b *Book) bytes() int64 {
 	if b.size > 0 {
 		return b.size
 	}
-	n := int64(len(b.HTML) + len(b.Text) + len(b.Cover))
+	n := int64(len(b.Text) + len(b.Cover))
+	for _, chapter := range b.Chapters {
+		n += int64(len(chapter.HTML))
+	}
 	for _, a := range b.Assets {
 		n += int64(len(a.Data))
 	}
@@ -167,13 +173,45 @@ type manifestItem struct {
 	path, mediaType, properties string
 }
 
+type renderBudget struct {
+	used, max int64
+	overflow  bool
+}
+
+type limitedBuilder struct {
+	b strings.Builder
+	budget *renderBudget
+}
+
+func (b *limitedBuilder) Write(p []byte) (int, error) {
+	if b.budget.overflow || int64(len(p)) > b.budget.max-b.budget.used {
+		b.budget.overflow = true
+		return 0, io.ErrShortWrite
+	}
+	n, err := b.b.Write(p)
+	b.budget.used += int64(n)
+	return n, err
+}
+
+func (b *limitedBuilder) WriteString(value string) (int, error) {
+	return b.Write([]byte(value))
+}
+
+func (b *limitedBuilder) WriteByte(value byte) error {
+	_, err := b.Write([]byte{value})
+	return err
+}
+
+func (b *limitedBuilder) String() string { return b.b.String() }
+func (b *limitedBuilder) Reset() { b.b.Reset() }
+
 type epubBuilder struct {
 	zip          *zip.Reader
 	manifest     map[string]manifestItem
 	spine        []string
 	assets       []Asset
 	assetIndex   map[string]int
-	out          strings.Builder
+	out          limitedBuilder
 	pending      []string
 	chapter      string
 	assetBase    string
@@ -185,6 +223,9 @@ func parseEPUB(rs io.ReadSeeker, size int64, assetBase, assetVersion string) (*B
 	zr, err := zip.NewReader(&readSeekerAt{rs: rs}, size)
 	if err != nil {
 		return nil, fmt.Errorf("EPUB 不是有效的 zip: %w", err)
+	}
+	if len(zr.File) > maxArchiveEntries {
+		return nil, fmt.Errorf("EPUB 条目数量超过 %d 上限", maxArchiveEntries)
 	}
 	budget := &budget{}
 	container, err := zipText(zr, "META-INF/container.xml", budget)
@@ -204,6 +245,7 @@ func parseEPUB(rs io.ReadSeeker, size int64, assetBase, assetVersion string) (*B
 		return nil, fmt.Errorf("解析 OPF 失败: %w", err)
 	}
 
+	rendered := &renderBudget{max: maxRenderedHTML}
 	b := &epubBuilder{
 		zip:          zr,
 		manifest:     map[string]manifestItem{},
@@ -211,6 +253,10 @@ func parseEPUB(rs io.ReadSeeker, size int64, assetBase, assetVersion string) (*B
 		assetBase:    strings.TrimRight(assetBase, "/"),
 		assetVersion: assetVersion,
 		budget:       budget,
+		out:          limitedBuilder{budget: rendered},
+	}
+	if len(pkg.Manifest.Items) > maxArchiveEntries || len(pkg.Spine.Itemrefs) > maxArchiveEntries {
+		return nil, fmt.Errorf("EPUB 清单或书脊条目过多")
 	}
 	for _, it := range pkg.Manifest.Items {
 		b.manifest[it.ID] = manifestItem{path: resolvePath(opfPath, it.Href), mediaType: it.MediaType, properties: it.Properties}
@@ -238,17 +284,15 @@ func parseEPUB(rs io.ReadSeeker, size int64, assetBase, assetVersion string) (*B
 		b.chapter = item.path
 		b.pending = b.pending[:0]
 		b.renderChapter([]byte(chapter))
+		if rendered.overflow {
+			return nil, fmt.Errorf("EPUB 渲染正文超过 %d MiB 上限", maxRenderedHTML>>20)
+		}
 		book.Chapters = append(book.Chapters, Chapter{HTML: b.out.String()})
 		b.out.Reset()
 	}
 	if len(book.Chapters) == 0 {
 		return nil, fmt.Errorf("EPUB 中没有可阅读内容")
 	}
-	parts := make([]string, len(book.Chapters))
-	for i, ch := range book.Chapters {
-		parts[i] = ch.HTML
-	}
-	book.HTML = strings.Join(parts, "")
 	book.Assets = b.assets
 	return book, nil
 }
@@ -292,12 +336,12 @@ func zipBytes(zr *zip.Reader, name string, b *budget) ([]byte, error) {
 // cumulative decompression budget. Exceeding either is an error rather than
 // a silent truncation.
 func readZipEntry(rc io.Reader, b *budget) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(rc, maxDecompressedTotal+1))
+	data, err := io.ReadAll(io.LimitReader(rc, maxDecompressedEntry+1))
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) > maxDecompressedTotal {
-		return nil, fmt.Errorf("EPUB 条目超过 %d MiB 上限", maxDecompressedTotal>>20)
+	if int64(len(data)) > maxDecompressedEntry {
+		return nil, fmt.Errorf("EPUB 条目超过 %d MiB 上限", maxDecompressedEntry>>20)
 	}
 	if err := b.take(int64(len(data))); err != nil {
 		return nil, err
@@ -693,22 +737,15 @@ func (b *epubBuilder) emitImg(node *html.Node, withExtra bool) {
 // writeImg 输出 <img>：内嵌图落盘到内存资产表并改写为 /assets 链接。
 func (b *epubBuilder) writeImg(src, alt string, withExtra bool) {
 	if isExternalURL(src) {
-		b.out.WriteString(`<img src="`)
-		b.out.WriteString(stdhtml.EscapeString(src))
-		b.out.WriteByte('"')
-		if alt != "" {
-			b.out.WriteString(` alt="`)
-			b.out.WriteString(stdhtml.EscapeString(alt))
-			b.out.WriteByte('"')
-		}
-		if withExtra {
-			b.writeBlockExtra()
-		}
-		b.out.WriteByte('>')
 		return
 	}
 	zipPath := resolvePath(b.chapter, src)
 	if zipPath == "" {
+		return
+	}
+	ext := extOf(zipPath)
+	contentType := AssetContentType(ext)
+	if contentType == "application/octet-stream" || contentType == "image/svg+xml" {
 		return
 	}
 	idx, ok := b.assetIndex[zipPath]
@@ -718,9 +755,8 @@ func (b *epubBuilder) writeImg(src, alt string, withExtra bool) {
 			return
 		}
 		idx = len(b.assets)
-		ext := extOf(zipPath)
 		w, h, _ := imageDims(data)
-		b.assets = append(b.assets, Asset{Data: data, ContentType: AssetContentType(ext), Width: w, Height: h})
+		b.assets = append(b.assets, Asset{Data: data, ContentType: contentType, Width: w, Height: h})
 		b.assetIndex[zipPath] = idx
 	}
 	b.out.WriteString(`<img src="`)
@@ -882,20 +918,20 @@ func extractTxtToc(text string) []TocEntry {
 	}
 	entries := make([]TocEntry, 0, len(marksInOrder))
 	mi := 0
-	utf16 := 0
+	utf16Offset := 0
 	for bi, ch := range text {
 		for mi < len(marksInOrder) && marksInOrder[mi].byteOff == bi {
 			m := marksInOrder[mi]
 			label := strings.TrimSpace(text[m.labelOff : m.labelOff+m.labelLen])
-			entries = append(entries, TocEntry{Label: label, Offset: int64(utf16)})
+			entries = append(entries, TocEntry{Label: label, Offset: int64(utf16Offset)})
 			mi++
 		}
-		utf16 += len(string(ch))
+		utf16Offset += unicodeutf16.RuneLen(ch)
 	}
 	for mi < len(marksInOrder) {
 		m := marksInOrder[mi]
 		label := strings.TrimSpace(text[m.labelOff : m.labelOff+m.labelLen])
-		entries = append(entries, TocEntry{Label: label, Offset: int64(utf16)})
+		entries = append(entries, TocEntry{Label: label, Offset: int64(utf16Offset)})
 		mi++
 	}
 	return entries
@@ -1068,6 +1104,9 @@ func (c *Cache) Put(key string, b *Book) {
 	if b == nil {
 		return
 	}
+	if b.bytes() > c.maxBytes {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.entries[key]; ok {
@@ -1080,7 +1119,7 @@ func (c *Cache) Put(key string, b *Book) {
 	for el := c.order.Back(); el != nil; el = el.Prev() {
 		total += el.Value.(*Book).bytes()
 	}
-	for c.order.Len() > c.maxBooks || (total > c.maxBytes && c.order.Len() > 1) {
+	for c.order.Len() > c.maxBooks || total > c.maxBytes {
 		el := c.order.Front()
 		book := el.Value.(*Book)
 		total -= book.bytes()

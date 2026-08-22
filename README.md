@@ -46,7 +46,7 @@ docker pull ghcr.io/vesperglow/revaro:latest
 
 每次 `main` 更新会发布 `latest` 和完整 commit SHA 标签；`v*` Git tag 还会发布对应版本标签。若 GHCR Package 尚未设为 Public，请先登录 GHCR，或在 GitHub Package 设置中将其改为公开。
 
-生产环境应将 `APP_BASE_URL` 改为实际 HTTPS 地址，将 `COOKIE_SECURE=true`，使用高熵密码，并将 Bucket CORS 的来源改为同一个 HTTPS Origin。Compose 自带 MinIO 主要用于单机部署和本地体验；也可以删除 `minio` / `minio-init` 服务并指向已有 S3-compatible 存储。
+生产环境应将 `APP_BASE_URL` 改为实际 HTTPS 地址（`COOKIE_SECURE` 会据此自动启用），使用高熵密码，并将 Bucket CORS 的来源改为同一个 HTTPS Origin。Compose 默认只监听 `127.0.0.1`，应通过同机 HTTPS 反向代理对外提供服务；自带 MinIO 主要用于单机部署和本地体验，也可以删除 `minio` / `minio-init` 服务并指向已有 S3-compatible 存储。
 
 ## 从源码构建
 
@@ -96,7 +96,7 @@ set -a; . ./.env; set +a
 | `PRESIGN_EXPIRES` | `15m` | 上传、下载和预览 URL 有效期 |
 | `BLOCK_SIZE` | `4194304` | FastCDC 目标平均块大小（字节），默认 4 MiB，范围 1 MiB–1 GiB |
 | `FASTCDC_MIN_SIZE` | `BLOCK_SIZE / 4` | FastCDC 最小块大小，默认 1 MiB，范围 64 KiB–`BLOCK_SIZE` |
-| `FASTCDC_MAX_SIZE` | `BLOCK_SIZE * 4` | FastCDC 强制切块上限，默认 16 MiB，范围 `BLOCK_SIZE`–1 GiB |
+| `FASTCDC_MAX_SIZE` | `BLOCK_SIZE * 4` | FastCDC 强制切块上限，默认 16 MiB，范围 `BLOCK_SIZE`–1 GiB；代理传输模式最多 64 MiB |
 | `UPLOAD_EXPIRES` | `24h` | 未完成上传的清理期限，也决定垃圾回收宽限期下限 |
 | `GC_INTERVAL` | `1h` | 垃圾回收间隔；`0` 表示禁用（回收需手动触发） |
 | `FFMPEG_PATH` | `ffmpeg` | 视频缩略图抽帧使用的 ffmpeg 可执行文件路径 |
@@ -164,7 +164,7 @@ Bucket 必须保持私有。直连模式的浏览器访问依赖 Presigned URL�
 ]
 ```
 
-`AllowedHeaders` 必须覆盖 `If-None-Match`：块上传的 Presigned URL 绑定了 `If-None-Match: *` 条件头（签名包含该头），浏览器必须原样携带它。若块已存在，S3 返回 `412 Precondition Failed`，前端把它视为"内容相同的块已存在"并继续——这正是内容寻址去重的正常路径。不再需要 `ExposeHeaders: ["ETag"]`。
+`AllowedHeaders` 必须覆盖 `If-None-Match` 与 `x-amz-checksum-sha256`：块上传的 Presigned URL 同时绑定条件写入和块 SHA-256，浏览器必须原样携带这两个签名头。若块已存在，S3 返回 `412 Precondition Failed`，前端把它视为“内容相同的块已存在”并继续——这正是内容寻址去重的正常路径。不再需要 `ExposeHeaders: ["ETag"]`。
 
 ## API
 
@@ -230,7 +230,7 @@ Bucket 必须保持私有。直连模式的浏览器访问依赖 Presigned URL�
 
 当前目录中的图片、GIF 和视频会组成一个循环媒体序列，可使用左右按钮或键盘方向键切换；移动端图片支持左右滑动切换。图片与 GIF 使用原始对象地址，GIF 会保留动画；视频使用浏览器原生播放器。音频文件会打开独立的原生播放器。预览弹窗点击媒体周围的空白区域即可关闭，底部下载按钮始终下载原始文件。
 
-文件网格与列表为图片、视频和 EPUB 提供**持久化缩略图**：图片与 EPUB 封面由服务端重采样（480px，JPEG），视频由内置 ffmpeg 在 1 秒处抽帧；缩略图作为内容寻址派生对象存在 S3 的 `thumbs/` 前缀，经内容哈希版本化的不可变 URL 由浏览器长期缓存。视频抽帧每内容仅需下载一次（上限 2 GiB，同时最多两个 ffmpeg 任务）；无 ffmpeg 的部署回退为浏览器抽帧上传。图片缩略图生成有像素尺寸上限（40 MP / 单边 30000px），防止高压缩比图片在解码时耗尽内存；AVIF 源图无法解码，回退为原图直连预览。
+文件网格与列表为图片、视频和 EPUB 提供**持久化缩略图**：图片与 EPUB 封面由服务端重采样（480px，JPEG），视频由内置 ffmpeg 在 1 秒处抽帧；缩略图作为内容寻址派生对象存在 S3 的 `thumbs/` 前缀，经内容哈希版本化的不可变 URL 由浏览器长期缓存。视频抽帧每内容仅需下载一次（上限 512 MiB，同时最多一个 ffmpeg 任务）；无 ffmpeg 的部署回退为浏览器抽帧上传。图片缩略图生成有像素尺寸上限（40 MP / 单边 30000px）和并发上限，防止高压缩比图片在解码时耗尽内存；浏览器上传的 JPEG 也会由服务端重新解码、缩放和编码后再保存。
 
 单块媒体（默认 4 MiB 以下）仍直连 S3；多块媒体由服务端按清单流式拼接，下载与预览端点支持 HTTP Range，视频拖动进度条会按需抓取对应块。
 
@@ -246,7 +246,7 @@ Bucket 必须保持私有。直连模式的浏览器访问依赖 Presigned URL�
 - **清单（manifest）**：每个文件的块列表序列化为 JSON，以清单自身的 SHA-256 为键存入 `manifests/…`。`files.object_key` 指向清单，`files.etag` 即清单哈希，天然是内容版本的指纹。
 - **文件树（SQLite）**：名称、目录关系、大小、MIME 与清单键；移动/重命名零 S3 操作。
 
-上传流程：浏览器把文件切成块 → 逐块算 SHA-256 → 批量登记，服务端对已存在的块返回 `exists:true`（去重跳过）。直连模式会为缺失块签发带 `If-None-Match: *` 的 Presigned PUT；UpCloud 代理模式则返回同源上传 URL，由 revaro 校验块哈希后写入私网 S3。完成后服务端 `HeadObject` 逐块校验、写入清单并把文件切换为 `ready`。极端竞态下（登记后某块被 GC 回收）完成接口返回 `409 + missing_blocks`，前端自动补传重试。
+上传流程：浏览器把文件切成块 → 逐块算 SHA-256 → 批量登记，服务端对已存在的块返回 `exists:true`（去重跳过）。直连模式会为缺失块签发同时绑定 `If-None-Match: *` 与 `x-amz-checksum-sha256` 的 Presigned PUT；UpCloud 代理模式则返回同源上传 URL，由 revaro 校验块哈希后写入私网 S3。完成后服务端 `HeadObject` 逐块校验、写入清单并把文件切换为 `ready`。极端竞态下（登记后某块被 GC 回收）完成接口返回 `409 + missing_blocks`，前端自动补传重试。
 
 下载流程：单块文件（绝大多数图片、文档、短视频）302 到 Presigned GET 直连 S3；多块文件由服务端按清单流式拼接，`ServeContent` 提供 Range/If-Modified-Since 支持。回收站保留元数据、清单与块引用；永久删除后，垃圾回收器才会在宽限期后按引用关系回收内容，同时清理升级前的 `objects/` 遗留对象。
 
@@ -291,12 +291,12 @@ docker compose start revaro
 
 - 单用户模型：一个管理员账户、一棵文件树，没有注册与多用户。
 - 非空目录会在单个 SQLite 事务中整棵移入回收站；恢复与永久删除同样是原子操作，重名恢复返回 `409`，不会覆盖现有项目。
-- 无服务端转码、波形、OCR 或 EXIF 索引；不受浏览器支持的编码无法播放。超大文件（数 TiB）的清单解析与逐块校验开销随块数线性增长，建议为超大媒体库调大 `BLOCK_SIZE`。
-- 登录限速是单实例内存状态；这符合单实例部署模型。
+- 无服务端转码、波形、OCR 或 EXIF 索引；不受浏览器支持的编码无法播放。单文件上限 1 TiB，清单最多 262144 块；超大文件的逐块校验开销随块数线性增长。
+- 登录限速与公开分享并发限制是单实例内存状态；这符合单实例部署模型。
 - 块上传不做跨浏览器断点恢复；取消或过期会清理元数据，孤儿块由回收器回收，网络失败可在当前页面重试。
 - 回收站项目仍占用对象存储空间；永久删除后内容对象进入异步垃圾回收，直到下一次宽限期后的回收才释放空间。
 - 阅读器不解析 PDF/MOBI；EPUB 上限 128 MiB、TXT 上限 16 MiB，且解析缓存为单实例内存（最多 3 本）。
-- 视频缩略图依赖容器内置的 ffmpeg（可用 `FFMPEG_PATH` 指定），超过 2 GiB 的视频不生成缩略图。
+- 视频缩略图依赖容器内置的 ffmpeg（可用 `FFMPEG_PATH` 指定），超过 512 MiB 的视频不生成缩略图。
 
 ## 测试
 

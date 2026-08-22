@@ -46,6 +46,7 @@ type mockStorage struct {
 	presignErr     error
 	putManifestErr error
 	getManifestErr error
+	omitManifestList bool
 }
 
 func newMockStorage(blockSize int64) *mockStorage {
@@ -118,6 +119,9 @@ func (m *mockStorage) GetManifest(_ context.Context, key string) (storage.Manife
 	return mm, nil
 }
 func (m *mockStorage) ListManifests(context.Context) ([]storage.ObjectRef, error) {
+	if m.omitManifestList {
+		return []storage.ObjectRef{}, nil
+	}
 	var out []storage.ObjectRef
 	for key := range m.manifests {
 		out = append(out, storage.ObjectRef{Key: key, Size: 1, LastModified: m.modified[key]})
@@ -1211,6 +1215,32 @@ func TestGarbageCollectorAbortsOnUnreadableReferencedManifest(t *testing.T) {
 	}
 }
 
+func TestGarbageCollectorKeepsBlocksWhenListingOmitsReferencedManifest(t *testing.T) {
+	a := newTestAppWithBlockSize(t, 8)
+	f := a.readyFile(t, "kept.bin", []byte("AAAAAAAABBBBBBBB"))
+	a.store.omitManifestList = true
+	for _, block := range a.store.manifests[f.objectKey].Blocks {
+		a.store.age(storage.BlockKey(block.ID), time.Now().Add(-48*time.Hour))
+	}
+	a.srv.CollectGarbage(context.Background())
+	for _, block := range a.store.manifests[f.objectKey].Blocks {
+		if _, ok := a.store.blocks[block.ID]; !ok {
+			t.Fatalf("referenced block %s deleted after incomplete listing", block.ID)
+		}
+	}
+}
+
+func TestSafeDeliveryMimeBlocksActiveWebContent(t *testing.T) {
+	for _, value := range []string{"text/html; charset=utf-8", "image/svg+xml", "application/javascript", "application/xhtml+xml"} {
+		if got := safeDeliveryMime(value); got != "application/octet-stream" {
+			t.Fatalf("safeDeliveryMime(%q)=%q", value, got)
+		}
+	}
+	if got := safeDeliveryMime("image/png"); got != "image/png" {
+		t.Fatalf("safe image MIME changed to %q", got)
+	}
+}
+
 func TestDocumentSaveConflictOnStaleEtag(t *testing.T) {
 	a := newTestApp(t)
 	doc := a.readyFile(t, "note.md", []byte("v1"))
@@ -1472,11 +1502,13 @@ func TestBookEndpointsEPUB(t *testing.T) {
 		t.Fatalf("content=%d: %s", body.Code, body.Body.String())
 	}
 	model := decode[struct {
-		Kind string `json:"kind"`
-		HTML string `json:"html"`
+		Kind     string `json:"kind"`
+		Chapters []struct {
+			HTML string `json:"html"`
+		} `json:"chapters"`
 	}](t, body)
-	if model.Kind != "epub" || !strings.Contains(model.HTML, "你好世界") || strings.Contains(model.HTML, "<script") {
-		t.Fatalf("html=%q", model.HTML)
+	if model.Kind != "epub" || len(model.Chapters) != 1 || !strings.Contains(model.Chapters[0].HTML, "你好世界") || strings.Contains(model.Chapters[0].HTML, "<script") {
+		t.Fatalf("chapters=%+v", model.Chapters)
 	}
 	asset := a.request("GET", "/api/files/"+f.ID+"/book/assets/0", nil, true)
 	if asset.Code != http.StatusOK || asset.Header().Get("Content-Type") != "image/png" || asset.Body.Len() != 33 {

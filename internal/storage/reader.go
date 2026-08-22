@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 )
 
 // fileReader streams a logical file back from its blocks. It implements
@@ -13,9 +14,8 @@ type fileReader struct {
 	s         *S3
 	ctx       context.Context
 	m         Manifest
+	starts    []int64
 	off       int64
-	scanIdx   int
-	scanStart int64
 	loadedIdx int
 	loaded    []byte
 	err       error
@@ -26,7 +26,13 @@ func (s *S3) Open(ctx context.Context, key string) (io.ReadSeekCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &fileReader{s: s, ctx: ctx, m: m, loadedIdx: -1}, nil
+	starts := make([]int64, len(m.Blocks))
+	var offset int64
+	for i, block := range m.Blocks {
+		starts[i] = offset
+		offset += block.Size
+	}
+	return &fileReader{s: s, ctx: ctx, m: m, starts: starts, loadedIdx: -1}, nil
 }
 
 func (r *fileReader) Read(p []byte) (int, error) {
@@ -75,22 +81,17 @@ func (r *fileReader) Seek(offset int64, whence int) (int64, error) {
 
 func (r *fileReader) Close() error { return nil }
 
-// blockAt locates the block containing off, advancing a cursor so that
-// sequential reads cost O(1) per block and a backward seek restarts the
-// scan from the beginning.
+// blockAt locates the block containing off by its prefix offset, keeping
+// backward and random Range seeks logarithmic even for very large manifests.
 func (r *fileReader) blockAt(off int64) (int, int64, int64, error) {
-	if off < r.scanStart {
-		r.scanIdx, r.scanStart = 0, 0
+	if off < 0 || off >= r.m.Size || len(r.starts) == 0 {
+		return 0, 0, 0, io.EOF
 	}
-	for r.scanIdx < len(r.m.Blocks) {
-		size := r.m.Blocks[r.scanIdx].Size
-		if off < r.scanStart+size {
-			return r.scanIdx, r.scanStart, size, nil
-		}
-		r.scanStart += size
-		r.scanIdx++
+	idx := sort.Search(len(r.starts), func(i int) bool { return r.starts[i] > off }) - 1
+	if idx < 0 {
+		idx = 0
 	}
-	return 0, 0, 0, io.EOF
+	return idx, r.starts[idx], r.m.Blocks[idx].Size, nil
 }
 
 func (r *fileReader) load(idx int) ([]byte, error) {

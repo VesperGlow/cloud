@@ -118,7 +118,7 @@ func (s *Service) BeginTOTPSetup(ctx context.Context, username, password string)
 	if err != nil {
 		return TOTPSetup{}, err
 	}
-	encrypted, err := encryptSecret(password, key.Secret(), s.params())
+	encrypted, err := s.encryptSecret(ctx, password, key.Secret())
 	if err != nil {
 		return TOTPSetup{}, err
 	}
@@ -161,7 +161,7 @@ func (s *Service) ConfirmTOTPSetup(ctx context.Context, username, password, code
 		_, _ = s.DB.ExecContext(ctx, `DELETE FROM settings WHERE key=?`, totpPendingKey)
 		return nil, ErrTOTPSetupExpired
 	}
-	secret, err := decryptSecret(password, pending.Secret)
+	secret, err := s.decryptSecret(ctx, password, pending.Secret)
 	if err != nil {
 		return nil, ErrInvalidCredentials
 	}
@@ -273,7 +273,7 @@ func (s *Service) consumeSecondFactor(ctx context.Context, password, code string
 	if err := json.Unmarshal([]byte(raw), &encrypted); err != nil {
 		return errors.New("stored TOTP configuration is invalid")
 	}
-	secret, err := decryptSecret(password, encrypted)
+	secret, err := s.decryptSecret(ctx, password, encrypted)
 	if err != nil {
 		return ErrInvalidCredentials
 	}

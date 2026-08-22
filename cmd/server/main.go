@@ -103,7 +103,10 @@ func main() {
 	}
 	app.CleanupExpiredUploads(context.Background())
 	authService.Cleanup(context.Background())
-	httpServer := &http.Server{Addr: cfg.Addr, Handler: app.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 1 << 20}
+	// Streaming downloads can legitimately run for much longer than a fixed
+	// response deadline. Upload/read deadlines are enforced at the handler and
+	// body-limit layers instead.
+	httpServer := &http.Server{Addr: cfg.Addr, Handler: app.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 1 << 20}
 	listener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		log.Error("server listen failed", "addr", cfg.Addr, "error", err)

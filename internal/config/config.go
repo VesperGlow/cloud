@@ -93,6 +93,9 @@ func Load() (Config, error) {
 	if c.BlockMaxSize < c.BlockSize || c.BlockMaxSize > 1024*1024*1024 {
 		return c, errors.New("FASTCDC_MAX_SIZE must be between BLOCK_SIZE and 1 GiB")
 	}
+	if c.ProxyTransfers && c.BlockMaxSize > 64*1024*1024 {
+		return c, errors.New("FASTCDC_MAX_SIZE must not exceed 64 MiB when S3_PROXY_TRANSFERS is enabled")
+	}
 	if c.UploadExpires <= 0 {
 		return c, errors.New("UPLOAD_EXPIRES must be positive")
 	}

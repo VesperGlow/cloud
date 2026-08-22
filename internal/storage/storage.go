@@ -127,11 +127,16 @@ func (s *S3) Ping(ctx context.Context) error {
 // never be overwritten and concurrent identical uploads race harmlessly
 // (the loser receives 412 Precondition Failed).
 func (s *S3) PresignBlockPut(ctx context.Context, id string, expiry time.Duration) (string, error) {
+	checksum, err := BlockChecksumSHA256(id)
+	if err != nil {
+		return "", err
+	}
 	in := &s3.PutObjectInput{
-		Bucket:      aws.String(s.bucket),
-		Key:         aws.String(BlockKey(id)),
-		ContentType: aws.String("application/octet-stream"),
-		IfNoneMatch: aws.String("*"),
+		Bucket:         aws.String(s.bucket),
+		Key:            aws.String(BlockKey(id)),
+		ContentType:    aws.String("application/octet-stream"),
+		IfNoneMatch:    aws.String("*"),
+		ChecksumSHA256: aws.String(checksum),
 	}
 	out, err := s.presign.PresignPutObject(ctx, in, s3.WithPresignExpires(expiry))
 	if err != nil {
