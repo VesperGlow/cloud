@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "dompurify": "3.4.14",
-    "marked": "17.0.5",
+    "marked": "18.0.10",
     "vue": "3.5.41"
   },
   "devDependencies": {
