@@ -58,7 +58,7 @@ function runCreate(action:'document'|'folder'){
         </div>
       </div>
       <p class="folder-meta">
-        <span>{{ itemCount }} 个项目</span><i></i><template v-if="trashMode"><span>永久删除前可恢复</span></template><template v-else>
+        <span>{{ itemCount }} 个项目</span><i></i><template v-if="trashMode"><span>{{ formatSize(totalBytes) }}</span><i></i><span>已删除的文件将在 30 天后永久删除</span></template><template v-else>
           <span>共 {{ fileCount }} 个文件</span><i></i>
           <span>{{ formatSize(totalBytes) }}</span>
         </template>
